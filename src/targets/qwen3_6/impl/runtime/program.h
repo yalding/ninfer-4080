@@ -283,7 +283,14 @@ AdmissionCandidate<NINFER_QWEN36_VARIANT>::AdmissionCandidate(AdmissionCandidate
 
 template <>
 AdmissionCandidate<NINFER_QWEN36_VARIANT>&
-AdmissionCandidate<NINFER_QWEN36_VARIANT>::operator=(AdmissionCandidate&&) noexcept = default;
+AdmissionCandidate<NINFER_QWEN36_VARIANT>::operator=(AdmissionCandidate&& rhs) noexcept {
+    // Explicit body (not `= default`): a defaulted member function is only emitted in the TU
+    // that odr-uses it, but the move-assign is odr-used from the engine's std::optional<...>
+    // operator= in a different TU, so MSVC leaves the symbol undefined (LNK2019). An explicit
+    // body is always emitted. Moving the unique_ptr is the whole operation.
+    impl_ = std::move(rhs.impl_);
+    return *this;
+}
 
 template <>
 AdmissionCandidate<NINFER_QWEN36_VARIANT>::~AdmissionCandidate() = default;
@@ -299,8 +306,12 @@ CapturePressureCandidate<NINFER_QWEN36_VARIANT>::CapturePressureCandidate(
 
 template <>
 CapturePressureCandidate<NINFER_QWEN36_VARIANT>&
-CapturePressureCandidate<NINFER_QWEN36_VARIANT>::operator=(CapturePressureCandidate&&) noexcept =
-    default;
+CapturePressureCandidate<NINFER_QWEN36_VARIANT>::operator=(CapturePressureCandidate&& rhs) noexcept {
+    // Explicit body (not `= default`): see the AdmissionCandidate note — MSVC only emits a
+    // defaulted member in the TU that odr-uses it, and the engine odr-uses this from another TU.
+    impl_ = std::move(rhs.impl_);
+    return *this;
+}
 
 template <>
 CapturePressureCandidate<NINFER_QWEN36_VARIANT>::~CapturePressureCandidate() = default;
@@ -956,6 +967,12 @@ private:
         detail::PhysicalDelta resource_delta;
         detail::PhysicalDelta active_entitlement_delta;
         detail::PhysicalResources capacity_preparation_removed;
+        // Exclusive resources of the active sequence when the capture was reserved. Victims
+        // released before preparation can only transfer co-owned objects to it; that transfer is
+        // credited to the request entitlement at preparation (sergiuszm/ninfer-4090#9).
+        detail::PhysicalResources active_exclusive_baseline;
+        // Entitlement leaving with the dropped private checkpoints, re-derived at preparation.
+        detail::PhysicalResources private_replacement_owned;
         ContinuationSummary active_summary;
         std::vector<runtime::ContextTransferRequirement> transfer_requirements;
         std::vector<runtime::ContextTransferObservation> transfer_observations;
@@ -1199,6 +1216,17 @@ private:
                                                             StateImageHandle state) const noexcept;
     [[nodiscard]] bool state_exclusive_to_sequence(const SequenceState& sequence,
                                                    StateImageHandle state) const noexcept;
+    // Effect of the checkpoint references a private capture drops (replaced rewrite and/or the
+    // selected long anchor). `freed` is what the drop releases physically now, mirroring
+    // release_checkpoint_reference; `owned` is what leaves the sequence's exclusive entitlement.
+    // They differ when a dropped image is pinned, e.g. as the borrowed source of a pending Fork.
+    struct CapturePrivateDropEffect {
+        detail::PhysicalResources freed;
+        detail::PhysicalResources owned;
+    };
+    [[nodiscard]] CapturePrivateDropEffect
+    capture_private_drop_effect(const SequenceState& sequence, const CaptureGroup& group,
+                                const LongAnchorCheckpoint* selected_anchor_replacement) const;
     [[nodiscard]] bool compose_pressure_candidate(
         ResourceCandidateState& candidate,
         std::span<const ContinuationHandle* const> pressure_owners,

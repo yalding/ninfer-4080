@@ -19,6 +19,12 @@ inherited: paged KV, compatible-prefix reuse, CUDA Graphs, speculative decoding,
 control, the OpenAI/Anthropic-compatible APIs, and the ReplaySSM state transactions all work as
 documented in [docs/](docs/).
 
+This fork targets `sm_89` on Linux and native Windows (MSVC + CUDA, vcpkg-managed
+dependencies). Blackwell-only NVFP4/W4A4 execution is unavailable; the engine uses the same
+groupwise-int path as the 3090 base. The Windows path is built and validated on the RTX 4090
+(VS 2026 + CUDA 13.3, `CMAKE_CUDA_ARCHITECTURES=89`); the Qwen3.6-35B-A3B target is inherited
+but untested on the RTX 4090.
+
 ## TL;DR
 
 - Runs ISTA-DASLab's 3-bit GSQ Qwen3.8-27B at 100K context on one RTX 4080 16 GB.

@@ -3454,7 +3454,16 @@ void test_publication_only_pressure_constructs_adoptable_target() {
 
 } // namespace
 
+#ifdef _WIN32
+#include <windows.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
+#endif
+
 int main() {
+#ifdef _WIN32
+    timeBeginPeriod(1);
+#endif
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
     run_test("publication-only construction",
@@ -3525,6 +3534,9 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
+#ifdef _WIN32
+    timeEndPeriod(1);
+#endif
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
     return 0;

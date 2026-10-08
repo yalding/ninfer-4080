@@ -3,7 +3,31 @@
 
 #include <spdlog/logger.h>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+inline int pipe(int fds[2]) {
+    return _pipe(fds, 4096, _O_BINARY);
+}
+inline int dup(int fd) {
+    return _dup(fd);
+}
+inline int dup2(int fd1, int fd2) {
+    return _dup2(fd1, fd2);
+}
+inline int close(int fd) {
+    return _close(fd);
+}
+inline int read(int fd, void* buf, std::size_t count) {
+    return _read(fd, buf, static_cast<unsigned int>(count));
+}
+using ssize_t = int;
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>

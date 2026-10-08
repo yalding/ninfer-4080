@@ -9,6 +9,7 @@
 #include "ninfer/engine.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
+#include "runtime/portable_u128.h"
 
 #include <cuda_runtime.h>
 
@@ -399,12 +400,15 @@ std::vector<TextCase> text_cases(std::uint32_t chunk) {
 }
 
 std::uint64_t attention_pairs(std::uint32_t prefix, std::uint32_t suffix) {
-    const unsigned __int128 pairs = static_cast<unsigned __int128>(prefix) * suffix +
-                                    static_cast<unsigned __int128>(suffix) * (suffix + 1ULL) / 2U;
-    if (pairs > std::numeric_limits<std::uint64_t>::max()) {
+    const std::uint64_t s_even = (suffix % 2 == 0) ? (suffix / 2) : suffix;
+    const std::uint64_t s_odd  = (suffix % 2 == 0) ? (static_cast<std::uint64_t>(suffix) + 1ULL) : ((static_cast<std::uint64_t>(suffix) + 1ULL) / 2);
+    const auto term1 = ninfer::detail::u128_mul64(prefix, suffix);
+    const auto term2 = ninfer::detail::u128_mul64(s_even, s_odd);
+    const auto pairs = ninfer::detail::u128_add(term1, term2);
+    if (ninfer::detail::u128_gt(pairs, ninfer::detail::u128_from64(std::numeric_limits<std::uint64_t>::max()))) {
         throw std::overflow_error("prefill attention-pair count exceeds uint64");
     }
-    return static_cast<std::uint64_t>(pairs);
+    return ninfer::detail::u128_to64(pairs);
 }
 
 std::vector<std::uint8_t> block_ppm(int width, int height, std::uint8_t value) {

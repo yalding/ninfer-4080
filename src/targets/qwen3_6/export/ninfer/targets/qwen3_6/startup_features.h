@@ -9,12 +9,26 @@ namespace ninfer::targets::qwen3_6 {
 }
 
 struct StartupFeatures {
-    bool vision                    = false;
-    std::uint32_t vision_max_tokens = 8192;
-    SpeculativeBackend speculative = SpeculativeBackend::None;
-    ProposalHead proposal_head     = ProposalHead::Full;
+    bool vision                            = false;
+    VisionResidency vision_residency       = VisionResidency::Resident;
+    std::uint32_t vision_max_tokens        = 8192;
+    std::uint32_t vision_max_merged_tokens = 16384;
+    SpeculativeBackend speculative         = SpeculativeBackend::None;
+    ProposalHead proposal_head             = ProposalHead::Full;
 
     bool operator==(const StartupFeatures&) const = default;
+
+    [[nodiscard]] bool vision_resident() const noexcept {
+        return vision && vision_residency == VisionResidency::Resident;
+    }
+
+    [[nodiscard]] bool vision_overlay() const noexcept {
+        return vision && vision_residency == VisionResidency::Overlay;
+    }
+
+    [[nodiscard]] bool vision_cpu() const noexcept {
+        return vision && vision_residency == VisionResidency::Cpu;
+    }
 
     [[nodiscard]] bool speculative_enabled() const noexcept {
         return speculative != SpeculativeBackend::None;
@@ -39,10 +53,12 @@ struct StartupFeatures {
 
 [[nodiscard]] inline StartupFeatures startup_features(const EngineOptions& options) noexcept {
     return StartupFeatures{
-        .vision            = options.enable_vision,
-        .vision_max_tokens = options.vision_max_tokens > 0 ? options.vision_max_tokens : 8192,
-        .speculative       = options.speculative.backend,
-        .proposal_head     = options.speculative.proposal_head,
+        .vision                   = options.enable_vision,
+        .vision_residency         = options.vision_residency,
+        .vision_max_tokens        = options.vision_max_tokens > 0 ? options.vision_max_tokens : 8192,
+        .vision_max_merged_tokens = options.vision_max_merged_tokens > 0 ? options.vision_max_merged_tokens : 16384,
+        .speculative              = options.speculative.backend,
+        .proposal_head            = options.speculative.proposal_head,
     };
 }
 

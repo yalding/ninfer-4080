@@ -57,9 +57,11 @@ struct ServeOptions {
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
-    bool enable_vision              = false;
-    std::uint32_t vision_max_tokens = 8192;
-    bool use_cuda_graph             = true;
+    bool enable_vision                     = false;
+    VisionResidency vision_residency       = VisionResidency::Resident;
+    std::uint32_t vision_max_tokens        = 8192;
+    std::uint32_t vision_max_merged_tokens = 16384;
+    bool use_cuda_graph                    = true;
     bool allow_prefix_reuse = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)

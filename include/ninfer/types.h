@@ -185,6 +185,12 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+enum class VisionResidency : std::uint8_t {
+    Resident,
+    Overlay,
+    Cpu,
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
@@ -214,7 +220,9 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    VisionResidency vision_residency       = VisionResidency::Resident;
     std::uint32_t vision_max_tokens        = 8192;
+    std::uint32_t vision_max_merged_tokens = 16384;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;

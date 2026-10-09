@@ -180,8 +180,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {2048});
 
     const artifact::TensorPlacement vision_placement =
-        features.vision ? artifact::TensorPlacement::Device
-                        : artifact::TensorPlacement::ValidateOnly;
+        features.vision_resident() ? artifact::TensorPlacement::Device
+        : features.vision_overlay() ? artifact::TensorPlacement::PinnedHost
+        : artifact::TensorPlacement::ValidateOnly;
     out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
     out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
     out.vision_merger_fc2   = artifact::bind_tensor(
@@ -339,6 +340,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                                NumericFormat::W8G32_F16S, 2048, 4608);
         vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
                                                                NumericFormat::BF16, {2048});
+        if (plan.features.vision_overlay()) {
+            runtime.vision_overlay =
+                qwen3_6::vision_overlay_layout(vision, backing.pinned_block());
+        }
     }
 
     if (plan.features.dflash()) {

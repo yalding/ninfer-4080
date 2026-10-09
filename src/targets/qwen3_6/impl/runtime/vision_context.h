@@ -9,6 +9,7 @@
 #include "core/weight.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/vision_overlay.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <array>
@@ -44,7 +45,8 @@ struct VisionScheduleConfig {
 
 class VisionContext {
 public:
-    VisionContext(DeviceContext& device, const LoadedModelData& model);
+    VisionContext(DeviceContext& device, const LoadedModelData& model,
+                  const VisionWeights* override_weights = nullptr);
 
     [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item);
     [[nodiscard]] static std::size_t workspace_bytes(std::size_t patches,
@@ -54,7 +56,8 @@ public:
     [[nodiscard]] static Tensor bind_output(DeviceSpan backing, const VisionWorkspacePlan& plan,
                                             std::size_t merged_tokens);
     void encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
-                const VisionWorkspacePlan& plan) const;
+                const VisionWorkspacePlan& plan,
+                detail::VisionWeightStream* weight_stream = nullptr) const;
 
 private:
     struct BlockW {
@@ -113,12 +116,14 @@ public:
 
 private:
     DeviceContext& device_;
+    const LoadedModelData& model_;
     DeviceSpan workspace_;
     const VisionWorkspacePlan& workspace_plan_;
     qwen3_6::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
     std::size_t& handoff_peak_bytes_;
     VisionContext context_;
+    std::optional<DeviceBuffer> staging_;
     std::size_t next_use_ = 0;
     std::optional<std::uint32_t> active_item_;
     std::size_t active_handoff_bytes_ = 0;

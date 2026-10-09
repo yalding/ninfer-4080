@@ -70,10 +70,28 @@ struct ReadSpan {
 } // namespace
 
 void* MaterializedArtifact::device_data(ObjectHandle handle) const {
-    if (handle.index >= objects_.size() || objects_[handle.index].device == nullptr) {
-        throw ArtifactError("object handle does not name a materialized tensor");
+    if (handle.index >= objects_.size()) {
+        throw ArtifactError("object handle is out of range");
     }
-    return objects_[handle.index].device;
+    if (objects_[handle.index].device != nullptr) {
+        return objects_[handle.index].device;
+    }
+    if (objects_[handle.index].pinned != nullptr) {
+        return objects_[handle.index].pinned;
+    }
+    throw ArtifactError("object handle does not name a materialized tensor");
+}
+
+void* MaterializedArtifact::pinned_data(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || objects_[handle.index].pinned == nullptr) {
+        throw ArtifactError("object handle does not name a pinned host tensor");
+    }
+    return objects_[handle.index].pinned;
+}
+
+std::span<const std::byte> MaterializedArtifact::pinned_block() const noexcept {
+    if (!pinned_arena_) { return {}; }
+    return {static_cast<const std::byte*>(pinned_arena_->data()), pinned_arena_->size()};
 }
 
 std::span<const std::byte> MaterializedArtifact::resource_bytes(ObjectHandle handle) const {
@@ -126,6 +144,21 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         out.stats_.retained_resource_bytes += resource.size();
         out.stats_.file_bytes =
             checked_add(out.stats_.file_bytes, resource.size(), "artifact read bytes overflow u64");
+    }
+
+    if (plan.pinned_capacity_bytes > 0) {
+        out.pinned_arena_ = std::make_unique<PinnedHostBuffer>(
+            static_cast<std::size_t>(plan.pinned_capacity_bytes));
+        auto* const block = static_cast<std::byte*>(out.pinned_arena_->data());
+        for (const PinnedMaterialization& placement : plan.pinned_objects) {
+            const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+            if (payload.data.size() != placement.bytes) {
+                throw ArtifactError("materialization plan does not match artifact payload");
+            }
+            std::memcpy(block + placement.offset, payload.data.data(), placement.bytes);
+            out.objects_.at(placement.object.index).pinned = block + placement.offset;
+        }
+        out.stats_.pinned_capacity_bytes = plan.pinned_capacity_bytes;
     }
 
     std::vector<CopyRange> ranges;

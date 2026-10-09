@@ -119,6 +119,26 @@ void Binder::materialize_on_device(ObjectHandle handle) {
     planned_[handle.index]                 = true;
 }
 
+void Binder::materialize_on_pinned_host(ObjectHandle handle) {
+    const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
+    if (tensor == nullptr) {
+        throw ArtifactError("resource cannot be materialized as a pinned host tensor");
+    }
+    if (planned_[handle.index]) {
+        throw ArtifactError("artifact object has more than one materialization placement: " +
+                            std::string(tensor->name));
+    }
+    const std::uint64_t alignment = tensor_alignment(tensor->layout);
+    const std::uint64_t offset    = align_up(materialization_.pinned_capacity_bytes, alignment);
+    if (tensor->bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
+        throw ArtifactError("materialization plan size overflows u64");
+    }
+    materialization_.pinned_objects.push_back(
+        PinnedMaterialization{handle, offset, tensor->bytes, alignment});
+    materialization_.pinned_capacity_bytes = offset + tensor->bytes;
+    planned_[handle.index]                 = true;
+}
+
 void Binder::retain_on_host(ObjectHandle handle) {
     const auto* resource = std::get_if<ResourceDescriptor>(&descriptor(handle));
     if (resource == nullptr) {

@@ -103,4 +103,26 @@ struct VisionWeights {
     const artifact::MaterializedArtifact& materialized, const VisionBackbonePlan& backbone,
     const VisionMergerInputPlan& merger_input, const VisionMergerNormPlan& merger_norm);
 
+inline constexpr std::size_t kVisionStagingAlignment = 256;
+
+[[nodiscard]] inline constexpr std::size_t staging_align(std::size_t bytes) noexcept {
+    return (bytes + kVisionStagingAlignment - 1) / kVisionStagingAlignment * kVisionStagingAlignment;
+}
+
+struct PinnedRange {
+    std::size_t offset = 0;
+    std::size_t bytes  = 0;
+};
+
+struct VisionOverlayLayout {
+    PinnedRange prelude;
+    std::vector<PinnedRange> layers;
+    PinnedRange merger;
+    std::size_t slot_bytes    = 0;
+    std::size_t staging_bytes = 0;
+};
+
+[[nodiscard]] VisionOverlayLayout vision_overlay_layout(const VisionWeights& weights,
+                                                        std::span<const std::byte> pinned_block);
+
 } // namespace ninfer::targets::qwen3_6

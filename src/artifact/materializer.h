@@ -17,6 +17,7 @@ struct MaterializationStats {
     std::uint64_t file_bytes              = 0;
     std::uint64_t h2d_bytes               = 0;
     std::uint64_t device_capacity_bytes   = 0;
+    std::uint64_t pinned_capacity_bytes   = 0;
     std::uint64_t retained_resource_bytes = 0;
     std::uint64_t peak_staging_bytes      = 0;
     std::size_t tensor_count              = 0;
@@ -34,6 +35,8 @@ public:
     MaterializedArtifact& operator=(const MaterializedArtifact&)     = delete;
 
     void* device_data(ObjectHandle handle) const;
+    void* pinned_data(ObjectHandle handle) const;
+    std::span<const std::byte> pinned_block() const noexcept;
     std::span<const std::byte> resource_bytes(ObjectHandle handle) const;
     std::vector<std::byte> take_resource_bytes(ObjectHandle handle);
 
@@ -47,10 +50,12 @@ private:
 
     struct ObjectStorage {
         void* device = nullptr;
+        void* pinned = nullptr;
         std::vector<std::byte> resource;
     };
 
     std::unique_ptr<DeviceArena> device_arena_;
+    std::unique_ptr<PinnedHostBuffer> pinned_arena_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
 };

@@ -266,7 +266,9 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     }
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.enable_vision            = options_.enable_vision;
+    engine_options.vision_residency         = options_.vision_residency;
     engine_options.vision_max_tokens        = options_.vision_max_tokens;
+    engine_options.vision_max_merged_tokens = options_.vision_max_merged_tokens;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;

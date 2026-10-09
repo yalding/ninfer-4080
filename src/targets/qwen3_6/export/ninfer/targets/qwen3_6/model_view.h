@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <optional>
+#include <span>
 
 namespace ninfer {
 
@@ -134,6 +135,8 @@ struct ModelView {
     std::optional<MtpLayer> mtp;
     std::optional<DFlashPayload> dflash;
     std::optional<VisionWeights> vision;
+    std::optional<VisionOverlayLayout> vision_overlay;
+    std::span<const std::byte> pinned_weights;
 };
 
 } // namespace targets::qwen3_6

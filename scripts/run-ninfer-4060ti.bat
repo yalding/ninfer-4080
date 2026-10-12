@@ -28,17 +28,19 @@ if not defined NINFER_ARTIFACT (
   )
 )
 
-if not defined NINFER_SPEC set "NINFER_SPEC=dflash2"
+if not defined NINFER_SPEC set "NINFER_SPEC=mtp"
 if not defined NINFER_PORT set "NINFER_PORT=8080"
 if not defined NINFER_BIND set "NINFER_BIND=127.0.0.1"
 if not defined NINFER_KV_DTYPE set "NINFER_KV_DTYPE=rk4v4-e8"
 
-if /i "%NINFER_SPEC%"=="dflash2" (
-  if not defined NINFER_DRAFT_TOKENS set "NINFER_DRAFT_TOKENS=7"
-  if not defined NINFER_CONTEXT set "NINFER_CONTEXT=65536"
-) else (
+if /i "%NINFER_SPEC%"=="mtp" (
   if not defined NINFER_DRAFT_TOKENS set "NINFER_DRAFT_TOKENS=3"
   if not defined NINFER_CONTEXT set "NINFER_CONTEXT=102400"
+  set "EXTRA_SPEC_FLAGS=--ngram chain"
+) else (
+  if not defined NINFER_DRAFT_TOKENS set "NINFER_DRAFT_TOKENS=7"
+  if not defined NINFER_CONTEXT set "NINFER_CONTEXT=65536"
+  set "EXTRA_SPEC_FLAGS="
 )
 
 rem Locate binary
@@ -69,7 +71,7 @@ echo Speculative Backend: %NINFER_SPEC% (Draft Tokens: %NINFER_DRAFT_TOKENS%)
 echo Max Context: %NINFER_CONTEXT% (KV: %NINFER_KV_DTYPE%)
 
 if defined NINFER_API_KEY (
-  "%SERVER%" "%NINFER_ARTIFACT%" --host %NINFER_BIND% --port %NINFER_PORT% --api-key "%NINFER_API_KEY%" --max-context %NINFER_CONTEXT% --kv-capacity %NINFER_CONTEXT% --kv-dtype %NINFER_KV_DTYPE% --max-concurrency 1 --max-pending-requests 16 --prefill-chunk 2688 --host-kv-mib 4096 --spec %NINFER_SPEC% --draft-tokens %NINFER_DRAFT_TOKENS% --lm-head-draft --vision --vision-offload on --preserve-thinking
+  "%SERVER%" "%NINFER_ARTIFACT%" --host %NINFER_BIND% --port %NINFER_PORT% --api-key "%NINFER_API_KEY%" --max-context %NINFER_CONTEXT% --kv-capacity %NINFER_CONTEXT% --kv-dtype %NINFER_KV_DTYPE% --max-concurrency 1 --max-pending-requests 16 --prefill-chunk 2688 --host-kv-mib 4096 --spec %NINFER_SPEC% --draft-tokens %NINFER_DRAFT_TOKENS% %EXTRA_SPEC_FLAGS% --lm-head-draft --vision --vision-offload on --preserve-thinking
 ) else (
-  "%SERVER%" "%NINFER_ARTIFACT%" --host %NINFER_BIND% --port %NINFER_PORT% --max-context %NINFER_CONTEXT% --kv-capacity %NINFER_CONTEXT% --kv-dtype %NINFER_KV_DTYPE% --max-concurrency 1 --max-pending-requests 16 --prefill-chunk 2688 --host-kv-mib 4096 --spec %NINFER_SPEC% --draft-tokens %NINFER_DRAFT_TOKENS% --lm-head-draft --vision --vision-offload on --preserve-thinking
+  "%SERVER%" "%NINFER_ARTIFACT%" --host %NINFER_BIND% --port %NINFER_PORT% --max-context %NINFER_CONTEXT% --kv-capacity %NINFER_CONTEXT% --kv-dtype %NINFER_KV_DTYPE% --max-concurrency 1 --max-pending-requests 16 --prefill-chunk 2688 --host-kv-mib 4096 --spec %NINFER_SPEC% --draft-tokens %NINFER_DRAFT_TOKENS% %EXTRA_SPEC_FLAGS% --lm-head-draft --vision --vision-offload on --preserve-thinking
 )

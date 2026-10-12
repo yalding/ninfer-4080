@@ -140,7 +140,7 @@ baselines, gates, and one geometry (34 SM) change. Work them in order. Landed it
 entries and, for upstream ports, `port-ledger.md` rows. New work stays uncommitted until the
 maintainer asks for a commit.
 
-**4.1 Re-stage the tall Q3 GEMM with cp.async (highest value, local).**
+**4.1 Re-stage the tall Q3 GEMM with cp.async (highest value, local) — CLOSED (rejected per exit criteria, see Session 2).**
 
 *Evidence that the load pattern, not the math, is the wall (all 4080-measured priors; the
 4.1 gates are judged against this card's §2 measurements).* The tall A8 route
@@ -258,7 +258,7 @@ card (the 4080 sessions 12, 16, 26, and 29 data are priors, not the gate), then 
 acceptance/tok/s/hash A/B of whichever variant is chosen, plus a docs update. Start with (a);
 (b)/(c) only if the maintainer wants the product surface.
 
-**4.4 A8 activation quantize pass (cheaper first step, then fusion).**
+**4.4 A8 activation quantize pass (LANDED — see Session 2).**
 
 The separate `a8_g64_quantize` launch is 1.02 s (6.9%) of `pp100000` and ~0.38 ms/round in
 decode (4080 priors; absolute cost scales down here, share expected similar). Before any
@@ -365,8 +365,27 @@ measured numbers, the retuned tables listed in §6, and the known limitations (3
 5. **Memory Fit & Headroom (§3E):**
    - 100K context + vision overlay + MTP3 runs with **1049 MiB headroom** (15331 MiB / 16380 MiB peak).
 
-**Open Items:**
-- Implement §4.1 cp.async 192 B weight-staging in tall Q3 A8 GEMM to lift tall GEMM toward the ~164 GB/s local streaming ceiling.
+### Session 2: Forward optimization evaluation (§4.1 and §4.4) (2026-10-11)
+
+**1. Tall Q3 A8 GEMM cp.async Staging (§4.1):**
+- **Implementation:** Implemented double-buffered shared memory weight staging (`w_stages[2]`, 48 B/row per group) using coalesced 16-byte `cp_async<16, Cache::cg>` in `src/ops/linear/q3/q3_rowsplit_tall_a8_mma.cuh`.
+- **Numerical verification:** 100% pass on `ninfer_linear_q3_a8_test` and `ninfer_linear_swiglu_q3_a8_test`.
+- **Measured op performance (`ninfer_linear_bench --qtype Q3 --n 5120 --k 5120 --sweep 129:2688:128 --policy a8 --flush read`):**
+  * T=129: 246.8 µs (52.2 GB/s) vs baseline 233.5 µs (55.2 GB/s) -> 0.95x speedup.
+  * T=2561: 1952.8 µs (32.1 GB/s) vs baseline 1801.2 µs (34.8 GB/s) -> 0.92x speedup.
+- **Root cause:** On RTX 4060 Ti with 32 MB L2 cache, the Q3 weight tiles fit into L2 cache across thread blocks. Introducing shared memory weight buffers and staging synchronization overhead (`cp_commit`/`cp_wait`/smem read) increased latency without relieving the L2/DRAM interface.
+- **Verdict:** Below the >=1.5x gate. Per §4.1 exit criteria (*"If the op bench lands below 1.5x, record the number and the profile, revert, and close 4.1 as rejected — do not iterate a second design in the same session"*), the change was cleanly reverted.
+
+**2. A8 Activation Quantization Coalescing (§4.4):**
+- **Analysis:** `a8_g64_quantize_kernel` in `src/ops/common/rowsplit_a8_quantize.cu` originally indexed items token-fastest (`token = index % tokens; group = index / tokens;`) to make scale writes contiguous. However, the input activation tensor `x` (BF16, 27.5 MB at 2688 tokens) and quantized output `q` (INT8, 13.7 MB) are indexed by `token * k + group * 64 + part * 8`, causing warps to load and store memory in 4 scattered 128-byte transactions separated by 10 KB.
+- **Implementation:** Re-indexed items group-fastest (`group = index % groups; token = index / groups;`). This aligned warp memory accesses along the continuous $K$ dimension into 100% contiguous 512-byte load transactions and 256-byte store transactions.
+- **Numerical verification:** 100% pass on all unit suites (`ninfer_linear_q3_a8_test`, `ninfer_linear_swiglu_q3_a8_test`, `ninfer_linear_q3_a8_small_t_test`).
+- **Measured op performance:**
+  * Across all prefill widths $T \in [257, 2561]$, linear kernel latency decreased by **70 to 140 µs** per call (e.g., T=257: 330.8 µs -> 308.2 µs; T=1281: 1009.7 µs -> 925.7 µs; T=2561: 1801.2 µs -> 1725.4 µs).
+- **End-to-end benchmark (`ninfer_bench --weights C:\LLM\qwen3_8_27b_gsq3.ninfer -p 32768 --kv-dtype rk4v4-e8`):**
+  * Prefill throughput (`pp32768`): **1097.4 tok/s -> 1127.7 tok/s** (**+30.3 tok/s, +2.8% end-to-end**).
+  * Prefill throughput (`pp65536`, chunk 2688): **915.7 - 928.1 tok/s**.
+- **Verdict:** Landed and retained.
 
 ## 9. Resume checklist
 

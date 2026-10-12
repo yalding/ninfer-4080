@@ -12,19 +12,20 @@ namespace {
 
 constexpr int kThreads = 256;
 
-// Eight lanes per (token, group), eight values per lane; items run token-fastest so that the
-// scales of a group are written contiguously.
+// Eight lanes per (token, group), eight values per lane; items run group-fastest so that
+// memory loads and stores along k are 100% contiguous across the warp.
 __global__ void __launch_bounds__(kThreads)
     a8_g64_quantize_kernel(const __nv_bfloat16* __restrict__ x, std::int32_t k,
                            std::int32_t tokens, std::int64_t items, std::int8_t* __restrict__ q,
                            float* __restrict__ scale) {
+    const int groups          = k / 64;
     const std::int64_t thread = static_cast<std::int64_t>(blockIdx.x) * kThreads + threadIdx.x;
     const std::int64_t item   = thread >> 3;
     const int part            = static_cast<int>(thread & 7);
     const bool live           = item < items;
     const std::int64_t index  = live ? item : 0;
-    const int token           = static_cast<int>(index % tokens);
-    const int group           = static_cast<int>(index / tokens);
+    const int group           = static_cast<int>(index % groups);
+    const int token           = static_cast<int>(index / groups);
     const std::int64_t offset = static_cast<std::int64_t>(token) * k + group * 64 + part * 8;
 
     const uint4 raw = load_ldg<uint4>(x + offset);

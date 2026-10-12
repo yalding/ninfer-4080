@@ -75,9 +75,9 @@ int check_route_boundaries() {
             ++failures;
         }
     };
-    // The single-token decode stays on the A16 GEMV, 2..16 columns run the small-T A8 engine, the
-    // 17..128 window keeps the A16 routes, and 129+ keeps the tall A8 engine.
-    expect(34816, 5120, 5120, 1, false, "T=1 stays A16");
+    // The 1..16 columns run the small-T A8 engine, the 17..128 window keeps the A16 routes, and
+    // 129+ keeps the tall A8 engine.
+    expect(34816, 5120, 5120, 1, true, "T=1 takes the small-T A8 engine");
     expect(34816, 5120, 5120, 2, true, "T=2 takes the small-T A8 engine");
     expect(34816, 5120, 5120, 8, true, "T=8 takes the small-T A8 engine");
     expect(34816, 5120, 5120, kQ3SmallTMaxTokens, true, "T=16 takes the small-T A8 engine");
@@ -240,13 +240,13 @@ int main() {
     try {
         // The whole small-T A8 domain on one registered shape.
         int failures = check_route_boundaries() + wide_tile_parity();
-        constexpr std::array kSmallA8{2, 3, 4, 8, 9, 12, 16};
-        constexpr std::array kSmallA16{1, 17, 128};
+        constexpr std::array kSmallA8{1, 2, 3, 4, 8, 9, 12, 16};
+        constexpr std::array kSmallA16{17, 128};
         failures += run_shape("Q3 small-T A8", 1024, 5120, 611U, kSmallA8, kSmallA16);
 
         // The registered body parents at the decode, MTP and DFlash2 windows.
-        constexpr std::array kBodyA8{2, 4, 8, 16};
-        constexpr std::array kBodyA16{1};
+        constexpr std::array kBodyA8{1, 2, 4, 8, 16};
+        const std::array<std::int32_t, 0> kBodyA16{};
         failures += run_shape("Q3 small-T A8", 34816, 5120, 613U, kBodyA8, kBodyA16);
         failures += run_shape("Q3 small-T A8", 7168, 5120, 617U, kBodyA8, kBodyA16);
         failures += run_shape("Q3 small-T A8", 12288, 5120, 619U, kBodyA8, kBodyA16);

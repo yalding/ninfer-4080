@@ -6,7 +6,7 @@
 # Pulls the published image and serves the DFlash2 profile at the context that fits the 16 GiB
 # card with the requantized Q4 companion:
 #
-#   * 100,000-token context without vision, 65,536 with vision (measured caps; override
+#   * 90,000-token context without vision, 65,536 with vision (measured caps; override
 #     with NINFER_CONTEXT)
 #   * DFlash2 block drafting with 7 draft tokens (K=7), LM-head proposal selector.
 #     Session 16 put every DFlash2 width on the fast small-T route (K=1..15,
@@ -79,7 +79,7 @@ if [[ "$vision" == "1" ]]; then
     context="${NINFER_CONTEXT:-65536}"
     vision_args=(--vision)
 else
-    context="${NINFER_CONTEXT:-100000}"
+    context="${NINFER_CONTEXT:-90000}"
     vision_args=()
 fi
 

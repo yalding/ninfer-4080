@@ -6,7 +6,7 @@ rem
 rem  Pulls the published image and serves the DFlash2 profile at the context
 rem  that fits the 16 GiB card with the requantized Q4 companion:
 rem
-rem    * 100,000-token context without vision, 65,536 with vision (measured caps;
+rem    * 90,000-token context without vision, 65,536 with vision (measured caps;
 rem      set NINFER_CONTEXT to override)
 rem    * DFlash2 block drafting with 7 draft tokens (K=7), LM-head proposal
 rem      selector. Session 16 put every DFlash2 width on the fast small-T route
@@ -67,7 +67,7 @@ if not defined NINFER_VISION set "NINFER_VISION=0"
 
 set "VISION_ARG="
 if "%NINFER_VISION%"=="0" (
-  if not defined NINFER_CONTEXT set "NINFER_CONTEXT=100000"
+  if not defined NINFER_CONTEXT set "NINFER_CONTEXT=90000"
 ) else (
   if not defined NINFER_CONTEXT set "NINFER_CONTEXT=65536"
   set "VISION_ARG=--vision"

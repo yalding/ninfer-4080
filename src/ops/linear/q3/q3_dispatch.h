@@ -10,7 +10,7 @@ namespace ninfer::ops::detail {
 
 // With an A8 permission, exact-K Q3 parents run an int8 tensor-core route: the tall engine from
 // this width on, and the small-T tensor-core engine for the decode and verification widths from
-// 2 through kQ3SmallTMaxTokens. Other widths (decode with a shape the small-T engine does not
+// 1 through kQ3SmallTMaxTokens. Other widths (decode with a shape the small-T engine does not
 // own, batched decode) keep the A16 routes.
 inline constexpr std::int32_t kQ3A8MinTokens = 129;
 // The tall engine's block shape; the dispatch layer cannot include the device header.
@@ -23,7 +23,7 @@ inline constexpr std::int32_t kQ3SmallTStepK = 256;
 inline constexpr std::int32_t kQ3SmallTMaxTokens = 16;
 // The narrow small-T tile; 9..kQ3SmallTMaxTokens use the native 16-column tile.
 inline constexpr std::int32_t kQ3SmallTNarrowTokens = 8;
-inline constexpr std::int32_t kQ3SmallTA8MinTokens = 2;
+inline constexpr std::int32_t kQ3SmallTA8MinTokens = 1;
 inline constexpr std::int32_t kQ3SmallTA8StepK = 512;
 Q3Launch select_q3_a16_launch(std::int32_t n, std::int32_t k, std::int32_t padded_k,
                              std::int32_t t);
@@ -35,7 +35,7 @@ Q3Launch select_q3_launch(std::int32_t n, std::int32_t k, std::int32_t padded_k,
 // True when an A8 route serves this exact problem: the policy admits it, K is an exact multiple
 // of 64 with no padding, and either N is a whole number of 128-row blocks with K admitting the
 // tall engine's 64-code steps at 129+ columns, or N is a whole number of 32-row blocks with K a
-// whole number of 512-code stages for the small-T engine at 2..kQ3SmallTMaxTokens.
+// whole number of 512-code stages for the small-T engine at 1..kQ3SmallTMaxTokens.
 [[nodiscard]] bool q3_uses_a8(std::int32_t n, std::int32_t k, std::int32_t padded_k,
                               LinearPolicy policy, std::int32_t tokens) noexcept;
 

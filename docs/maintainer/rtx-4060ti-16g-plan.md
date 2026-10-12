@@ -127,7 +127,12 @@ local DRAM floor of ~240-272. Fill the §2 table with the real numbers.
   indicating the small-T path is cleanly memory-bandwidth bound at 60.3% of nominal bus.
   Tall A8 op achieves 55-67 GB/s, showing the severe sector efficiency penalty isolated in §4.1.
 - **E. Memory fit.** Booting with 100k context, vision overlay, and MTP3 allocates 15331 MiB of 16380 MiB,
-  leaving over 1049 MiB headroom. All tests pass with zero out-of-memory errors.
+  leaving over 1049 MiB headroom. DFlash2 K=7 text-only CLI (`ninfer.exe`) passes at **90,000 tokens**
+  (14.0 GiB planned total, 1.00 GiB free after startup). Server (`ninfer-serve.exe`) with state cache
+  and host KV fits **80,000 tokens** (750 MiB free after startup) and **65,536 tokens** with vision
+  (1.25 GiB free after startup, 76.4 tok/s decode). 100,000 tokens text DFlash2 requires 14.20 GiB,
+  which misses by ~167 MiB under Windows WDDM desktop allocation (~1.7-2.5 GB display use). All valid
+  profiles pass with zero out-of-memory errors.
 - **F. Prefill chunk.** `--prefill-chunk 2688` runs stably and achieves 928 tok/s at 65.5k context.
 
 **Audit Verdict:** All functional paths pass on 34 SMs. Speculative configuration retuned for 4060 Ti.
@@ -386,6 +391,35 @@ measured numbers, the retuned tables listed in §6, and the known limitations (3
   * Prefill throughput (`pp32768`): **1097.4 tok/s -> 1127.7 tok/s** (**+30.3 tok/s, +2.8% end-to-end**).
   * Prefill throughput (`pp65536`, chunk 2688): **915.7 - 928.1 tok/s**.
 - **Verdict:** Landed and retained.
+
+### Session 3: Small-T T=1 tensor-core dispatch, MTP depth tuning, and wave audit (2026-10-11)
+
+**1. Small-T T=1 Route in Q3 Linear (§5 Opportunity 1):**
+- **Analysis:** $T=1$ previously fell back to `q3_rowsplit_gemv_staged` (208.8 GB/s, 333.8 µs), whereas $T=2$ on the small-T tensor-core engine achieved 259.1 GB/s (269.3 µs) — 19.3% faster than $T=1$ despite twice the work.
+- **Implementation:** Updated `kQ3SmallTA8MinTokens` from 2 to 1 in `src/ops/linear/q3/q3_dispatch.h`. Verified `q3_rowsplit_small_t_a8_mma.cuh` activation/scale loading and `problem.emit` masking safely handle `live = 1`.
+- **Numerical verification:** 100% pass on all 9 Q3 tests (`ninfer_linear_q3_a8_small_t_test`, `ninfer_linear_q3_a8_test`, `ninfer_linear_swiglu_q3_a8_test`, etc.).
+- **Measured op performance (`ninfer_linear_bench --qtype Q3 --n 34816 --k 5120 --sweep 1:4:1 --policy a8 --flush read`):**
+  * $T=1$: **333.8 µs (208.8 GB/s) -> 268.3 µs (259.8 GB/s)** (**-65.5 µs, -19.6% latency, +24.4% throughput**).
+  * $T=1..4$ now completely flat at 268-269 µs across all decode widths.
+- **End-to-end benchmark results (`ninfer_bench` on `C:\LLM\qwen3_8_27b_gsq3.ninfer`):**
+  * Single-token no-spec decode: **19.6 - 20.2 tok/s -> 22.59 tok/s** (**+14.7%**).
+  * MTP3 `tg256` decode (K=3): **37.3 tok/s -> 64.35 tok/s** (**+72.5%**).
+  * MTP3 structured JSONL: **55.6 tok/s -> 61.8 tok/s** (**+11.2%**, 3.48 tok/round).
+  * MTP3 Python code: **61.5 tok/s -> 69.8 tok/s** (**+13.5%**, 3.97 tok/round).
+
+**2. MTP Draft Depth Tuning ($K \in \{2, 3, 4, 5\}$):**
+- $K=2$: **35.74 tok/s** (acc 43.7%).
+- $K=3$: **64.35 tok/s** (acc 63.7%).
+- $K=4$: **82.41 tok/s** (acc 58.5%).
+- $K=5$: **34.71 tok/s** (acc 23.5%).
+- **Finding:** $K=4$ delivers the peak MTP decode throughput (**82.4 tok/s**) on RTX 4060 Ti, because verifying 5 tokens ($T=5$) remains completely inside the narrow 8-column small-T tensor-core tile without latency inflation.
+
+**3. Tall GEMM Wave Tail Audit on 34 SMs:**
+- Prefill batches ($T=2688$) launch 21 token tiles.
+- $N=17408$: $136 = 34 \times 4$ waves (0% wave tail).
+- $N=34816$: $272 = 34 \times 8$ waves (0% wave tail).
+- $N=5120$: $40 \times 21 = 840$ blocks $= 24.7$ waves (<3% wave tail).
+- Wave tail is only significant at tiny prefill widths ($T=129$), not production prefill batches.
 
 ## 9. Resume checklist
 

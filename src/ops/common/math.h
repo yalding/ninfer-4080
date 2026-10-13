@@ -38,6 +38,8 @@ NINFER_KERNEL_HD constexpr int sign_extend(int x) {
     return (x ^ sign) - sign;
 }
 
+inline constexpr float kLog2E = 1.4426950408889634F;
+
 } // namespace ninfer::ops
 
 #undef NINFER_KERNEL_HD

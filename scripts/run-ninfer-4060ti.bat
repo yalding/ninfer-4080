@@ -36,7 +36,7 @@ if not defined NINFER_KV_DTYPE set "NINFER_KV_DTYPE=rk4v4-e8"
 if not defined NINFER_VISION set "NINFER_VISION=0"
 
 if /i "%NINFER_SPEC%"=="mtp" (
-  if not defined NINFER_DRAFT_TOKENS set "NINFER_DRAFT_TOKENS=3"
+  if not defined NINFER_DRAFT_TOKENS set "NINFER_DRAFT_TOKENS=4"
   if not defined NINFER_CONTEXT set "NINFER_CONTEXT=102400"
   set "EXTRA_SPEC_FLAGS=--ngram chain"
   set "EXTRA_VISION_FLAGS=--vision --vision-offload on"

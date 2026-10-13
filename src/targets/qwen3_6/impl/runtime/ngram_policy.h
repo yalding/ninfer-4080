@@ -12,7 +12,7 @@ namespace ninfer::targets::qwen3_6 {
 
 // A round verifies the full n-gram window V only when some row's usable draft reaches the MTP
 // depth k plus this margin; otherwise it keeps the MTP width k+1 and its cost.
-inline constexpr std::uint32_t kNgramWideRoundMargin = 3;
+inline constexpr std::uint32_t kNgramWideRoundMargin = 8;
 
 /**
  * Chain draft for one row: the MTP proposal followed by the pool's continuation of

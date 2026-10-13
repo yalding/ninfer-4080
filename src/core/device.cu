@@ -53,6 +53,8 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
     if (device_id < 0 || device_id >= count) { throw std::runtime_error("invalid CUDA device id"); }
 
     bind_to_current_thread();
+    const cudaError_t flag_err = cudaSetDeviceFlags(cudaDeviceScheduleSpin | cudaDeviceMapHost);
+    (void)flag_err;
 
     err = cudaGetDeviceProperties(&props, device_id);
     if (err != cudaSuccess) {

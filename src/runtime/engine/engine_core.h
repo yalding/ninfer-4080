@@ -730,7 +730,17 @@ private:
         bool active_ = true;
     };
 
-    void publish_runtime_stats() {
+    void publish_runtime_stats(bool force = true) {
+        if (!force) {
+            ++decode_rounds_since_stats_;
+            const auto now = Clock::now();
+            if (decode_rounds_since_stats_ < 16 &&
+                (now - last_stats_published_) < std::chrono::milliseconds(50)) {
+                return;
+            }
+        }
+        decode_rounds_since_stats_ = 0;
+        last_stats_published_      = Clock::now();
         HostPhaseMeasurement measurement = begin_host_phase();
         std::optional<nvtx::ScopedRange> phase_range;
         phase_range.emplace(nvtx::Name::EngineMaintenance, nvtx::Category::Runtime);
@@ -776,8 +786,15 @@ private:
         }
         // Per-slot occupancy for /slots-style readers. Digests come from a cache keyed by the
         // catalog entry's (id, revision), so an unchanged session costs no ledger hashing.
-        std::vector<SlotState> slot_snapshot(resources_.catalog_capacity());
+        slot_snapshot_.resize(resources_.catalog_capacity());
         for (std::uint32_t slot = 0; slot < resources_.catalog_capacity(); ++slot) {
+            SlotState& state     = slot_snapshot_[slot];
+            state.processing     = false;
+            state.retained       = false;
+            state.prompt_tokens  = 0;
+            state.cached_tokens  = 0;
+            state.session_digest.clear();
+            state.checkpoints.clear();
             const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
             if (view.state != ResourceManagement::CatalogState::Catalogued ||
                 view.handle == nullptr) {
@@ -791,7 +808,6 @@ private:
                 cache.digest      = instance_.program->continuation_digest(*view.handle);
                 cache.checkpoints = instance_.program->continuation_checkpoints(*view.handle);
             }
-            SlotState& state     = slot_snapshot[slot];
             state.retained       = true;
             state.prompt_tokens  = cache.depth;
             state.cached_tokens  = cache.depth;
@@ -802,8 +818,8 @@ private:
             if (slots_[lane] == nullptr) { continue; }
             const std::optional<std::uint32_t> publication =
                 resources_.lane_publication_slot(LaneId{lane});
-            if (!publication || *publication >= slot_snapshot.size()) { continue; }
-            SlotState& state    = slot_snapshot[*publication];
+            if (!publication || *publication >= slot_snapshot_.size()) { continue; }
+            SlotState& state    = slot_snapshot_[*publication];
             state.processing    = true;
             state.prompt_tokens = slots_[lane]->prompt_summary.prompt_tokens;
             if (slots_[lane]->begin) {
@@ -818,7 +834,7 @@ private:
         snapshot.host_work = cumulative_stats_.host_work;
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
-        published_slots_ = std::move(slot_snapshot);
+        published_slots_ = slot_snapshot_;
     }
 
     void record_prefix_selection(const RequestPlanSummary& summary) noexcept {
@@ -2102,7 +2118,15 @@ private:
             std::chrono::duration<double>(Clock::now() - decode_started).count();
         program_call.finish(pending.execution_timing());
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
-        publish_runtime_stats();
+        bool has_terminal = false;
+        for (std::size_t i = 0; i < membership.size; ++i) {
+            const auto& req = slots_[membership.lanes[i]];
+            if (req != nullptr && req->terminal_reason) {
+                has_terminal = true;
+                break;
+            }
+        }
+        publish_runtime_stats(/*force=*/has_terminal);
     }
 
     void run_control_batch(const ControlMembership& membership) {
@@ -2372,6 +2396,9 @@ private:
     std::vector<SlotDigestCacheEntry> slot_digest_cache_;
     // Guarded by stats_mutex_, republished at every unit boundary.
     std::vector<SlotState> published_slots_;
+    std::vector<SlotState> slot_snapshot_;
+    std::uint32_t decode_rounds_since_stats_ = 0;
+    Clock::time_point last_stats_published_{};
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

@@ -976,7 +976,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
                              /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out,
-                             o, s);
+                             o, DeviceExecutionView{.stream = s, .multiprocessor_count = ctx_.multiprocessor_count()});
     }
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(

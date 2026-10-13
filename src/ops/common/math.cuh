@@ -62,4 +62,10 @@ __device__ __forceinline__ __half2 half2_from_bits(std::uint32_t bits) {
     return load_vec<__half2>(&bits);
 }
 
+__device__ __forceinline__ void unpack_bf16x2_to_fp32_bits(unsigned packed, unsigned& low,
+                                                           unsigned& high) {
+    low  = packed << 16;
+    high = packed & 0xffff0000U;
+}
+
 } // namespace ninfer::ops

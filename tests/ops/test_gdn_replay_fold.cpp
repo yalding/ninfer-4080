@@ -320,7 +320,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 Tensor beta_tensor(static_cast<float*>(beta_row.p) + token * profile.value_heads, DType::FP32, {profile.value_heads, 1});
                 Tensor output_token = output.slice(2, token, 1).view({kStateDim, profile.value_heads, 1});
                 ops::gated_delta_net(query, key, value, g_tensor, beta_tensor, kScale, true,
-                                     reference_workspace, local_state_tensor, output_token, nullptr);
+                                     reference_workspace, local_state_tensor, output_token, DeviceExecutionView{});
                 if (token + 1 == commit)
                     cuda_check(cudaMemcpyAsync(expected, local_state.p, recurrent_slot_bytes,
                                                cudaMemcpyDeviceToDevice, nullptr), "save Nth snapshot");

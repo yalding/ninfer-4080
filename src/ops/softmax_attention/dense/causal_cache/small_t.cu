@@ -66,7 +66,7 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
     if (kv_storage_is_int8_family(storage) && tokens >= 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::SmallTSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::SmallTSplitScale;
-        constexpr std::int32_t kMax = 42 * Geometry::SmallTSplitScale;
+        constexpr std::int32_t kMax = 17 * Geometry::SmallTSplitScale;
         const std::int32_t clamped  = (splits > kMin) ? splits : kMin;
         return (clamped < kMax) ? clamped : kMax;
     }

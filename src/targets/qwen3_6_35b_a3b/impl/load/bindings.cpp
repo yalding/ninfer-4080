@@ -341,8 +341,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
                                                                NumericFormat::BF16, {2048});
         if (plan.features.vision_overlay()) {
+            runtime.pinned_weights = backing.pinned_block();
             runtime.vision_overlay =
-                qwen3_6::vision_overlay_layout(vision, backing.pinned_block());
+                qwen3_6::vision_overlay_layout(vision, runtime.pinned_weights);
         }
     }
 

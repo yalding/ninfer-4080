@@ -59,22 +59,15 @@ public:
             for (cudaEvent_t& event : uploaded_) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             }
+            for (cudaEvent_t& event : compute_fence_) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+            }
             CUDA_CHECK(cudaEventCreateWithFlags(&prelude_event_, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&merger_event_, cudaEventDisableTiming));
-            CUDA_CHECK(cudaEventCreateWithFlags(&compute_fence_, cudaEventDisableTiming));
-
-            const cudaStream_t copy = device_.transfer_stream;
-            CUDA_CHECK(cudaMemcpyAsync(prelude_, block_.data() + layout.prelude.offset,
-                                       layout.prelude.bytes, cudaMemcpyHostToDevice, copy));
-            CUDA_CHECK(cudaEventRecord(prelude_event_, copy));
-            CUDA_CHECK(cudaMemcpyAsync(merger_, block_.data() + layout.merger.offset,
-                                       layout.merger.bytes, cudaMemcpyHostToDevice, copy));
-            CUDA_CHECK(cudaEventRecord(merger_event_, copy));
         } catch (...) {
             destroy_events();
             throw;
         }
-        upload_bytes_ = layout.prelude.bytes + layout.merger.bytes;
     }
 
     ~VisionWeightStream() {
@@ -117,9 +110,17 @@ public:
     }
 
     void reset(cudaStream_t compute) {
-        CUDA_CHECK(cudaEventRecord(compute_fence_, compute));
-        CUDA_CHECK(cudaStreamWaitEvent(device_.transfer_stream, compute_fence_, 0));
-        next_upload_ = 0;
+        const cudaStream_t copy = device_.transfer_stream;
+        CUDA_CHECK(cudaEventRecord(compute_fence_[0], compute));
+        CUDA_CHECK(cudaStreamWaitEvent(copy, compute_fence_[0], 0));
+        CUDA_CHECK(cudaMemcpyAsync(prelude_, block_.data() + layout_.prelude.offset,
+                                   layout_.prelude.bytes, cudaMemcpyHostToDevice, copy));
+        CUDA_CHECK(cudaEventRecord(prelude_event_, copy));
+        CUDA_CHECK(cudaMemcpyAsync(merger_, block_.data() + layout_.merger.offset,
+                                   layout_.merger.bytes, cudaMemcpyHostToDevice, copy));
+        CUDA_CHECK(cudaEventRecord(merger_event_, copy));
+        upload_bytes_ = layout_.prelude.bytes + layout_.merger.bytes;
+        next_upload_  = 0;
         upload_next_layer();
         upload_next_layer();
     }
@@ -132,11 +133,14 @@ public:
         CUDA_CHECK(cudaStreamWaitEvent(compute, merger_event_, 0));
     }
 
-    void arrive(std::uint32_t layer, cudaStream_t compute) {
+    void begin_layer(std::uint32_t layer, cudaStream_t compute) {
         CUDA_CHECK(cudaStreamWaitEvent(compute, uploaded_[layer % 2], 0));
+    }
+
+    void end_layer(std::uint32_t layer, cudaStream_t compute) {
         if (layer + 2 < layout_.layers.size()) {
-            CUDA_CHECK(cudaEventRecord(compute_fence_, compute));
-            CUDA_CHECK(cudaStreamWaitEvent(device_.transfer_stream, compute_fence_, 0));
+            CUDA_CHECK(cudaEventRecord(compute_fence_[layer % 2], compute));
+            CUDA_CHECK(cudaStreamWaitEvent(device_.transfer_stream, compute_fence_[layer % 2], 0));
             upload_next_layer();
         }
     }
@@ -158,23 +162,25 @@ private:
         for (cudaEvent_t& event : uploaded_) {
             if (event != nullptr) { (void)cudaEventDestroy(event); event = nullptr; }
         }
+        for (cudaEvent_t& event : compute_fence_) {
+            if (event != nullptr) { (void)cudaEventDestroy(event); event = nullptr; }
+        }
         if (prelude_event_ != nullptr) { (void)cudaEventDestroy(prelude_event_); prelude_event_ = nullptr; }
         if (merger_event_ != nullptr) { (void)cudaEventDestroy(merger_event_); merger_event_ = nullptr; }
-        if (compute_fence_ != nullptr) { (void)cudaEventDestroy(compute_fence_); compute_fence_ = nullptr; }
     }
 
     DeviceContext& device_;
     const VisionOverlayLayout& layout_;
     std::span<const std::byte> block_;
-    std::byte* prelude_        = nullptr;
-    std::byte* merger_         = nullptr;
-    std::byte* slot_[2]        = {nullptr, nullptr};
-    cudaEvent_t uploaded_[2]   = {nullptr, nullptr};
-    cudaEvent_t prelude_event_ = nullptr;
-    cudaEvent_t merger_event_  = nullptr;
-    cudaEvent_t compute_fence_ = nullptr;
-    std::uint32_t next_upload_ = 0;
-    std::size_t upload_bytes_  = 0;
+    std::byte* prelude_          = nullptr;
+    std::byte* merger_           = nullptr;
+    std::byte* slot_[2]          = {nullptr, nullptr};
+    cudaEvent_t uploaded_[2]     = {nullptr, nullptr};
+    cudaEvent_t compute_fence_[2] = {nullptr, nullptr};
+    cudaEvent_t prelude_event_   = nullptr;
+    cudaEvent_t merger_event_    = nullptr;
+    std::uint32_t next_upload_   = 0;
+    std::size_t upload_bytes_    = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail

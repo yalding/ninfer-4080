@@ -321,7 +321,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
         nvtx::ScopedRange layer_range(nvtx::Name::VisionLayer, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(layer));
         if (weight_stream != nullptr) {
-            weight_stream->arrive(static_cast<std::uint32_t>(layer), stream);
+            weight_stream->begin_layer(static_cast<std::uint32_t>(layer), stream);
         }
         const BlockW& block = blocks_[layer];
         {
@@ -381,6 +381,9 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
             ops::linear(up, *block.fc2, down, stream);
             ops::add_bias(*block.fc2_bias, down, stream);
             ops::residual_add(down, x, stream);
+        }
+        if (weight_stream != nullptr) {
+            weight_stream->end_layer(static_cast<std::uint32_t>(layer), stream);
         }
     }
 

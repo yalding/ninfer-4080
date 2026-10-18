@@ -51,7 +51,9 @@ using q3_small_t::kTokens;
 using q3_small_t::kTokensPerB;
 using q3_small_t::kWarps;
 using q3_small_t::kWideTokens;
+using q3_small_t::Q3SmallTLinearAddProblem;
 using q3_small_t::Q3SmallTLinearProblem;
+using q3_small_t::Q3SmallTSplitLinearProblem;
 using q3_small_t::Q3SmallTSwiGluProblem;
 
 // One stage: four 128-code weight groups = eight 64-code activation groups = eight 64-code steps.

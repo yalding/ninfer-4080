@@ -399,7 +399,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
                             plan.kv_storage, text_envelope, 1, 1, 1));
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
-        matrix(layout, DType::BF16, TextConfig::hidden, 1);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(1, 1));
         proposal_scratch(layout, 1);
     };

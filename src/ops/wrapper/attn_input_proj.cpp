@@ -9,6 +9,7 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/q3/q3_dispatch.h"
 #include "core/device.h"
 #include <cstddef>
 #include <cstdint>
@@ -98,17 +99,6 @@ void require_q3_rowsplit(const Weight& weight, std::int32_t rows, const char* la
         !aligned_to(weight.scales, 4)) {
         throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
     }
-}
-
-void copy_column_rows(const Tensor& src, std::int32_t src_begin, std::int32_t rows,
-                      Tensor& dst, cudaStream_t stream) {
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        dst.data, static_cast<std::size_t>(rows) * sizeof(std::uint16_t),
-        static_cast<const std::uint8_t*>(src.data) +
-            static_cast<std::size_t>(src_begin) * sizeof(std::uint16_t),
-        static_cast<std::size_t>(src.ne[0]) * sizeof(std::uint16_t),
-        static_cast<std::size_t>(rows) * sizeof(std::uint16_t),
-        static_cast<std::size_t>(src.ne[1]), cudaMemcpyDeviceToDevice, stream));
 }
 
 void require_bf16_contiguous(const Weight& weight, std::int32_t rows, std::int32_t hidden,
@@ -267,11 +257,8 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported Q3 profile");
         }
-        WorkspaceLayoutBuilder layout;
-        (void)layout.alloc(DType::BF16, {7168, max_tokens});
-        (void)layout.alloc_bytes(linear_workspace_capacity_bytes(parent_qtype, 7168, 5120, policy,
-                                                               min_tokens, max_tokens));
-        return layout.peak_bytes(1);
+        return linear_workspace_capacity_bytes(parent_qtype, 7168, 5120, policy, min_tokens,
+                                               max_tokens);
     }
     case QType::Q4G64_F16S:
     case QType::Q5G64_F16S:
@@ -367,14 +354,21 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_matrix(v, kKvRows, cols, "v");
     require_q3_rowsplit(query_key_weight, kQRows + kKvRows, "query/key weight");
     require_q3_rowsplit(gate_value_weight, kQRows + kKvRows, "gate/value weight");
-    auto scope       = workspace.scope();
-    Tensor projected = workspace.alloc(DType::BF16, {kQRows + kKvRows, cols});
-    linear(x, query_key_weight, projected, policy, workspace, stream);
-    copy_column_rows(projected, 0, kQRows, q, stream);
-    copy_column_rows(projected, kQRows, kKvRows, k, stream);
-    linear(x, gate_value_weight, projected, policy, workspace, stream);
-    copy_column_rows(projected, 0, kQRows, gate, stream);
-    copy_column_rows(projected, kQRows, kKvRows, v, stream);
+    if (detail::q3_uses_a8(kQRows + kKvRows, kHidden, kHidden, policy, cols)) {
+        auto scope = workspace.scope();
+        detail::A8G64Activation act =
+            detail::allocate_a8_g64_activation(workspace, kHidden, cols);
+        detail::a8_g64_quantize(x, act, stream);
+        detail::q3_dispatch_a8_split(act, query_key_weight, q.data, kQRows, k.data, kKvRows,
+                                     kQRows, stream);
+        detail::q3_dispatch_a8_split(act, gate_value_weight, gate.data, kQRows, v.data, kKvRows,
+                                     kQRows, stream);
+        return;
+    }
+    detail::q3_dispatch_a16_split(x, query_key_weight, q.data, kQRows, k.data, kKvRows, kQRows,
+                                  stream);
+    detail::q3_dispatch_a16_split(x, gate_value_weight, gate.data, kQRows, v.data, kKvRows,
+                                  kQRows, stream);
 }
 
 } // namespace ninfer::ops

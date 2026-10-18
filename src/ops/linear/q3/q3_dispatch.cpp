@@ -77,7 +77,9 @@ void q3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
         auto scope = workspace->scope();
         A8G64Activation act = allocate_a8_g64_activation(*workspace, w.k, x.ne[1]);
         a8_g64_quantize(x, act, stream);
-        if (x.ne[1] >= kQ3A8MinTokens) {
+        if (x.ne[1] >= kQ3A8WideMinTokens) {
+            launch_q3_mma_tall_a8_r128_c256(act, w, out, stream);
+        } else if (x.ne[1] >= kQ3A8MinTokens) {
             launch_q3_mma_tall_a8_r128_c128(act, w, out, stream);
         } else if (x.ne[1] <= kQ3SmallTNarrowTokens) {
             launch_q3_mma_small_t_a8_r32_c8(act, w, out, stream);
@@ -89,6 +91,175 @@ void q3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
     const Q3Launch launch =
         select_q3_launch(w.n, w.k, static_cast<std::int32_t>(w.padded_shape[1]), x.ne[1], policy);
     launch(x, w, out, stream);
+}
+
+void q3_dispatch_a16_pitched(const Tensor& x, const Weight& w, void* out, std::int32_t out_ld,
+                             cudaStream_t stream) {
+    const std::int32_t n        = w.n;
+    const std::int32_t k        = w.k;
+    const std::int32_t padded_k = static_cast<std::int32_t>(w.padded_shape[1]);
+    const std::int32_t t        = x.ne[1];
+    if (t <= kQ3SmallTMaxTokens) {
+        const bool small_t = t >= 2 && (n % kQ3SmallTRows) == 0 && (k % 8) == 0 && padded_k >= k &&
+                             (padded_k % kQ3SmallTStepK) == 0;
+        if (small_t) {
+            if (t <= kQ3SmallTNarrowTokens) {
+                launch_q3_mma_small_t_r32_c8_pitched(x, w, out, out_ld, stream);
+            } else {
+                launch_q3_mma_small_t_r32_c16_pitched(x, w, out, out_ld, stream);
+            }
+            return;
+        }
+        if (t <= 8) {
+            launch_q3_gemv_r8_c8_staged_pitched(x, w, out, out_ld, stream);
+            return;
+        }
+        launch_q3_mma_r32_c64_pitched(x, w, out, out_ld, stream);
+        return;
+    }
+    if (n % 128 == 0 && t >= 64) {
+        if (t >= 128) {
+            launch_q3_mma_tall_r128_c128_pitched(x, w, out, out_ld, stream);
+        } else {
+            launch_q3_mma_tall_r128_c64_pitched(x, w, out, out_ld, stream);
+        }
+        return;
+    }
+    launch_q3_mma_r32_c64_pitched(x, w, out, out_ld, stream);
+}
+
+void q3_dispatch_a16_split(const Tensor& x, const Weight& w, void* out0, std::int32_t out0_ld,
+                           void* out1, std::int32_t out1_ld, std::int32_t split_rows,
+                           cudaStream_t stream) {
+    const std::int32_t n        = w.n;
+    const std::int32_t k        = w.k;
+    const std::int32_t padded_k = static_cast<std::int32_t>(w.padded_shape[1]);
+    const std::int32_t t        = x.ne[1];
+    if (t <= kQ3SmallTMaxTokens) {
+        const bool small_t = t >= 2 && (n % kQ3SmallTRows) == 0 &&
+                             (split_rows % kQ3SmallTRows) == 0 && (k % 8) == 0 && padded_k >= k &&
+                             (padded_k % kQ3SmallTStepK) == 0;
+        if (small_t) {
+            if (t <= kQ3SmallTNarrowTokens) {
+                launch_q3_mma_small_t_r32_c8_split(x, w, out0, out0_ld, out1, out1_ld, split_rows,
+                                                   stream);
+            } else {
+                launch_q3_mma_small_t_r32_c16_split(x, w, out0, out0_ld, out1, out1_ld, split_rows,
+                                                    stream);
+            }
+            return;
+        }
+        if (t <= 8) {
+            launch_q3_gemv_r8_c8_staged_split(x, w, out0, out0_ld, out1, out1_ld, split_rows,
+                                              stream);
+            return;
+        }
+        launch_q3_mma_r32_c64_split(x, w, out0, out0_ld, out1, out1_ld, split_rows, stream);
+        return;
+    }
+    if (n % 128 == 0 && split_rows % 128 == 0 && t >= 64) {
+        if (t >= 128) {
+            launch_q3_mma_tall_r128_c128_split(x, w, out0, out0_ld, out1, out1_ld, split_rows,
+                                               stream);
+        } else {
+            launch_q3_mma_tall_r128_c64_split(x, w, out0, out0_ld, out1, out1_ld, split_rows,
+                                              stream);
+        }
+        return;
+    }
+    launch_q3_mma_r32_c64_split(x, w, out0, out0_ld, out1, out1_ld, split_rows, stream);
+}
+
+void q3_dispatch_a8_pitched(const A8G64Activation& act, const Weight& w, void* out,
+                            std::int32_t out_ld, cudaStream_t stream) {
+    const std::int32_t tokens = act.q.ne[1];
+    if (tokens >= kQ3A8WideMinTokens) {
+        launch_q3_mma_tall_a8_r128_c256_pitched(act, w, out, out_ld, stream);
+    } else if (tokens >= kQ3A8MinTokens) {
+        launch_q3_mma_tall_a8_r128_c128_pitched(act, w, out, out_ld, stream);
+    } else if (tokens <= kQ3SmallTNarrowTokens) {
+        launch_q3_mma_small_t_a8_r32_c8_pitched(act, w, out, out_ld, stream);
+    } else {
+        launch_q3_mma_small_t_a8_r32_c16_pitched(act, w, out, out_ld, stream);
+    }
+}
+
+void q3_dispatch_a8_split(const A8G64Activation& act, const Weight& w, void* out0,
+                          std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                          std::int32_t split_rows, cudaStream_t stream) {
+    const std::int32_t tokens = act.q.ne[1];
+    if (tokens >= kQ3A8WideMinTokens) {
+        launch_q3_mma_tall_a8_r128_c256_split(act, w, out0, out0_ld, out1, out1_ld, split_rows,
+                                              stream);
+    } else if (tokens >= kQ3A8MinTokens) {
+        launch_q3_mma_tall_a8_r128_c128_split(act, w, out0, out0_ld, out1, out1_ld, split_rows,
+                                              stream);
+    } else if (tokens <= kQ3SmallTNarrowTokens) {
+        launch_q3_mma_small_t_a8_r32_c8_split(act, w, out0, out0_ld, out1, out1_ld, split_rows,
+                                              stream);
+    } else {
+        launch_q3_mma_small_t_a8_r32_c16_split(act, w, out0, out0_ld, out1, out1_ld, split_rows,
+                                               stream);
+    }
+}
+
+void q3_dispatch_a8_add(const A8G64Activation& act, const Weight& w, Tensor& residual_out,
+                        cudaStream_t stream) {
+    const std::int32_t tokens = act.q.ne[1];
+    if (tokens >= kQ3A8WideMinTokens) {
+        launch_q3_mma_tall_a8_r128_c256_add(act, w, residual_out, stream);
+    } else if (tokens >= kQ3A8MinTokens) {
+        launch_q3_mma_tall_a8_r128_c128_add(act, w, residual_out, stream);
+    } else if (tokens <= kQ3SmallTNarrowTokens) {
+        launch_q3_mma_small_t_a8_r32_c8_add(act, w, residual_out, stream);
+    } else {
+        launch_q3_mma_small_t_a8_r32_c16_add(act, w, residual_out, stream);
+    }
+}
+
+void q3_dispatch_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPolicy policy,
+                     WorkspaceArena* workspace, cudaStream_t stream) {
+    if (q3_uses_a8(w.n, w.k, w.padded_shape[1], policy, x.ne[1])) {
+        if (workspace == nullptr) {
+            throw std::invalid_argument("q3 A8 linear_add requires caller workspace");
+        }
+        auto scope          = workspace->scope();
+        A8G64Activation act = allocate_a8_g64_activation(*workspace, w.k, x.ne[1]);
+        a8_g64_quantize(x, act, stream);
+        q3_dispatch_a8_add(act, w, residual_out, stream);
+        return;
+    }
+    const std::int32_t n        = w.n;
+    const std::int32_t k        = w.k;
+    const std::int32_t padded_k = static_cast<std::int32_t>(w.padded_shape[1]);
+    const std::int32_t t        = x.ne[1];
+    if (t <= kQ3SmallTMaxTokens) {
+        const bool small_t = t >= 2 && (n % kQ3SmallTRows) == 0 && (k % 8) == 0 && padded_k >= k &&
+                             (padded_k % kQ3SmallTStepK) == 0;
+        if (small_t) {
+            if (t <= kQ3SmallTNarrowTokens) {
+                launch_q3_mma_small_t_r32_c8_add(x, w, residual_out, stream);
+            } else {
+                launch_q3_mma_small_t_r32_c16_add(x, w, residual_out, stream);
+            }
+            return;
+        }
+        if (t <= 8) {
+            launch_q3_gemv_r8_c8_staged_add(x, w, residual_out, stream);
+            return;
+        }
+        launch_q3_mma_r32_c64_add(x, w, residual_out, stream);
+        return;
+    }
+    if (n % 128 == 0 && t >= 64) {
+        if (t >= 128) {
+            launch_q3_mma_tall_r128_c128_add(x, w, residual_out, stream);
+        } else {
+            launch_q3_mma_tall_r128_c64_add(x, w, residual_out, stream);
+        }
+        return;
+    }
+    launch_q3_mma_r32_c64_add(x, w, residual_out, stream);
 }
 
 } // namespace ninfer::ops::detail

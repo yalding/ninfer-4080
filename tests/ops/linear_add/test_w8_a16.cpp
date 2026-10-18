@@ -31,6 +31,15 @@ int w8_a16_conformance() {
     failures += ninfer::test::linear_add::run_shape(
         "W8_A16 LinearAdd", WeightFormat::W8G32F16S,
         ShapeCase{2048, 6144, 421U, kK6144RouteStarts, kK6144RouteInteriors});
+
+    constexpr std::array<std::int32_t, 1> kN5120RouteStarts{49};
+    constexpr std::array<std::int32_t, 4> kN5120RouteInteriors{5, 16, 64, 128};
+    failures += ninfer::test::linear_add::run_shape(
+        "W8_A16 LinearAdd", WeightFormat::W8G32F16S,
+        ShapeCase{5120, 6144, 423U, kN5120RouteStarts, kN5120RouteInteriors});
+    failures += ninfer::test::linear_add::run_shape(
+        "W8_A16 LinearAdd", WeightFormat::W8G32F16S,
+        ShapeCase{5120, 17408, 425U, kN5120RouteStarts, kN5120RouteInteriors});
     return failures;
 }
 

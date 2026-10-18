@@ -27,8 +27,16 @@ void launch_q3_mma_tall_swiglu_r64_c128(const Tensor& x, const Weight& w, Tensor
 // a8_g64_quantize, and the weight codes multiply it with m16n8k32 s8 MMAs.
 void launch_q3_mma_tall_a8_r128_c128(const A8G64Activation& act, const Weight& w, Tensor& out,
                                      cudaStream_t stream);
+void launch_q3_mma_tall_a8_r128_c256(const A8G64Activation& act, const Weight& w, Tensor& out,
+                                     cudaStream_t stream);
 void launch_q3_mma_tall_a8_swiglu_r64_c128(const A8G64Activation& act, const Weight& w,
                                            Tensor& out, cudaStream_t stream);
+void launch_q3_mma_tall_a8_swiglu_r64_c256(const A8G64Activation& act, const Weight& w,
+                                           Tensor& out, cudaStream_t stream);
+void launch_q3_mma_tall_a8_swiglu_a8_out_r64_c128(const A8G64Activation& act, const Weight& w,
+                                                  A8G64Activation& out, cudaStream_t stream);
+void launch_q3_mma_tall_a8_swiglu_a8_out_r64_c256(const A8G64Activation& act, const Weight& w,
+                                                  A8G64Activation& out, cudaStream_t stream);
 // Small-T tensor-core routes: 32 weight rows x one token tile per CTA over whole-group staged
 // codes, several CTAs per SM and an eight-warp K-split. The 8-column tile owns 1..8 tokens; the
 // 16-column tile owns 9..16 and stages every code byte once.
@@ -50,4 +58,83 @@ void launch_q3_mma_small_t_a8_swiglu_r16_c8(const A8G64Activation& act, const We
                                             Tensor& out, cudaStream_t stream);
 void launch_q3_mma_small_t_a8_swiglu_r16_c16(const A8G64Activation& act, const Weight& w,
                                              Tensor& out, cudaStream_t stream);
+
+// Pitched, split-output, and residual-add Q3 routes for zero-copy input projections and
+// fused linear_add.
+void launch_q3_gemv_r8_c8_staged_pitched(const Tensor& x, const Weight& w, void* out,
+                                         std::int32_t out_ld, cudaStream_t stream);
+void launch_q3_gemv_r8_c8_staged_split(const Tensor& x, const Weight& w, void* out0,
+                                       std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                                       std::int32_t split_rows, cudaStream_t stream);
+void launch_q3_gemv_r8_c8_staged_add(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                     cudaStream_t stream);
+
+void launch_q3_mma_r32_c64_pitched(const Tensor& x, const Weight& w, void* out,
+                                   std::int32_t out_ld, cudaStream_t stream);
+void launch_q3_mma_r32_c64_split(const Tensor& x, const Weight& w, void* out0,
+                                 std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                                 std::int32_t split_rows, cudaStream_t stream);
+void launch_q3_mma_r32_c64_add(const Tensor& x, const Weight& w, Tensor& residual_out,
+                               cudaStream_t stream);
+
+void launch_q3_mma_tall_r128_c64_pitched(const Tensor& x, const Weight& w, void* out,
+                                         std::int32_t out_ld, cudaStream_t stream);
+void launch_q3_mma_tall_r128_c128_pitched(const Tensor& x, const Weight& w, void* out,
+                                          std::int32_t out_ld, cudaStream_t stream);
+void launch_q3_mma_tall_r128_c64_split(const Tensor& x, const Weight& w, void* out0,
+                                       std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                                       std::int32_t split_rows, cudaStream_t stream);
+void launch_q3_mma_tall_r128_c128_split(const Tensor& x, const Weight& w, void* out0,
+                                        std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                                        std::int32_t split_rows, cudaStream_t stream);
+void launch_q3_mma_tall_r128_c64_add(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                     cudaStream_t stream);
+void launch_q3_mma_tall_r128_c128_add(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                      cudaStream_t stream);
+
+void launch_q3_mma_tall_a8_r128_c128_pitched(const A8G64Activation& act, const Weight& w,
+                                             void* out, std::int32_t out_ld, cudaStream_t stream);
+void launch_q3_mma_tall_a8_r128_c256_pitched(const A8G64Activation& act, const Weight& w,
+                                             void* out, std::int32_t out_ld, cudaStream_t stream);
+void launch_q3_mma_tall_a8_r128_c128_split(const A8G64Activation& act, const Weight& w, void* out0,
+                                           std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                                           std::int32_t split_rows, cudaStream_t stream);
+void launch_q3_mma_tall_a8_r128_c256_split(const A8G64Activation& act, const Weight& w, void* out0,
+                                           std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                                           std::int32_t split_rows, cudaStream_t stream);
+void launch_q3_mma_tall_a8_r128_c128_add(const A8G64Activation& act, const Weight& w,
+                                         Tensor& residual_out, cudaStream_t stream);
+void launch_q3_mma_tall_a8_r128_c256_add(const A8G64Activation& act, const Weight& w,
+                                         Tensor& residual_out, cudaStream_t stream);
+
+void launch_q3_mma_small_t_r32_c8_pitched(const Tensor& x, const Weight& w, void* out,
+                                          std::int32_t out_ld, cudaStream_t stream);
+void launch_q3_mma_small_t_r32_c16_pitched(const Tensor& x, const Weight& w, void* out,
+                                           std::int32_t out_ld, cudaStream_t stream);
+void launch_q3_mma_small_t_r32_c8_split(const Tensor& x, const Weight& w, void* out0,
+                                        std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                                        std::int32_t split_rows, cudaStream_t stream);
+void launch_q3_mma_small_t_r32_c16_split(const Tensor& x, const Weight& w, void* out0,
+                                         std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                                         std::int32_t split_rows, cudaStream_t stream);
+void launch_q3_mma_small_t_r32_c8_add(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                      cudaStream_t stream);
+void launch_q3_mma_small_t_r32_c16_add(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                       cudaStream_t stream);
+
+void launch_q3_mma_small_t_a8_r32_c8_pitched(const A8G64Activation& act, const Weight& w,
+                                             void* out, std::int32_t out_ld, cudaStream_t stream);
+void launch_q3_mma_small_t_a8_r32_c16_pitched(const A8G64Activation& act, const Weight& w,
+                                              void* out, std::int32_t out_ld, cudaStream_t stream);
+void launch_q3_mma_small_t_a8_r32_c8_split(const A8G64Activation& act, const Weight& w, void* out0,
+                                           std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                                           std::int32_t split_rows, cudaStream_t stream);
+void launch_q3_mma_small_t_a8_r32_c16_split(const A8G64Activation& act, const Weight& w,
+                                            void* out0, std::int32_t out0_ld, void* out1,
+                                            std::int32_t out1_ld, std::int32_t split_rows,
+                                            cudaStream_t stream);
+void launch_q3_mma_small_t_a8_r32_c8_add(const A8G64Activation& act, const Weight& w,
+                                         Tensor& residual_out, cudaStream_t stream);
+void launch_q3_mma_small_t_a8_r32_c16_add(const A8G64Activation& act, const Weight& w,
+                                          Tensor& residual_out, cudaStream_t stream);
 } // namespace ninfer::ops::detail

@@ -312,6 +312,90 @@ struct Q3LinearProblem {
     }
 };
 
+// Split RowSplit Q3 linear: row blocks below `split_blocks` write to `out0` with pitch `out0_ld`,
+// and row blocks at or above `split_blocks` write to `out1` (offset by `split_blocks * kRows`)
+// with pitch `out1_ld`.
+struct Q3SplitLinearProblem {
+    static constexpr int kOutRows = kRows;
+    const std::uint8_t* codes;
+    const std::uint16_t* scales;
+    __nv_bfloat16* out0;
+    std::int32_t out0_ld;
+    __nv_bfloat16* out1;
+    std::int32_t out1_ld;
+    std::int32_t split_blocks;
+
+    __device__ Q3RowSource source(int row_block, int row, int quarter, int groups) const {
+        const std::int64_t grow = static_cast<std::int64_t>(row_block) * kRows + row;
+        return {codes + grow * groups * Q3RowSplitStorage::kCodeBytesPerGroup + quarter * 12,
+                scales + grow * groups};
+    }
+    template <int MT>
+    __device__ void stage_outputs(const float (&acc)[MT][4][4], __nv_bfloat16* staged, int ld,
+                                  int warp_row, int warp_token, int lane) const {
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                stage_fragment(staged, ld, warp_row + mt * 16 + (lane >> 2),
+                               warp_token + nt * 8 + 2 * (lane & 3),
+                               [&](int e) { return __float2bfloat16_rn(acc[mt][nt][e]); });
+            }
+        }
+    }
+    __device__ void write(int row_block, int token, int row, uint4 values) const {
+        if (row_block < split_blocks) {
+            *reinterpret_cast<uint4*>(
+                &out0[static_cast<std::int64_t>(token) * out0_ld + row_block * kRows + row]) =
+                values;
+        } else {
+            *reinterpret_cast<uint4*>(&out1[static_cast<std::int64_t>(token) * out1_ld +
+                                            (row_block - split_blocks) * kRows + row]) = values;
+        }
+    }
+};
+
+// Fused RowSplit Q3 linear + residual add: rounds the projection to BF16 and adds `residual_out`
+// in-place in BF16 (matching the standalone linear + residual_add instruction sequence).
+struct Q3LinearAddProblem {
+    static constexpr int kOutRows = kRows;
+    const std::uint8_t* codes;
+    const std::uint16_t* scales;
+    __nv_bfloat16* residual_out;
+    std::int32_t out_ld;
+
+    __device__ Q3RowSource source(int row_block, int row, int quarter, int groups) const {
+        const std::int64_t grow = static_cast<std::int64_t>(row_block) * kRows + row;
+        return {codes + grow * groups * Q3RowSplitStorage::kCodeBytesPerGroup + quarter * 12,
+                scales + grow * groups};
+    }
+    template <int MT>
+    __device__ void stage_outputs(const float (&acc)[MT][4][4], __nv_bfloat16* staged, int ld,
+                                  int warp_row, int warp_token, int lane) const {
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                stage_fragment(staged, ld, warp_row + mt * 16 + (lane >> 2),
+                               warp_token + nt * 8 + 2 * (lane & 3),
+                               [&](int e) { return __float2bfloat16_rn(acc[mt][nt][e]); });
+            }
+        }
+    }
+    __device__ void write(int row_block, int token, int row, uint4 values) const {
+        uint4* dst      = reinterpret_cast<uint4*>(&residual_out[static_cast<std::int64_t>(token) *
+                                                                 out_ld + row_block * kRows + row]);
+        const uint4 res = *dst;
+        uint4 sum;
+        const __nv_bfloat162* v2 = reinterpret_cast<const __nv_bfloat162*>(&values);
+        const __nv_bfloat162* r2 = reinterpret_cast<const __nv_bfloat162*>(&res);
+        __nv_bfloat162* s2       = reinterpret_cast<__nv_bfloat162*>(&sum);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { s2[i] = __hadd2(v2[i], r2[i]); }
+        *dst = sum;
+    }
+};
+
 // Folded gate/up SwiGLU over the stacked [2*intermediate, K] Q3 parent: row block b holds
 // output rows 64 b .. 64 b + 63; tile rows 0-31 and 64-95 are their gate rows and tile rows 32-63
 // and 96-127 the matching up rows, so a 64-row warp tile pairs its first and second halves.
@@ -350,6 +434,76 @@ struct Q3SwiGluProblem {
     __device__ void write(int row_block, int token, int row, uint4 values) const {
         *reinterpret_cast<uint4*>(&out[static_cast<std::int64_t>(token) * intermediate +
                                        row_block * 64 + row]) = values;
+    }
+};
+
+// Folded gate/up SwiGLU that quantizes its 64-row output block directly into an A8G64Activation
+// (one 64-element group per row_block per token) after BF16 rounding in shared memory.
+struct Q3SwiGluA8OutProblem {
+    static constexpr int kOutRows = 64;
+    const std::uint8_t* codes;
+    const std::uint16_t* scales;
+    std::int8_t* q_out;
+    float* scale_out;
+    std::int32_t intermediate;
+    std::int32_t total_tokens;
+
+    __device__ Q3RowSource source(int row_block, int row, int quarter, int groups) const {
+        const int block   = row >> 6;
+        const int local   = row & 63;
+        const int out_row = row_block * 64 + block * 32 + (local & 31);
+        const bool up     = (local >> 5) != 0;
+        const std::int64_t grow = up ? intermediate + out_row : out_row;
+        return {codes + grow * groups * Q3RowSplitStorage::kCodeBytesPerGroup + quarter * 12,
+                scales + grow * groups};
+    }
+    template <int MT>
+    __device__ void stage_outputs(const float (&acc)[MT][4][4], __nv_bfloat16* staged, int ld,
+                                  int warp_row, int warp_token, int lane) const {
+        static_assert(MT == 4, "the folded pairing needs 64-row warp tiles");
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                stage_fragment(staged, ld, warp_row / 2 + mt * 16 + (lane >> 2),
+                               warp_token + nt * 8 + 2 * (lane & 3), [&](int e) {
+                                   return __float2bfloat16_rn(silu(acc[mt][nt][e]) *
+                                                              acc[mt + 2][nt][e]);
+                               });
+            }
+        }
+    }
+    __device__ void write(int row_block, int token, int row, uint4 values) const {
+        const unsigned words[4] = {values.x, values.y, values.z, values.w};
+        float value[8];
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 pair =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&words[i]));
+            value[2 * i]     = pair.x;
+            value[2 * i + 1] = pair.y;
+            amax             = fmaxf(amax, fmaxf(fabsf(pair.x), fabsf(pair.y)));
+        }
+        const unsigned mask = 0xffu << (threadIdx.x & 24);
+#pragma unroll
+        for (int offset_lanes = 1; offset_lanes < 8; offset_lanes <<= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(mask, amax, offset_lanes));
+        }
+        const float inverse = amax > 0.0f ? 127.0f / amax : 0.0f;
+        unsigned packed[2]  = {0u, 0u};
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int code = max(-127, min(127, __float2int_rn(value[i] * inverse)));
+            packed[i >> 2] |= (static_cast<unsigned>(code) & 0xffu) << (8 * (i & 3));
+        }
+        const std::int64_t offset =
+            static_cast<std::int64_t>(token) * intermediate + row_block * 64 + row;
+        *reinterpret_cast<uint2*>(q_out + offset) = make_uint2(packed[0], packed[1]);
+        if (row == 0) {
+            scale_out[static_cast<std::int64_t>(row_block) * total_tokens + token] =
+                amax / 127.0f;
+        }
     }
 };
 

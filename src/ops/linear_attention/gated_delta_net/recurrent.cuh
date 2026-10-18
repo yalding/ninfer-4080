@@ -21,12 +21,17 @@ static_assert(kStateDim % kBlockDv == 0);
 
 __device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const float* base,
                                              std::uint32_t dqk_base) {
-    store_vec(reg, load_vec<float4>(base + dqk_base));
+    const float4 v = __ldcs(reinterpret_cast<const float4*>(base + dqk_base));
+    reg[0]         = v.x;
+    reg[1]         = v.y;
+    reg[2]         = v.z;
+    reg[3]         = v.w;
 }
 
 __device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], float* base,
                                               std::uint32_t dqk_base) {
-    store_vec(base + dqk_base, load_vec<float4>(reg));
+    __stcs(reinterpret_cast<float4*>(base + dqk_base),
+           make_float4(reg[0], reg[1], reg[2], reg[3]));
 }
 
 inline constexpr float kQkL2NormEps = 1.0e-6f;
@@ -91,13 +96,13 @@ __device__ __forceinline__ RawValuePack load_value_pack(const __nv_bfloat16* bas
 
 __device__ __forceinline__ RawGatePair load_source_gate(const float* g, const float* beta,
                                                         std::int64_t offset) {
-    const float g_value    = g[offset];
-    const float beta_value = beta[offset];
+    const float g_value    = load_ldg<float>(g + offset);
+    const float beta_value = load_ldg<float>(beta + offset);
     return {make_uint2(__float_as_uint(g_value), __float_as_uint(beta_value)), g_value, beta_value};
 }
 
 __device__ __forceinline__ RawGatePair load_record_gate(const uint2* gate, std::int64_t offset) {
-    const uint2 bits = load_vec<uint2>(gate + offset);
+    const uint2 bits = load_ldg<uint2>(gate + offset);
     return {bits, __uint_as_float(bits.x), __uint_as_float(bits.y)};
 }
 
@@ -651,7 +656,7 @@ __device__ __forceinline__ void zero_output_suffix(const Access& access,
 }
 
 template <bool NormalizeInputs>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 6)
     recurrent_bf16_direct_kernel(const __nv_bfloat16* __restrict__ q,
                                  const __nv_bfloat16* __restrict__ k,
                                  const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
@@ -668,7 +673,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 }
 
 template <bool NormalizeInputs>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 6)
     recurrent_batch_update_kernel(BatchUpdateAccess access) {
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
@@ -678,7 +683,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 }
 
 template <bool Masked>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 6)
     recurrent_record_kernel(RecordAccess<Masked> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);
@@ -689,7 +694,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 }
 
 template <class Geometry>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 6)
     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);

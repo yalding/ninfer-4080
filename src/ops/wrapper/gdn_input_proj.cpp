@@ -11,10 +11,12 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
+#include "ops/common/rowsplit_a8_quantize.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/q3/q3_dispatch.h"
 
 #include <algorithm>
 #include <array>
@@ -49,16 +51,6 @@ void require_q3_rowsplit(const Weight& weight, std::int32_t rows, const char* la
     }
 }
 
-// Column-major row-window copy for a [rows, columns] BF16 tensor.
-void copy_columns(const void* src, std::size_t src_pitch, std::size_t src_offset, void* dst,
-                  std::size_t dst_pitch, std::size_t dst_offset, std::size_t width_bytes,
-                  std::int32_t columns, cudaStream_t stream) {
-    CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::uint8_t*>(dst) + dst_offset, dst_pitch,
-                                 static_cast<const std::uint8_t*>(src) + src_offset, src_pitch,
-                                 width_bytes, static_cast<std::size_t>(columns),
-                                 cudaMemcpyDeviceToDevice, stream));
-}
-
 void require_conv_tensor(const Tensor& tensor, std::int32_t rows, std::int32_t width,
                          std::int32_t batch, const char* op, const char* label) {
     if (tensor.dtype != DType::BF16 || tensor.ne[0] != rows || tensor.ne[1] != width ||
@@ -80,28 +72,32 @@ void require_single_parent_nonoverlap(const Tensor& x, const Tensor& qkv, const 
     }
 }
 
-// Composed two-parent Q3 projection: [query,key] then [value,z] through one qualified
-// projection buffer, publishing qkv [10240,T] and z [6144,T].
+// Direct two-parent Q3 projection: [query,key] writes rows 0..4095 of qkv [10240,T] and [value,z]
+// splits rows 0..6143 to qkv + 4096 and rows 6144..12287 to z [6144,T], with a single shared A8
+// quantization of x when the A8 route is selected.
 void dispatch_q3_input_pair(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                             Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
                             cudaStream_t stream) {
+    constexpr std::int32_t kHidden    = 5120;
     constexpr std::int32_t kQkRows    = 4096;
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
-    constexpr std::size_t kElem       = sizeof(std::uint16_t);
+    constexpr std::int32_t kQkvRows   = kQkRows + kValueRows;
     const std::int32_t columns        = x.ne[1];
-    auto scope                        = ws.scope();
-    Tensor qk                         = ws.alloc(DType::BF16, {kQkRows, columns});
-    linear(x, qk_weight, qk, policy, ws, stream);
-    copy_columns(qk.data, kQkRows * kElem, 0, qkv.data, (kQkRows + kValueRows) * kElem, 0,
-                 kQkRows * kElem, columns, stream);
-    Tensor vz = ws.alloc(DType::BF16, {kValueRows + kZRows, columns});
-    linear(x, value_z_weight, vz, policy, ws, stream);
-    copy_columns(vz.data, (kValueRows + kZRows) * kElem, 0, qkv.data,
-                 (kQkRows + kValueRows) * kElem, kQkRows * kElem, kValueRows * kElem, columns,
-                 stream);
-    copy_columns(vz.data, (kValueRows + kZRows) * kElem, kValueRows * kElem, z.data,
-                 kZRows * kElem, 0, kZRows * kElem, columns, stream);
+    void* const qkv_value_base =
+        static_cast<std::uint8_t*>(qkv.data) + static_cast<std::size_t>(kQkRows) * sizeof(std::uint16_t);
+    if (detail::q3_uses_a8(kQkRows, kHidden, kHidden, policy, columns)) {
+        auto scope                    = ws.scope();
+        detail::A8G64Activation act = detail::allocate_a8_g64_activation(ws, kHidden, columns);
+        detail::a8_g64_quantize(x, act, stream);
+        detail::q3_dispatch_a8_pitched(act, qk_weight, qkv.data, kQkvRows, stream);
+        detail::q3_dispatch_a8_split(act, value_z_weight, qkv_value_base, kQkvRows, z.data, kZRows,
+                                     kValueRows, stream);
+        return;
+    }
+    detail::q3_dispatch_a16_pitched(x, qk_weight, qkv.data, kQkvRows, stream);
+    detail::q3_dispatch_a16_split(x, value_z_weight, qkv_value_base, kQkvRows, z.data, kZRows,
+                                  kValueRows, stream);
 }
 
 struct ConvGeometry {
@@ -845,13 +841,8 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     }
     if (parent_qtype == QType::Q3G128_F16S && parent_rows == 16384 && input_rows == 5120 &&
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8)) {
-        // The pair projects [4096] then [12288] into one scope; the A8 activation is sized per
-        // projection and only the widest one can be live with the second projection.
-        WorkspaceLayoutBuilder layout;
-        (void)layout.alloc(DType::BF16, {4096 + 12288, max_tokens});
-        (void)layout.alloc_bytes(linear_workspace_capacity_bytes(
-            QType::Q3G128_F16S, 4096 + 12288, input_rows, policy, min_tokens, max_tokens));
-        return layout.peak_bytes(1);
+        return linear_workspace_capacity_bytes(QType::Q3G128_F16S, 4096, input_rows, policy,
+                                               min_tokens, max_tokens);
     }
     throw std::invalid_argument("gdn_input_proj workspace: unsupported parent qtype");
 }

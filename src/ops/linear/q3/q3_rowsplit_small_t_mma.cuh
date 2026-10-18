@@ -156,6 +156,99 @@ struct Q3SmallTLinearProblem {
     }
 };
 
+// Split 32-row output blocks: row blocks below `split_blocks` write to `out0` with pitch `out0_ld`,
+// and row blocks at or above `split_blocks` write to `out1` (offset by `split_blocks * kRows`)
+// with pitch `out1_ld`.
+struct Q3SmallTSplitLinearProblem {
+    static constexpr bool kFused = false;
+
+    const std::uint8_t* codes;
+    const std::uint16_t* scales;
+    __nv_bfloat16* out0;
+    std::int32_t out0_ld;
+    __nv_bfloat16* out1;
+    std::int32_t out1_ld;
+    std::int32_t split_blocks;
+    std::int32_t groups_per_row;
+
+    __device__ __forceinline__ const std::uint8_t* code_row(int row_block, int local_row) const {
+        const std::int64_t grow = static_cast<std::int64_t>(row_block) * kRows + local_row;
+        return codes + grow * groups_per_row * kCodeBytesPerGroup;
+    }
+    __device__ __forceinline__ const std::uint16_t* scale_row(int row_block, int local_row) const {
+        const std::int64_t grow = static_cast<std::int64_t>(row_block) * kRows + local_row;
+        return scales + grow * groups_per_row;
+    }
+    __device__ __forceinline__ void emit(int row_block, int token0, int lane,
+                                         const float (&acc)[kM16Tiles][4], int tokens) const {
+        const int gid          = lane >> 2;
+        const int lid          = lane & 3;
+        const int col0         = token0 + 2 * lid;
+        __nv_bfloat16* dst     = row_block < split_blocks ? out0 : out1;
+        const std::int32_t ld  = row_block < split_blocks ? out0_ld : out1_ld;
+        const int block_offset = row_block < split_blocks ? row_block : (row_block - split_blocks);
+        for (int t = 0; t < kM16Tiles; ++t) {
+            const int row0 = block_offset * kRows + t * 16 + gid;
+            if (col0 < tokens) {
+                dst[static_cast<std::int64_t>(col0) * ld + row0] = __float2bfloat16_rn(acc[t][0]);
+                dst[static_cast<std::int64_t>(col0) * ld + row0 + 8] =
+                    __float2bfloat16_rn(acc[t][2]);
+            }
+            if (col0 + 1 < tokens) {
+                dst[static_cast<std::int64_t>(col0 + 1) * ld + row0] =
+                    __float2bfloat16_rn(acc[t][1]);
+                dst[static_cast<std::int64_t>(col0 + 1) * ld + row0 + 8] =
+                    __float2bfloat16_rn(acc[t][3]);
+            }
+        }
+    }
+};
+
+// Fused 32-row output block + residual add: rounds the projection to BF16 and adds `residual_out`
+// in-place in BF16.
+struct Q3SmallTLinearAddProblem {
+    static constexpr bool kFused = false;
+
+    const std::uint8_t* codes;
+    const std::uint16_t* scales;
+    __nv_bfloat16* residual_out;
+    std::int32_t out_ld;
+    std::int32_t groups_per_row;
+
+    __device__ __forceinline__ const std::uint8_t* code_row(int row_block, int local_row) const {
+        const std::int64_t grow = static_cast<std::int64_t>(row_block) * kRows + local_row;
+        return codes + grow * groups_per_row * kCodeBytesPerGroup;
+    }
+    __device__ __forceinline__ const std::uint16_t* scale_row(int row_block, int local_row) const {
+        const std::int64_t grow = static_cast<std::int64_t>(row_block) * kRows + local_row;
+        return scales + grow * groups_per_row;
+    }
+    __device__ __forceinline__ void emit(int row_block, int token0, int lane,
+                                         const float (&acc)[kM16Tiles][4], int tokens) const {
+        const int gid  = lane >> 2;
+        const int lid  = lane & 3;
+        const int col0 = token0 + 2 * lid;
+        for (int t = 0; t < kM16Tiles; ++t) {
+            const int row0 = row_block * kRows + t * 16 + gid;
+            if (col0 < tokens) {
+                __nv_bfloat16* d0 = &residual_out[static_cast<std::int64_t>(col0) * out_ld + row0];
+                __nv_bfloat16* d2 =
+                    &residual_out[static_cast<std::int64_t>(col0) * out_ld + row0 + 8];
+                *d0 = __hadd(__float2bfloat16_rn(acc[t][0]), *d0);
+                *d2 = __hadd(__float2bfloat16_rn(acc[t][2]), *d2);
+            }
+            if (col0 + 1 < tokens) {
+                __nv_bfloat16* d1 =
+                    &residual_out[static_cast<std::int64_t>(col0 + 1) * out_ld + row0];
+                __nv_bfloat16* d3 =
+                    &residual_out[static_cast<std::int64_t>(col0 + 1) * out_ld + row0 + 8];
+                *d1 = __hadd(__float2bfloat16_rn(acc[t][1]), *d1);
+                *d3 = __hadd(__float2bfloat16_rn(acc[t][3]), *d3);
+            }
+        }
+    }
+};
+
 // Folded gate/up SwiGLU: the stacked [2*intermediate, K] parent supplies tile rows 0-15 as the
 // gate rows and rows 16-31 as the matching up rows of one 16-row output block, so the epilogue
 // publishes the Problem's single `silu(gate) * up` BF16 rounding.

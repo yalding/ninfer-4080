@@ -13,6 +13,7 @@ namespace ninfer::ops::detail {
 // 1 through kQ3SmallTMaxTokens. Other widths (decode with a shape the small-T engine does not
 // own, batched decode) keep the A16 routes.
 inline constexpr std::int32_t kQ3A8MinTokens = 129;
+inline constexpr std::int32_t kQ3A8WideMinTokens = 1024;
 // The tall engine's block shape; the dispatch layer cannot include the device header.
 inline constexpr std::int32_t kQ3A8Rows = 128;
 inline constexpr std::int32_t kQ3A8StepK = 64;
@@ -44,4 +45,20 @@ Q3Launch select_q3_launch(std::int32_t n, std::int32_t k, std::int32_t padded_k,
 
 void q3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  WorkspaceArena* workspace, cudaStream_t stream);
+
+void q3_dispatch_a16_pitched(const Tensor& x, const Weight& w, void* out, std::int32_t out_ld,
+                             cudaStream_t stream);
+void q3_dispatch_a16_split(const Tensor& x, const Weight& w, void* out0, std::int32_t out0_ld,
+                           void* out1, std::int32_t out1_ld, std::int32_t split_rows,
+                           cudaStream_t stream);
+void q3_dispatch_a8_pitched(const A8G64Activation& act, const Weight& w, void* out,
+                            std::int32_t out_ld, cudaStream_t stream);
+void q3_dispatch_a8_split(const A8G64Activation& act, const Weight& w, void* out0,
+                          std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                          std::int32_t split_rows, cudaStream_t stream);
+
+void q3_dispatch_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPolicy policy,
+                     WorkspaceArena* workspace, cudaStream_t stream);
+void q3_dispatch_a8_add(const A8G64Activation& act, const Weight& w, Tensor& residual_out,
+                        cudaStream_t stream);
 } // namespace ninfer::ops::detail

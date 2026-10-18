@@ -10,6 +10,8 @@
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/silu_mul.h"
+#include "ops/common/rowsplit_a8_quantize.h"
+#include "ops/linear/q3/q3_dispatch.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -123,6 +125,41 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
 std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
                                        ops::LinearPolicy policy, std::int32_t first,
                                        std::int32_t last) {
+    if (gate_up_qtype == QType::Q3G128_F16S && down_qtype == QType::Q3G128_F16S &&
+        policy == ops::LinearPolicy::AllowA8) {
+        std::size_t bytes = 0;
+        if (last >= ops::detail::kQ3A8MinTokens) {
+            WorkspaceLayoutBuilder fused_layout;
+            (void)ops::detail::allocate_a8_g64_activation(fused_layout, TextConfig::intermediate,
+                                                          last);
+            {
+                auto scope = fused_layout.scope();
+                (void)ops::detail::allocate_a8_g64_activation(fused_layout, TextConfig::hidden,
+                                                              last);
+            }
+            bytes = fused_layout.peak_bytes(1);
+        }
+        if (first < ops::detail::kQ3A8MinTokens) {
+            const std::int32_t unfused_last =
+                std::min(last, ops::detail::kQ3A8MinTokens - 1);
+            WorkspaceLayoutBuilder unfused_layout;
+            (void)unfused_layout.alloc(DType::BF16, {TextConfig::intermediate, unfused_last});
+            {
+                auto scope = unfused_layout.scope();
+                (void)unfused_layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
+                    gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, policy, first,
+                    unfused_last));
+            }
+            {
+                auto scope = unfused_layout.scope();
+                (void)unfused_layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
+                    down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first,
+                    unfused_last));
+            }
+            bytes = std::max(bytes, unfused_layout.peak_bytes(1));
+        }
+        return bytes;
+    }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
     {
@@ -338,8 +375,29 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, const ::ninfer::ops::SparseMoeHints&,
                          WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope        = workspace.scope();
-    Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
+    auto scope = workspace.scope();
+    const std::int32_t columns = hidden.ne[1];
+    if (weights.gate_up.qtype == QType::Q3G128_F16S && weights.down.qtype == QType::Q3G128_F16S &&
+        kQ3TextPolicy == ops::LinearPolicy::AllowA8 && columns >= ops::detail::kQ3A8MinTokens) {
+        ops::detail::A8G64Activation act_out = ops::detail::allocate_a8_g64_activation(
+            workspace, TextConfig::intermediate, columns);
+        {
+            auto swiglu_scope = workspace.scope();
+            ops::detail::A8G64Activation act_in = ops::detail::allocate_a8_g64_activation(
+                workspace, TextConfig::hidden, columns);
+            ops::detail::a8_g64_quantize(hidden, act_in, stream);
+            if (columns >= ops::detail::kQ3A8WideMinTokens) {
+                ops::detail::launch_q3_mma_tall_a8_swiglu_a8_out_r64_c256(
+                    act_in, weights.gate_up, act_out, stream);
+            } else {
+                ops::detail::launch_q3_mma_tall_a8_swiglu_a8_out_r64_c128(
+                    act_in, weights.gate_up, act_out, stream);
+            }
+        }
+        ops::detail::q3_dispatch_a8_add(act_out, weights.down, residual, stream);
+        return;
+    }
+    Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, columns});
     ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
                        stream);
     ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
@@ -348,17 +406,11 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                              Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope     = workspace.scope();
-    const int cols = hidden.ne[1];
-    Tensor gate_up = workspace.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, cols});
-    ops::linear(hidden, weights.gate_up, gate_up, stream);
+    auto scope        = workspace.scope();
+    const int cols    = hidden.ne[1];
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
-    ops::silu_mul(gate_up.slice(0, 0, TextConfig::intermediate),
-                  gate_up.slice(0, TextConfig::intermediate, TextConfig::intermediate), activation,
-                  stream);
-    Tensor delta = workspace.alloc(DType::BF16, {TextConfig::hidden, cols});
-    ops::linear(activation, weights.down, delta, stream);
-    ops::residual_add(delta, residual, stream);
+    ops::linear_swiglu(hidden, weights.gate_up, activation, workspace, stream);
+    ops::linear_add(activation, weights.down, residual, workspace, stream);
 }
 
 std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
@@ -635,9 +687,7 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                              std::int32_t last) {
     validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, last});
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
     return layout.peak_bytes(1);
 }
 

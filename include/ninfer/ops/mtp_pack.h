@@ -51,4 +51,22 @@ void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, 
 void mtp_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,
                        cudaStream_t stream);
 
+/**
+ * Op: mtp_rmsnorm_pack_fc_input
+ *
+ * Math / indexing:
+ *   embedding_norm[:, t] = rmsnorm_unit_offset(embedding[:, t], embedding_weight, eps)
+ *   hidden_norm[:, t]    = rmsnorm_unit_offset(hidden[:, t], hidden_weight, eps)
+ *   out[0:D, t]          = embedding_norm[:, t]
+ *   out[D:2D, t]         = hidden_norm[:, t]
+ *
+ * Logical shapes:
+ *   BF16 embedding [D, T], embedding_weight [D], hidden [D, T], hidden_weight [D],
+ *   out [2D, T], all contiguous.
+ *   Registered domains are D=5120 for Qwen3.6-27B and D=2048 for Qwen3.6-35B-A3B.
+ */
+void mtp_rmsnorm_pack_fc_input(const Tensor& embedding, const Tensor& embedding_weight,
+                               const Tensor& hidden, const Tensor& hidden_weight,
+                               float eps, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops

@@ -1,12 +1,11 @@
 #include "ninfer/ops/linear_add.h"
 
-#include "ninfer/ops/residual_add.h"
-
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/q3/q3_dispatch.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
@@ -127,11 +126,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         if (!supported_shape) {
             throw std::invalid_argument("linear_add workspace: unsupported Q3 profile");
         }
-        WorkspaceLayoutBuilder layout;
-        (void)layout.alloc(DType::BF16, {output_rows, max_tokens});
-        (void)layout.alloc_bytes(linear_workspace_capacity_bytes(qtype, output_rows, input_rows,
-                                                               policy, min_tokens, max_tokens));
-        return layout.peak_bytes(1);
+        return linear_workspace_capacity_bytes(qtype, output_rows, input_rows, policy, min_tokens,
+                                               max_tokens);
     }
     if (qtype == QType::NVFP4) {
         const bool supported = (output_rows == detail::Nvfp4Residual6144Geometry::kOutputRows &&
@@ -220,10 +216,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument(
                 "linear_add: Q3 requires 16-byte x/residual/code alignment");
         }
-        auto scope    = ws.scope();
-        Tensor delta  = ws.alloc(DType::BF16, {w.n, t});
-        linear(x, w, delta, policy, ws, stream);
-        residual_add(delta, residual_out, stream);
+        detail::q3_dispatch_add(x, w, residual_out, policy, &ws, stream);
         return;
     }
 
@@ -232,7 +225,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("W8 linear_add admits only A16");
         }
         require_w8(w);
-        if (w.n != 2048 || (w.k != 4096 && w.k != 6144)) {
+        const bool supported_shape =
+            (w.n == 2048 && (w.k == 4096 || w.k == 6144)) ||
+            (w.n == 5120 && (w.k == 6144 || w.k == 17408));
+        if (!supported_shape) {
             throw std::invalid_argument("linear_add: unsupported W8 shape");
         }
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||

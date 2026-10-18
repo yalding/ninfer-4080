@@ -183,13 +183,20 @@ __device__ __forceinline__ void q3_gemv_consume_stage(
     }
 }
 
+enum class Q3GemvEpilogue {
+    Plain,
+    Split,
+    Add,
+};
+
 template <int MaxCols, bool FullK, bool Fused, int GroupsPerStage, int PipelineStages,
-          int LaunchBoundsMinBlocks>
+          int LaunchBoundsMinBlocks, Q3GemvEpilogue Epilogue = Q3GemvEpilogue::Plain>
 __device__ __forceinline__ void q3_gemv_run(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
-    std::int32_t out_rows, std::int32_t k, std::int32_t cols, std::int32_t padded_k,
-    std::int32_t pair_stride, std::int32_t weight_rows) {
+    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out0,
+    std::int32_t out0_ld, __nv_bfloat16* __restrict__ out1, std::int32_t out1_ld,
+    std::int32_t split_rows, std::int32_t out_rows, std::int32_t k, std::int32_t cols,
+    std::int32_t padded_k, std::int32_t pair_stride, std::int32_t weight_rows) {
     using Tiles                = StageTiles<Fused ? 2 : 1, GroupsPerStage, PipelineStages>;
     constexpr int kRowsPerLane = Tiles::kStageRows;
     constexpr int kStageRows   = Tiles::kStageRows;
@@ -213,7 +220,7 @@ __device__ __forceinline__ void q3_gemv_run(
 #pragma unroll
     for (int row = 0; row < kStageRows; ++row) {
         row_codes[row] = codes + static_cast<std::int64_t>(live[row] ? rows[row] : 0) *
-                                    groups_per_row * kGroupBytes;
+                                     groups_per_row * kGroupBytes;
         row_scales[row] = reinterpret_cast<const std::uint16_t*>(scales) +
                           static_cast<std::int64_t>(live[row] ? rows[row] : 0) * groups_per_row;
     }
@@ -268,12 +275,24 @@ __device__ __forceinline__ void q3_gemv_run(
                 up += __shfl_down_sync(0xffffffffu, up, offset);
             }
             if (lane == 0 && live[0]) {
-                out[static_cast<std::int64_t>(col) * out_rows + row_a] =
+                out0[static_cast<std::int64_t>(col) * out0_ld + row_a] =
                     __float2bfloat16_rn(silu(gate) * up);
             }
         } else {
             if (lane == 0 && live[0]) {
-                out[static_cast<std::int64_t>(col) * out_rows + row_a] = __float2bfloat16(gate);
+                const __nv_bfloat16 val = __float2bfloat16(gate);
+                if constexpr (Epilogue == Q3GemvEpilogue::Split) {
+                    if (row_a < split_rows) {
+                        out0[static_cast<std::int64_t>(col) * out0_ld + row_a] = val;
+                    } else {
+                        out1[static_cast<std::int64_t>(col) * out1_ld + (row_a - split_rows)] = val;
+                    }
+                } else if constexpr (Epilogue == Q3GemvEpilogue::Add) {
+                    __nv_bfloat16* dst = &out0[static_cast<std::int64_t>(col) * out0_ld + row_a];
+                    *dst               = __hadd(val, *dst);
+                } else {
+                    out0[static_cast<std::int64_t>(col) * out0_ld + row_a] = val;
+                }
             }
         }
     }
@@ -287,7 +306,21 @@ __global__ __launch_bounds__(kThreads, LaunchBoundsMinBlocks) void q3_gemv_stage
     std::int32_t out_rows, std::int32_t k, std::int32_t cols, std::int32_t padded_k,
     std::int32_t pair_stride, std::int32_t weight_rows) {
     q3_gemv_run<MaxCols, FullK, Fused, GroupsPerStage, PipelineStages, LaunchBoundsMinBlocks>(
-        x, codes, scales, out, out_rows, k, cols, padded_k, pair_stride, weight_rows);
+        x, codes, scales, out, out_rows, nullptr, 0, out_rows, out_rows, k, cols, padded_k,
+        pair_stride, weight_rows);
+}
+
+template <int MaxCols, bool FullK, int GroupsPerStage, int PipelineStages,
+          int LaunchBoundsMinBlocks, Q3GemvEpilogue Epilogue>
+__global__ __launch_bounds__(kThreads, LaunchBoundsMinBlocks) void q3_gemv_staged_epilogue_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out0,
+    std::int32_t out0_ld, __nv_bfloat16* __restrict__ out1, std::int32_t out1_ld,
+    std::int32_t split_rows, std::int32_t out_rows, std::int32_t k, std::int32_t cols,
+    std::int32_t padded_k) {
+    q3_gemv_run<MaxCols, FullK, false, GroupsPerStage, PipelineStages, LaunchBoundsMinBlocks,
+                Epilogue>(x, codes, scales, out0, out0_ld, out1, out1_ld, split_rows, out_rows, k,
+                          cols, padded_k, 1, out_rows);
 }
 
 } // namespace ninfer::ops::detail::q3_gemv_staged

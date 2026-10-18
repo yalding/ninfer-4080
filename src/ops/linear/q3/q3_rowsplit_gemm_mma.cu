@@ -41,6 +41,38 @@ void launch_schedule(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <class Schedule, Q3MmaEpilogue Epilogue, class OutT = __nv_bfloat16>
+void launch_epilogue_schedule(const Tensor& x, const Weight& w, void* out0, std::int32_t out0_ld,
+                              void* out1, std::int32_t out1_ld, std::int32_t split_rows,
+                              cudaStream_t stream) {
+    const std::int32_t rows     = w.n;
+    const std::int32_t k        = x.ne[0];
+    const std::int32_t cols     = x.ne[1];
+    const std::int32_t padded_k = static_cast<std::int32_t>(w.padded_shape[1]);
+
+    const dim3 grid(static_cast<unsigned>((rows + Schedule::kBlockRows - 1) / Schedule::kBlockRows),
+                    static_cast<unsigned>((cols + Schedule::kBlockCols - 1) / Schedule::kBlockCols),
+                    1u);
+    const bool full = (rows % Schedule::kBlockRows) == 0 &&
+                      (cols % Schedule::kBlockCols) == 0 && k == padded_k;
+    if (full) {
+        q3_rowsplit_gemm_mma_epilogue_kernel<Schedule, true, OutT, Epilogue>
+            <<<grid, Schedule::kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<OutT*>(out0), out0_ld,
+                static_cast<OutT*>(out1), out1_ld, split_rows, rows, k, cols, padded_k);
+    } else {
+        q3_rowsplit_gemm_mma_epilogue_kernel<Schedule, false, OutT, Epilogue>
+            <<<grid, Schedule::kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<OutT*>(out0), out0_ld,
+                static_cast<OutT*>(out1), out1_ld, split_rows, rows, k, cols, padded_k);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 void launch_q3_mma_r32_c64(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -50,6 +82,25 @@ void launch_q3_mma_r32_c64(const Tensor& x, const Weight& w, Tensor& out, cudaSt
 void launch_q3_mma_r32_c64_f32(const Tensor& x, const Weight& w, Tensor& out,
                                cudaStream_t stream) {
     launch_schedule<Q3MmaR32C64Schedule, float>(x, w, out, stream);
+}
+
+void launch_q3_mma_r32_c64_pitched(const Tensor& x, const Weight& w, void* out,
+                                   std::int32_t out_ld, cudaStream_t stream) {
+    launch_epilogue_schedule<Q3MmaR32C64Schedule, Q3MmaEpilogue::Plain>(x, w, out, out_ld, nullptr,
+                                                                        0, w.n, stream);
+}
+
+void launch_q3_mma_r32_c64_split(const Tensor& x, const Weight& w, void* out0,
+                                 std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                                 std::int32_t split_rows, cudaStream_t stream) {
+    launch_epilogue_schedule<Q3MmaR32C64Schedule, Q3MmaEpilogue::Split>(x, w, out0, out0_ld, out1,
+                                                                        out1_ld, split_rows, stream);
+}
+
+void launch_q3_mma_r32_c64_add(const Tensor& x, const Weight& w, Tensor& residual_out,
+                               cudaStream_t stream) {
+    launch_epilogue_schedule<Q3MmaR32C64Schedule, Q3MmaEpilogue::Add>(
+        x, w, residual_out.data, residual_out.ne[0], nullptr, 0, w.n, stream);
 }
 
 } // namespace ninfer::ops::detail

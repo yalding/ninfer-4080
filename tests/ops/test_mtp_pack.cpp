@@ -137,6 +137,93 @@ int split_case(std::int32_t tokens) {
     return failures;
 }
 
+int rmsnorm_pack_case(std::int32_t hidden, std::int32_t tokens) {
+    const std::int32_t output_rows = 2 * hidden;
+    const std::size_t input_count  = static_cast<std::size_t>(hidden) * tokens;
+    const float eps = 1e-6f;
+
+    std::vector<float> emb_f(input_count), hid_f(input_count);
+    std::vector<float> ew_f(hidden), hw_f(hidden);
+    fill_uniform(emb_f, 0x1234u, -4.0f, 4.0f);
+    fill_uniform(hid_f, 0x5678u, -4.0f, 4.0f);
+    fill_uniform(ew_f, 0x9abcu, -1.5f, 1.5f);
+    fill_uniform(hw_f, 0xdef0u, -1.5f, 1.5f);
+    round_to_bf16(emb_f);
+    round_to_bf16(hid_f);
+    round_to_bf16(ew_f);
+    round_to_bf16(hw_f);
+
+    std::vector<double> ref(static_cast<std::size_t>(output_rows) * tokens);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        double sum_sq_e = 0.0;
+        double sum_sq_h = 0.0;
+        for (std::int32_t r = 0; r < hidden; ++r) {
+            double ve = emb_f[t * hidden + r];
+            double vh = hid_f[t * hidden + r];
+            sum_sq_e += ve * ve;
+            sum_sq_h += vh * vh;
+        }
+        double inv_e = 1.0 / std::sqrt(sum_sq_e / static_cast<double>(hidden) + eps);
+        double inv_h = 1.0 / std::sqrt(sum_sq_h / static_cast<double>(hidden) + eps);
+        for (std::int32_t r = 0; r < hidden; ++r) {
+            double out_e = static_cast<double>(emb_f[t * hidden + r]) * inv_e * (static_cast<double>(ew_f[r]) + 1.0);
+            double out_h = static_cast<double>(hid_f[t * hidden + r]) * inv_h * (static_cast<double>(hw_f[r]) + 1.0);
+            ref[static_cast<std::size_t>(t) * output_rows + r] = out_e;
+            ref[static_cast<std::size_t>(t) * output_rows + hidden + r] = out_h;
+        }
+    }
+
+    std::vector<std::uint16_t> emb_bf16(input_count), hid_bf16(input_count);
+    std::vector<std::uint16_t> ew_bf16(hidden), hw_bf16(hidden);
+    for (std::size_t i = 0; i < input_count; ++i) {
+        emb_bf16[i] = f32_to_bf16(emb_f[i]);
+        hid_bf16[i] = f32_to_bf16(hid_f[i]);
+    }
+    for (std::int32_t i = 0; i < hidden; ++i) {
+        ew_bf16[i] = f32_to_bf16(ew_f[i]);
+        hw_bf16[i] = f32_to_bf16(hw_f[i]);
+    }
+
+    GuardedDeviceBuffer dev_emb(emb_bf16.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dev_ew(ew_bf16.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dev_hid(hid_bf16.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dev_hw(hw_bf16.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dev_out(ref.size() * sizeof(std::uint16_t));
+
+    dev_emb.copy_from_host(emb_bf16.data(), dev_emb.bytes());
+    dev_ew.copy_from_host(ew_bf16.data(), dev_ew.bytes());
+    dev_hid.copy_from_host(hid_bf16.data(), dev_hid.bytes());
+    dev_hw.copy_from_host(hw_bf16.data(), dev_hw.bytes());
+    dev_out.fill(0xcd);
+
+    Tensor t_emb(dev_emb.data(), DType::BF16, {hidden, tokens});
+    Tensor t_ew(dev_ew.data(), DType::BF16, {hidden});
+    Tensor t_hid(dev_hid.data(), DType::BF16, {hidden, tokens});
+    Tensor t_hw(dev_hw.data(), DType::BF16, {hidden});
+    Tensor t_out(dev_out.data(), DType::BF16, {output_rows, tokens});
+
+    ops::mtp_rmsnorm_pack_fc_input(t_emb, t_ew, t_hid, t_hw, eps, t_out, nullptr);
+    cuda_synchronize();
+
+    const std::string label = "mtp_rmsnorm_pack_fc_input D=" + std::to_string(hidden) + " T=" + std::to_string(tokens);
+    std::vector<std::uint16_t> gpu_out_u16 = from_device<std::uint16_t>(dev_out.data(), ref.size());
+    std::vector<double> gpu_out_d(ref.size());
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        gpu_out_d[i] = static_cast<double>(bf16_to_f32(gpu_out_u16[i]));
+    }
+
+    constexpr ReductionCriterion criterion{/*relative_l2*/ 1.85e-3, /*gross_absolute*/ 1.0e-5,
+                                           /*gross_relative_to_max_reference*/ 3.95e-3};
+    int failures = 0;
+    failures += verify_reduction(label.c_str(), gpu_out_d, ref, criterion);
+    failures += dev_emb.verify_guards((label + " emb").c_str());
+    failures += dev_ew.verify_guards((label + " ew").c_str());
+    failures += dev_hid.verify_guards((label + " hid").c_str());
+    failures += dev_hw.verify_guards((label + " hw").c_str());
+    failures += dev_out.verify_guards((label + " out").c_str());
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -155,6 +242,12 @@ int main() {
     failures += split_case(1);
     failures += split_case(6);
     failures += split_case(48);
+    failures += rmsnorm_pack_case(5120, 1);
+    failures += rmsnorm_pack_case(5120, 5);
+    failures += rmsnorm_pack_case(5120, 16);
+    failures += rmsnorm_pack_case(2048, 1);
+    failures += rmsnorm_pack_case(2048, 5);
+    failures += rmsnorm_pack_case(2048, 16);
     std::cout << (failures ? "FAIL" : "OK") << " mtp_pack\n";
     return failures ? 1 : 0;
 }

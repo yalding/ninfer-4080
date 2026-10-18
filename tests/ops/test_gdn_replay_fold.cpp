@@ -270,6 +270,11 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
     const float kScale = 1.0F / std::sqrt(128.0F);
     WorkspaceArena reference_workspace(256);
+    int dev_id = 0;
+    cuda_check(cudaGetDevice(&dev_id), "get device");
+    cudaDeviceProp dev_props{};
+    cuda_check(cudaGetDeviceProperties(&dev_props, dev_id), "get device props");
+    const DeviceExecutionView ref_exec{nullptr, dev_props.multiProcessorCount};
 
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
         const GdnReplayRecordLayer layer_records = records.layer(layer, rows);
@@ -320,7 +325,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 Tensor beta_tensor(static_cast<float*>(beta_row.p) + token * profile.value_heads, DType::FP32, {profile.value_heads, 1});
                 Tensor output_token = output.slice(2, token, 1).view({kStateDim, profile.value_heads, 1});
                 ops::gated_delta_net(query, key, value, g_tensor, beta_tensor, kScale, true,
-                                     reference_workspace, local_state_tensor, output_token, DeviceExecutionView{});
+                                     reference_workspace, local_state_tensor, output_token, ref_exec);
                 if (token + 1 == commit)
                     cuda_check(cudaMemcpyAsync(expected, local_state.p, recurrent_slot_bytes,
                                                cudaMemcpyDeviceToDevice, nullptr), "save Nth snapshot");

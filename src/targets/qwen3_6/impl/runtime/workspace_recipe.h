@@ -135,8 +135,6 @@ Tensor post_mixer_hidden(Allocator& allocator, std::int32_t tokens) {
 
 struct MtpStemRoots {
     Tensor embedding;
-    Tensor normalized_embedding;
-    Tensor normalized_hidden;
     Tensor packed_input;
     Tensor residual;
     Tensor attention_hidden;
@@ -148,11 +146,9 @@ MtpStemRoots mtp_stem(Allocator& allocator, std::int32_t tokens, bool allocate_e
     if (allocate_embedding) {
         out.embedding = matrix(allocator, DType::BF16, Config::hidden, tokens);
     }
-    out.normalized_embedding = matrix(allocator, DType::BF16, Config::hidden, tokens);
-    out.normalized_hidden    = matrix(allocator, DType::BF16, Config::hidden, tokens);
-    out.packed_input         = matrix(allocator, DType::BF16, Config::mtp_input_rows, tokens);
-    out.residual             = matrix(allocator, DType::BF16, Config::hidden, tokens);
-    out.attention_hidden     = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    out.packed_input     = matrix(allocator, DType::BF16, Config::mtp_input_rows, tokens);
+    out.residual         = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    out.attention_hidden = matrix(allocator, DType::BF16, Config::hidden, tokens);
     return out;
 }
 
@@ -189,14 +185,12 @@ MtpAttentionResultRoots mtp_attention_results(Allocator& allocator, std::int32_t
 }
 
 struct MtpPostAttentionRoots {
-    Tensor output;
     Tensor post_mixer_hidden;
 };
 
 template <class Config, class Allocator>
 MtpPostAttentionRoots mtp_post_attention(Allocator& allocator, std::int32_t tokens) {
     return {
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
         matrix(allocator, DType::BF16, Config::hidden, tokens),
     };
 }

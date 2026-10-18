@@ -1699,8 +1699,9 @@ private:
         cumulative_stats_.prefill_seconds_total +=
             std::chrono::duration<double>(Clock::now() - prefill_started).count();
         program_call.finish(progress.timing);
+        const bool force_stats = progress.complete || progress.capture.has_value();
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
-        publish_runtime_stats();
+        publish_runtime_stats(force_stats);
     }
 
     [[nodiscard]] FifoSnapshot pending_snapshot() const {

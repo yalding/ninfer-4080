@@ -40,8 +40,11 @@ namespace ninfer::ops::detail::q3_tall_a8 {
 using q3_tall::kRows;
 using q3_tall::kStepK;
 using q3_tall::kThreads;
+using q3_tall::Q3LinearAddProblem;
 using q3_tall::Q3LinearProblem;
 using q3_tall::Q3RowSource;
+using q3_tall::Q3SplitLinearProblem;
+using q3_tall::Q3SwiGluA8OutProblem;
 using q3_tall::Q3SwiGluProblem;
 
 // 1.5 * 2^23 as FP32 bits: kFloatMagic + d reinterpreted as a float is 12582912 + d exactly for
@@ -51,11 +54,13 @@ constexpr float kFloatMagicValue = 12582912.0f;
 
 template <int Tokens>
 struct Config {
-    static_assert(Tokens == 128 || Tokens == 64);
-    static constexpr int kWarpsN   = Tokens / 32;
-    static constexpr int kWarpsM   = 8 / kWarpsN;
-    static constexpr int kWarpRows = kRows / kWarpsM;
-    static constexpr int MT        = kWarpRows / 16;
+    static_assert(Tokens == 256 || Tokens == 128 || Tokens == 64);
+    static constexpr int kHalves     = Tokens == 256 ? 2 : 1;
+    static constexpr int kHalfTokens = Tokens / kHalves;
+    static constexpr int kWarpsN     = kHalfTokens / 32;
+    static constexpr int kWarpsM     = 8 / kWarpsN;
+    static constexpr int kWarpRows   = kRows / kWarpsM;
+    static constexpr int MT          = kWarpRows / 16;
 
     // Code and activation rows are 64 bytes; the 16-byte chunk c of line l sits at chunk
     // c ^ ((l >> 1) & 3), so eight consecutive lines of one chunk cover all 32 banks.
@@ -68,7 +73,7 @@ struct Config {
 
     template <class Problem>
     static constexpr std::size_t shared_bytes() {
-        return std::max(2 * sizeof(Stage), static_cast<std::size_t>(Tokens) *
+        return std::max(2 * sizeof(Stage), static_cast<std::size_t>(kHalfTokens) *
                                                q3_tall::kOutLd<Problem::kOutRows> *
                                                sizeof(__nv_bfloat16));
     }
@@ -86,7 +91,9 @@ __global__ void __launch_bounds__(kThreads, 1)
                                std::int32_t k, std::int32_t tokens, std::int32_t token_tiles) {
     using Cfg   = Config<Tokens>;
     using Stage = typename Cfg::Stage;
-    constexpr int MT = Cfg::MT;
+    constexpr int kHalves     = Cfg::kHalves;
+    constexpr int kHalfTokens = Cfg::kHalfTokens;
+    constexpr int MT          = Cfg::MT;
     extern __shared__ __align__(128) std::uint8_t q3_tall_a8_smem[];
     Stage* stages = reinterpret_cast<Stage*>(q3_tall_a8_smem);
 
@@ -192,15 +199,29 @@ __global__ void __launch_bounds__(kThreads, 1)
         }
     }
 
-    const auto multiply = [&](const Stage& s, int (&g)[MT][4][4]) {
-        const unsigned base = smem_addr(&s);
+    float acc[kHalves][MT][4][4];
+#pragma unroll
+    for (int h = 0; h < kHalves; ++h) {
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) { acc[h][mt][nt][e] = 0.0f; }
+            }
+        }
+    }
+
+    const auto multiply = [&](const Stage& s, int half, int (&g)[MT][4][4]) {
+        const unsigned base  = smem_addr(&s);
+        const unsigned b_add = static_cast<unsigned>(half * kHalfTokens * kStepK);
 #pragma unroll
         for (int ks = 0; ks < 2; ++ks) {
             unsigned b[4][2];
 #pragma unroll
             for (int np = 0; np < 2; ++np) {
                 ldmatrix_x4(b[2 * np][0], b[2 * np][1], b[2 * np + 1][0], b[2 * np + 1][1],
-                            base + b_off[ks] + np * 16 * kStepK);
+                            base + b_off[ks] + b_add + np * 16 * kStepK);
             }
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
@@ -219,7 +240,7 @@ __global__ void __launch_bounds__(kThreads, 1)
             }
         }
     };
-    float row_scale[MT][2], token_scale[4][2];
+    float row_scale[MT][2], token_scale[kHalves][4][2];
     const auto load_scales = [&](const Stage& s) {
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
@@ -227,32 +248,34 @@ __global__ void __launch_bounds__(kThreads, 1)
             row_scale[mt][1] = s.row_scale[wm * Cfg::kWarpRows + mt * 16 + gid + 8];
         }
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-            token_scale[nt][0] = s.token_scale[wn * 32 + nt * 8 + 2 * lid];
-            token_scale[nt][1] = s.token_scale[wn * 32 + nt * 8 + 2 * lid + 1];
-        }
-    };
-    float acc[MT][4][4];
-#pragma unroll
-    for (int mt = 0; mt < MT; ++mt) {
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-#pragma unroll
-            for (int e = 0; e < 4; ++e) { acc[mt][nt][e] = 0.0f; }
-        }
-    }
-    // Fragment C: [0], [1] are row gid, tokens 2 lid and 2 lid + 1; [2], [3] are row gid + 8.
-    const auto update = [&](const int (&g)[MT][4][4]) {
-#pragma unroll
-        for (int mt = 0; mt < MT; ++mt) {
+        for (int h = 0; h < kHalves; ++h) {
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) {
+                token_scale[h][nt][0] =
+                    s.token_scale[h * kHalfTokens + wn * 32 + nt * 8 + 2 * lid];
+                token_scale[h][nt][1] =
+                    s.token_scale[h * kHalfTokens + wn * 32 + nt * 8 + 2 * lid + 1];
+            }
+        }
+    };
+    // Fragment C: [0], [1] are row gid, tokens 2 lid and 2 lid + 1; [2], [3] are row gid + 8.
+    const auto update = [&](int half, const int (&g)[MT][4][4]) {
 #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    const float unit = row_scale[mt][e >> 1] * token_scale[nt][e & 1];
-                    acc[mt][nt][e]   = fmaf(unit, __int_as_float(g[mt][nt][e]) - kFloatMagicValue,
-                                            acc[mt][nt][e]);
-                }
+        for (int mt = 0; mt < MT; ++mt) {
+            const float rs0 = row_scale[mt][0];
+            const float rs1 = row_scale[mt][1];
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const float ts0 = token_scale[half][nt][0];
+                const float ts1 = token_scale[half][nt][1];
+                acc[half][mt][nt][0] = fmaf(
+                    rs0 * ts0, __int_as_float(g[mt][nt][0]) - kFloatMagicValue, acc[half][mt][nt][0]);
+                acc[half][mt][nt][1] = fmaf(
+                    rs0 * ts1, __int_as_float(g[mt][nt][1]) - kFloatMagicValue, acc[half][mt][nt][1]);
+                acc[half][mt][nt][2] = fmaf(
+                    rs1 * ts0, __int_as_float(g[mt][nt][2]) - kFloatMagicValue, acc[half][mt][nt][2]);
+                acc[half][mt][nt][3] = fmaf(
+                    rs1 * ts1, __int_as_float(g[mt][nt][3]) - kFloatMagicValue, acc[half][mt][nt][3]);
             }
         }
     };
@@ -276,37 +299,59 @@ __global__ void __launch_bounds__(kThreads, 1)
                 if (step + 2 < steps) { load(step + 2); }
             }
         };
-        if (pong) {
-            if (step > 0) { update(g); }
-            next();
-            multiply(s, g);
-            load_scales(s);
+        if constexpr (kHalves == 1) {
+            if (pong) {
+                if (step > 0) { update(0, g); }
+                next();
+                multiply(s, 0, g);
+                load_scales(s);
+            } else {
+                multiply(s, 0, g);
+                next();
+                load_scales(s);
+                update(0, g);
+            }
         } else {
-            multiply(s, g);
-            next();
-            load_scales(s);
-            update(g);
+            if (pong) {
+                if (step > 0) { update(1, g); }
+                next();
+                load_scales(s);
+                multiply(s, 0, g);
+                update(0, g);
+                multiply(s, 1, g);
+            } else {
+                load_scales(s);
+                multiply(s, 0, g);
+                next();
+                update(0, g);
+                multiply(s, 1, g);
+                update(1, g);
+            }
         }
     }
-    if (pong) { update(g); }
+    if (pong) { update(kHalves - 1, g); }
 
     // Epilogue: the problem stages bf16 outputs as [token][row] in shared memory, then writes
     // 16-byte row chunks of each live token.
     constexpr int kOutRows = Problem::kOutRows;
     constexpr int kLd      = q3_tall::kOutLd<kOutRows>;
-    __syncthreads();
-    __nv_bfloat16* staged = reinterpret_cast<__nv_bfloat16*>(q3_tall_a8_smem);
-    problem.template stage_outputs<MT>(acc, staged, kLd, wm * Cfg::kWarpRows, wn * 32, lane);
-    __syncthreads();
-    constexpr int kChunks = kOutRows / 8;
+    constexpr int kChunks  = kOutRows / 8;
+    __nv_bfloat16* staged  = reinterpret_cast<__nv_bfloat16*>(q3_tall_a8_smem);
 #pragma unroll
-    for (int i = 0; i < Tokens * kChunks / kThreads; ++i) {
-        const int item  = tid + i * kThreads;
-        const int token = item / kChunks;
-        const int chunk = item % kChunks;
-        if (token < live) {
-            problem.write(row_block, token0 + token, chunk * 8,
-                          *reinterpret_cast<const uint4*>(&staged[token * kLd + chunk * 8]));
+    for (int h = 0; h < kHalves; ++h) {
+        __syncthreads();
+        problem.template stage_outputs<MT>(acc[h], staged, kLd, wm * Cfg::kWarpRows, wn * 32, lane);
+        __syncthreads();
+        const int half_token0 = h * kHalfTokens;
+#pragma unroll
+        for (int i = 0; i < kHalfTokens * kChunks / kThreads; ++i) {
+            const int item  = tid + i * kThreads;
+            const int token = item / kChunks;
+            const int chunk = item % kChunks;
+            if (half_token0 + token < live) {
+                problem.write(row_block, token0 + half_token0 + token, chunk * 8,
+                              *reinterpret_cast<const uint4*>(&staged[token * kLd + chunk * 8]));
+            }
         }
     }
 }

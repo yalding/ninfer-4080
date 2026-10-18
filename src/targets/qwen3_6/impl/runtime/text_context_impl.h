@@ -343,13 +343,9 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
         ops::embedding(flat_ids, *embed_, emb, s);
     }
 
-    Tensor e = roots.normalized_embedding;
-    Tensor h = roots.normalized_hidden;
-    ops::rmsnorm(emb, *mtp_.pre_fc_norm_embedding, kCfg.rms_eps, true, e, s);
-    ops::rmsnorm(flat_hidden, *mtp_.pre_fc_norm_hidden, kCfg.rms_eps, true, h, s);
-
     Tensor fc_in = roots.packed_input;
-    ops::mtp_pack_fc_input(e, h, fc_in, s);
+    ops::mtp_rmsnorm_pack_fc_input(emb, *mtp_.pre_fc_norm_embedding, flat_hidden,
+                                   *mtp_.pre_fc_norm_hidden, kCfg.rms_eps, fc_in, s);
 
     x = roots.residual;
     ops::linear(fc_in, *mtp_.fc, x, s);
@@ -407,13 +403,10 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
                                       batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
+    ops::linear_add(a.view({kCfg.q_size, T}), *mtp_.o_proj, x, work_, s);
 
     const auto post = workspace_recipe::mtp_post_attention<TextConfig>(work_, T);
-    Tensor o        = post.output;
-    ops::linear(a.view({kCfg.q_size, T}), *mtp_.o_proj, o, s);
-    ops::residual_add(o, x, s);
-
-    Tensor mh = post.post_mixer_hidden;
+    Tensor mh       = post.post_mixer_hidden;
     ops::rmsnorm(x, *mtp_.post_attn_norm, kCfg.rms_eps, true, mh, s);
 
     {
@@ -541,9 +534,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                              mtp_kv_.layer_view(0), envelope, work_, a, s);
         ops::sigmoid_mul(gate, a, s);
 
-        Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
-        ops::linear(a.view({kCfg.q_size, 1}), *mtp_.o_proj, o, s);
-        ops::residual_add(o, x_last, s);
+        ops::linear_add(a.view({kCfg.q_size, 1}), *mtp_.o_proj, x_last, work_, s);
 
         Tensor mh = work_.alloc(DType::BF16, {kCfg.hidden, 1});
         ops::rmsnorm(x_last, *mtp_.post_attn_norm, kCfg.rms_eps, true, mh, s);

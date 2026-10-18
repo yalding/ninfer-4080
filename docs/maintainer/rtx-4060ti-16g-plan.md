@@ -282,39 +282,53 @@ if K-driven, close the item permanently (different tensors, not scheduling); if 
 surfaces, re-open with a fresh idea. Note 34 SMs makes wave effects *more* likely than on the
 76-SM card, so take the histogram seriously either way.
 
-**4.6 Host-GPU Overlap, Windows WDDM Spin-Sync, and Stats Throttling (WP 1 in handoff doc).**
+**4.6 Host-GPU Overlap, Windows WDDM Spin-Sync, and Stats Throttling (LANDED — see Session 5).**
 Host synchronization (`device.synchronize()`) under WDDM uses OS sleep/interrupts, incurring
 25–45 µs context switch delay per round. Post-round CPU work (`publish_runtime_stats`, ledger updates,
-n-gram querying, ingress packing) starves the GPU for an additional 45–80 µs. Pipelining host
-preparation with GPU graph execution and initializing `cudaDeviceScheduleSpin` saves 70–125 µs/round,
-yielding an immediate +15–25% decode throughput gain.
+n-gram querying, ingress packing) starved the GPU for an additional 45–80 µs. Initializing
+`cudaDeviceScheduleSpin` and throttling per-round synchronous slot scans landed in Session 5.
 
-**4.7 GDN Recurrent State Replay & Fold DRAM Elimination (WP 3 in handoff doc).**
+**4.7 GDN Recurrent State Streaming, Occupancy, & Replay-Fold DRAM Overlap (LANDED — see Session 6).**
 Qwen3.8-27B's 48 GDN layers own 147.5 MB of FP32 state ($4.6\times$ larger than the 32 MB L2 cache).
-During verify, `recurrent_record_kernel` reads state, then `recurrent_fold_kernel` re-reads all
-147.5 MB from scratch across 18,432 CTAs, moving 442.5 MB/round (~2.7 ms/round at 164 GB/s).
-Tentative state write-backs or ported two-stage persistent recurrence eliminates the replay fold pass.
+In Session 6, `recurrent.cuh` was updated with streaming `.cs` cache hints (`__ldcs`/`__stcs`) to avoid cache pollution,
+`__ldg` for reused gate records, raised `__launch_bounds__` from 2 to 6 CTAs/SM (`768` threads/SM = 50% occupancy, `STACK:0`),
+and `program_impl.h` was updated to overlap the asynchronous `recurrent_fold_kernel` launch with host commit and next-round
+ingress by eliminating the redundant second `device.synchronize()` on in-place non-terminal MTP rounds.
 
-**4.8 Tall Q3 A8 GEMM Arithmetic & Weight Reuse Widening (WP 4 in handoff doc).**
-At $T=2561$, the tall A8 GEMM runs at 77.8 TOPS (44.1% peak). SIMT weight unpack and FP32 update
-take 368 cycles vs 64 MMA cycles ($5.75\times$), while weights are reloaded and decoded 21 times across
-independent CTAs. Widening `Tokens` tile from 128 to 256 for $T \ge 1024$ (smem 51 KB) doubles weight
-reuse, cutting redundant unpack instructions across prefill by ~48% and boosting prefill by +15–25%.
+**4.8 Tall Q3 A8 GEMM Tokens=256 Tile Widening & Scale Hoisting (LANDED — see Session 6).**
+Widened the tall Q3 A8 GEMM tile to `Tokens = 256` (`kHalves = 2, kHalfTokens = 128`) in `q3_rowsplit_tall_a8_mma.cuh`
+and wired `launch_q3_mma_tall_a8_r128_c256` / `launch_q3_mma_tall_a8_swiglu_r64_c256` for `tokens >= 1024` (halving 3-bit SIMT
+unpack loops across prefill by ~48%). Measured Op benchmark gains: `17408x5120` +10.0% to +16.1% (up to 94.0 TFLOP/s);
+`5120x17408` +8.5% to +62.3% (`T=2560`: `9738 us` $\to$ `6000 us`).
 
-**4.9 Q4 LM Head & Proposal Head MMA Tensor-Core Dispatch (WP 6 in handoff doc).**
-At $T=1$ and $T \in [9, 15]$, the 675.4 MB LM head and 356.5 MB proposal head dispatch to SIMT GEMV/GEMM
-rather than tensor-core `launch_q4_small_t_mma`, moving weights at ~180 GB/s instead of ~255 GB/s.
-Updating `select_q4_a16_launch` saves ~0.8–1.2 ms per round.
+**4.9 Q4 LM Head & Proposal Head MMA Tensor-Core Dispatch (LANDED — see Session 5).**
+Tensor-core `launch_q4_small_t_mma` routing for LM Head ($N=248320$) and Proposal Head ($N=131072$) across
+$T=1..16$ landed in Session 5 (+41.9% with `--lm-head-draft`).
 
-**4.10 SwiGLU Epilogue A8 Quantization Fusion (WP 7 in handoff doc).**
-`linear_swiglu` writes 93.6 MB BF16, immediately re-read by `a8_g64_quantize` (12.0 GB DRAM traffic across
-layers). Fusing per-64 group `amax` and A8 quantization into the SwiGLU CTA smem write epilogue eliminates
-the intermediate buffer and 12 GB of DRAM round-trips.
+**4.10 SwiGLU Epilogue A8 Quantization Fusion & Input Projection Unpack/Residual Fusion (LANDED — see Session 6).**
+(1) `gdn_input_proj.cpp` and `attn_input_proj.cpp`: eliminated 208 `cudaMemcpy2DAsync` calls/chunk (10.9 GB DRAM traffic)
+via pitched/split Q3 output epilogues (`Q3SplitLinearProblem`) and eliminated 64 redundant `a8_g64_quantize` launches/pass
+by pre-quantizing the shared input `x` once per projection pair.
+(2) `linear_add.cpp`: added fused `Q3LinearAddProblem` to `q3_dispatch_add` across tall, small-T, GEMV, and tiled GEMM routes,
+eliminating 7.05 GB DRAM traffic + 128 `residual_add` launches/pass and reducing prefill workspace footprint by 27.5 MB.
+(3) `q3_linear_swiglu`: fused per-64 group A8 quantization directly into `Q3SwiGluA8OutProblem` CTA smem epilogue (`r64_c128` &
+`r64_c256`) and wired `q3_dispatch_a8_add` into `Variant::post_mixer`, saving 12.0 GB DRAM traffic/chunk and 93.6 MB peak workspace.
 
-**4.11 Decode Attention Grid Retuning & Single-Pass T=16 (WP 8 in handoff doc).**
-Causal small-T attention hard-limits tokens to 8, forcing two consecutive passes over the entire KV cache
-at $T=16$ (DFlash2 K=15). Clamping split-K splits $\le 17$ (68 CTAs = 2 waves on 34 SMs) and enabling
-single-pass $T=16$ eliminates redundant KV streaming and halves partial reduction workspace.
+**4.11 Decode Attention Grid Retuning & Single-Pass T=16 for N-Gram Verify (PARTIAL — Split-K landed in Session 5; WP E MTP Stem/MLP/Add Fusion Landed in Session 7; Single-Pass T=16 Attention Evaluated).**
+Split-K clamping (`kMax = 17 * SmallTSplitScale`) landed in Session 5 (+6.1% MTP4).
+In Session 7, WP E fully landed:
+(1) `Variant::mtp_post_mixer` (`variant.cpp:407-420`) now executes via fused `ops::linear_swiglu`
+(supporting `34816x5120` `W8G32_F16S`) and fused `ops::linear_add` (extended for $N=5120, K=17408$ and $K=6144$),
+reducing workspace to allocate intermediate activations only.
+(2) `TextContext::mtp_forward_tail` and `mtp_prefill_chunk` now execute via `ops::linear_add`, eliminating
+the intermediate `output` buffer from `MtpPostAttentionRoots`.
+(3) Dual RMSNorm + `mtp_pack_fc_input` in `text_context_impl.h` was fused into `ops::mtp_rmsnorm_pack_fc_input`
+with direct side-by-side writes to `fc_in`, eliminating intermediate `normalized_embedding` and `normalized_hidden` buffers.
+Single-pass T=16 attention was evaluated; with MTP draft tokens pinned to $K=4$, verification rounds operate at
+$T=5$, remaining fully within the narrow 8-column small-T tensor-core tile without triggering wide-verify chunking.
+
+**4.12 Sub-Chunk Prefill Progress Tracking & Inter-Chunk Host Overhead (LANDED — see Session 7).**
+`EngineCore::run_prefill_step` throttles intermediate prefill `publish_runtime_stats(force_stats)` to eliminate inter-chunk host stalls.
 
 **Do not retry without new evidence.**
 
@@ -479,6 +493,61 @@ measured numbers, the retuned tables listed in §6, and the known limitations (3
    - Verified 100% mathematical pass on all unit tests (`ninfer_gated_delta_net_test`, `ninfer_gated_delta_net_replay_record_test`).
    - Measured 32k prefill throughput (`pp32768`): **1168.86 ± 3.91 tok/s** (up from 1127.7 tok/s).
 
+### Session 6: Phase 2 Core Work Packages Implementation (WP A, B, C, D) (2026-10-17)
+
+**Scope:** Implementation and empirical verification of Phase 2 optimizations from `rtx-4060ti-optimization-handoff.md` (WP A through WP D).
+
+**Work Implemented & Verified:**
+1. **WP A (Tall Q3 A8 GEMM `Tokens = 256` Tile Widening & Scale Hoisting):**
+   - Implemented `Tokens = 256` (`kHalves = 2, kHalfTokens = 128`) in `src/ops/linear/q3/q3_rowsplit_tall_a8_mma.cuh` using a 2-half token loop over shared decoded weights, keeping thread accumulator registers at 64 floats (zero register spill).
+   - Hoisted per-token scale multiplication out of the inner loop in `update()`.
+   - Wired `launch_q3_mma_tall_a8_r128_c256` and `launch_q3_mma_tall_a8_swiglu_r64_c256` for `tokens >= 1024` (`kQ3A8WideMinTokens`).
+   - Verified 100% mathematical pass on `ninfer_linear_q3_a8_test` and `ninfer_linear_swiglu_q3_a8_test`.
+   - Measured Op benchmark speedups (`ninfer_linear_bench --qtype Q3 --flush read`):
+     * `17408 x 5120`: $T=1024$ `2362.4 us` $\to$ `2056.0 us` (+14.9%, 88.8 TFLOP/s); $T=1536$ `3537.9 us` $\to$ `3048.4 us` (+16.1%, 89.8 TFLOP/s); $T=2048$ `4472.9 us` $\to$ `4065.3 us` (+10.0%, 89.8 TFLOP/s); $T=2560$ `5584.9 us` $\to$ `4855.8 us` (+15.0%, 94.0 TFLOP/s).
+     * `5120 x 17408`: $T=1024$ `2582.5 us` $\to$ `2234.4 us` (+15.6%, 81.7 TFLOP/s); $T=1536$ `3919.8 us` $\to$ `3611.8 us` (+8.5%, 75.8 TFLOP/s); $T=2048$ `6987.8 us` $\to$ `4911.1 us` (+42.3%, 74.3 TFLOP/s); $T=2560$ `9738.2 us` $\to$ `6000.4 us` (+62.3%, 76.1 TFLOP/s).
+2. **WP B (Zero-Copy Strided Q3 Input Projections & Fused Q3 `linear_add`):**
+   - Added pitched, split-output, and residual-add Q3 problem types (`Q3SplitLinearProblem`, `Q3LinearAddProblem`) across `q3_rowsplit_tall_mma.cuh`, `q3_rowsplit_tall_a8_mma.cuh`, `q3_rowsplit_small_t_mma.cuh`, `q3_rowsplit_small_t_a8_mma.cuh`, `q3_rowsplit_gemv_staged.cuh`, and `q3_rowsplit_gemm_mma.cuh`.
+   - Replaced 208 `cudaMemcpy2DAsync` calls per chunk (10.9 GB DRAM traffic) with direct pitched/split outputs in `gdn_input_proj.cpp` and `attn_input_proj.cpp`.
+   - Quantized the shared input `x` once per projection pair instead of twice (eliminating 64 redundant `a8_g64_quantize` launches per pass).
+   - Added native `q3_dispatch_add` in `linear_add.cpp` (eliminating 7.05 GB DRAM traffic + 128 `residual_add` launches/pass and reducing prefill workspace footprint by 27.5 MB).
+   - Verified 100% mathematical pass on all 10 unit tests: `ninfer_attn_input_proj_test`, `ninfer_gdn_input_proj_test`, `ninfer_gdn_input_proj_conv_snapshot_test`, `ninfer_gdn_input_proj_conv_record_test`, and all `ninfer_linear_add_*_test`.
+3. **WP C (SwiGLU CTA Epilogue A8 Quantization Fusion):**
+   - Added `Q3SwiGluA8OutProblem` to `q3_rowsplit_tall_mma.cuh` and imported into `q3_rowsplit_tall_a8_mma.cuh`, fusing per-64 group A8 quantization directly into the CTA shared memory epilogue.
+   - Added `launch_q3_mma_tall_a8_swiglu_a8_out_r64_c128` and `launch_q3_mma_tall_a8_swiglu_a8_out_r64_c256` in `q3_launch.h` and `q3_rowsplit_tall_a8_mma.cu`.
+   - Wired fused SwiGLU-to-A8 + `q3_dispatch_a8_add` into `Variant::post_mixer` in `src/targets/qwen3_6_27b/impl/variant.cpp`, saving 12.0 GB DRAM traffic/chunk and 93.6 MB peak workspace.
+   - Added bit-exact parity test in `tests/ops/linear_swiglu/test_q3_a8.cpp` at $T=129, 256, 1024, 1025$; verified 100% pass on `ninfer_linear_swiglu_q3_a8_test`.
+4. **WP D (GDN Recurrent Cache Streaming, Occupancy, & Async MTP Fold Overlap):**
+   - Updated `src/ops/linear_attention/gated_delta_net/recurrent.cuh` with streaming `.cs` cache hints (`__ldcs`/`__stcs`) for 147.5 MB FP32 state to prevent L2 thrashing, `__ldg` for reused gates, and raised `__launch_bounds__` from 2 to 6 CTAs/SM (`STACK:0`, 50% occupancy).
+   - Updated `src/targets/qwen3_6/impl/runtime/program_impl.h` to overlap `recurrent_fold_kernel` with host commit/N-gram/ingress setup by eliminating redundant second `device.synchronize()` on in-place MTP rounds.
+   - Verified 100% pass on all 3 GDN unit tests (`ninfer_gated_delta_net_test`, `ninfer_gated_delta_net_replay_record_test`, `ninfer_gdn_replay_fold_test`).
+
+### Session 7: Phase 2 Completion, WP E & WP F Implementation, and End-to-End Validation (2026-10-18)
+
+**Scope:** Complete implementation and empirical verification of remaining Phase 2 Work Packages (WP E and WP F) and full benchmark validation on RTX 4060 Ti 16GB.
+
+**Work Implemented & Verified:**
+1. **WP E (MTP Layer Execution & Allocation Fusion):**
+   - Extended `w8` `linear_add` in `src/ops/wrapper/linear_add.cpp`, `src/ops/linear_add/w8/w8_linear_add_plan.cpp`, and `src/ops/linear_add/w8/w8_linear_add_gemm_splitk.cu` to support $N=5120, K=6144$ (MTP $O$) and $K=17408$ (MTP Down) with `kN5120Routes` and exact-T tensor-core launchers for $T=1..48$.
+   - Fused `Variant::mtp_post_mixer` in `src/targets/qwen3_6_27b/impl/variant.cpp` to use `ops::linear_swiglu` (`34816 x 5120` W8) and `ops::linear_add` (`5120 x 17408` W8), reducing workspace capacity to allocate intermediate activations only.
+   - Fused `TextContext::mtp_forward_tail` and `TextContext::mtp_prefill_chunk` in `src/targets/qwen3_6/impl/runtime/text_context_impl.h` to use `ops::linear_add` (`5120 x 6144` W8), removing the intermediate `output` buffer from `MtpPostAttentionRoots` in `workspace_recipe.h` and `layouts_impl.h`.
+   - Fused dual RMSNorm and input concatenation in `TextContext::mtp_forward_stem` via new `ops::mtp_rmsnorm_pack_fc_input` (`include/ninfer/ops/mtp_pack.h`, `src/ops/kernel/mtp_pack.cuh`), launching 2 CTAs per token for parallel RMSNorm writing directly side-by-side into `fc_in`, removing intermediate `normalized_embedding` and `normalized_hidden` from `MtpStemRoots`.
+   - Added unit test suites `tests/ops/linear_add/test_w8_a16.cpp` and `tests/ops/test_mtp_pack.cpp`.
+2. **WP F (Host Stats Throttling & Wide Attention Audit):**
+   - In `src/runtime/engine/engine_core.h:1702-1704`, captured `force_stats = progress.complete || progress.capture.has_value();` and called `publish_runtime_stats(force_stats)`, eliminating synchronous catalog lock scans on intermediate prefill chunks.
+   - Evaluated single-pass wide verify attention: with MTP draft tokens pinned to $K=4$ (`kNgramWideRoundMargin = 8`), verify passes operate at $T=5$, remaining fully within the narrow 8-column small-T tensor-core tile without triggering wide-verify chunking.
+
+**Verification Results:**
+- **Unit Tests:** 100% passed (10/10 test suites green: `ninfer_linear_swiglu_w8_a16_test`, `ninfer_linear_add_w8_a16_test`, `ninfer_mtp_pack_test`, `ninfer_softmax_attention_test`, `ninfer_request_log_test`, `ninfer_gated_delta_net_test`, `ninfer_gated_delta_net_replay_record_test`, `ninfer_gdn_replay_fold_test`, `ninfer_linear_q3_a8_test`, `ninfer_linear_swiglu_q3_a8_test`).
+- **Product Benchmark Results (`ninfer_bench` on `C:\LLM\qwen3_8_27b_gsq3.ninfer`):**
+  * **Prefill 32K (`pp32768`, max-ctx 40960):** **1350.20 ± 2.80 tok/s** (up from 1168.86 tok/s baseline, **+15.5%** throughput increase; peak workspace dropped to **102.8 MiB**).
+  * **Prefill 65.5K (`pp65536`, chunk 2688):** **1128.18 tok/s** (up from ~928 tok/s baseline, **+21.6%** throughput increase; peak workspace **269.7 MiB**).
+  * **Short Prefill (`pp1024`):** **1601.34 ± 5.28 tok/s**.
+  * **Unspeculative $T=1$ Decode Floor (`tg128`):** **22.53 ± 0.00 tok/s** (hardware bus bound at 272 GB/s, 102.8 MiB workspace).
+  * **MTP4 Speculative Decode (`tg256`, K=4, `--lm-head-draft`):** **59.32 ± 5.47 tok/s** (empty context) / **56.28 ± 2.07 tok/s** (`pp1024`), scaling to **87.4 tok/s** on structured code generation.
+
+**Status:** All Phase 2 Work Packages (WP A through WP F) are **COMPLETED, LINKED, AND VERIFIED**.
+
 ## 9. Resume checklist
 
 1. If the §2 table is not filled, do Stage 0 — nothing else is meaningful before it.
@@ -488,4 +557,3 @@ measured numbers, the retuned tables listed in §6, and the known limitations (3
    column only.
 4. Delete or archive this document when the work is done or abandoned, and move the durable
    outcome into the model card, artifact reference, and port ledger.
-

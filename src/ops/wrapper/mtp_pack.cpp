@@ -1,6 +1,7 @@
 #include "ninfer/ops/mtp_pack.h"
 #include "ops/launcher/mtp_pack.h"
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -70,6 +71,33 @@ void mtp_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate
     }
 
     detail::mtp_split_attn_in_launch(attn_in, q, k, gate, v, stream);
+}
+
+void mtp_rmsnorm_pack_fc_input(const Tensor& embedding, const Tensor& embedding_weight,
+                               const Tensor& hidden, const Tensor& hidden_weight,
+                               float eps, Tensor& out, cudaStream_t stream) {
+    constexpr const char* op = "mtp_rmsnorm_pack_fc_input";
+    require_bf16_contiguous_nonnull(embedding, op, "embedding");
+    require_bf16_contiguous_nonnull(embedding_weight, op, "embedding_weight");
+    require_bf16_contiguous_nonnull(hidden, op, "hidden");
+    require_bf16_contiguous_nonnull(hidden_weight, op, "hidden_weight");
+    require_bf16_contiguous_nonnull(out, op, "out");
+
+    const std::int32_t rows   = embedding.ne[0];
+    const std::int32_t tokens = embedding.ne[1];
+    if (rows <= 0) { throw std::invalid_argument("mtp_rmsnorm_pack_fc_input: D must be positive"); }
+    if (tokens <= 0) { throw std::invalid_argument("mtp_rmsnorm_pack_fc_input: T must be positive"); }
+    if (!(eps > 0.0f) || !std::isfinite(eps)) {
+        throw std::invalid_argument("mtp_rmsnorm_pack_fc_input: eps must be positive and finite");
+    }
+    require_shape(embedding, rows, tokens, op, "embedding");
+    require_shape(embedding_weight, rows, 1, op, "embedding_weight");
+    require_shape(hidden, rows, tokens, op, "hidden");
+    require_shape(hidden_weight, rows, 1, op, "hidden_weight");
+    require_shape(out, 2 * rows, tokens, op, "out");
+
+    detail::mtp_rmsnorm_pack_fc_input_launch(embedding, embedding_weight, hidden, hidden_weight,
+                                             eps, out, stream);
 }
 
 } // namespace ninfer::ops

@@ -88,7 +88,9 @@ void q3_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out,
         auto scope = ws.scope();
         A8G64Activation act = allocate_a8_g64_activation(ws, w.k, columns);
         a8_g64_quantize(x, act, stream);
-        if (columns >= kQ3A8MinTokens) {
+        if (columns >= kQ3A8WideMinTokens) {
+            launch_q3_mma_tall_a8_swiglu_r64_c256(act, w, out, stream);
+        } else if (columns >= kQ3A8MinTokens) {
             launch_q3_mma_tall_a8_swiglu_r64_c128(act, w, out, stream);
         } else if (columns <= q3_small_t::kTokens) {
             launch_q3_mma_small_t_a8_swiglu_r16_c8(act, w, out, stream);

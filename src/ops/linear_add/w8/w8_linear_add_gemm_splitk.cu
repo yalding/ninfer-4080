@@ -1,6 +1,7 @@
 #include "ops/linear_add/w8/w8_linear_add_kernels.h"
 
 #include "core/device.h"
+#include "ops/linear/w8/w8_config.h"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
 #include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 
@@ -22,6 +23,37 @@ constexpr int kLastExactCols = 32;
 constexpr int kLastExactCols = 48;
 #endif
 using ProjectionLauncher      = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+
+template <class Geometry, int ActiveCols>
+void launch_exact_residual(const Tensor& x, const Weight& weight, Tensor& residual_out,
+                           cudaStream_t stream) {
+    using Schedule = typename W8LinearSmallTProductionSchedule<Geometry, ActiveCols>::Type;
+    constexpr int kLocalRows = Geometry::kOutputRows;
+    constexpr int kLocalRowsPerCta = Schedule::kRowsPerCta;
+    static_assert((kLocalRows % kLocalRowsPerCta) == 0);
+    auto* residual = static_cast<__nv_bfloat16*>(residual_out.data);
+    const W8ContiguousOutput output{residual, kLocalRows};
+    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                          W8SmallTMmaResidualEpilogue>
+        <<<kLocalRows / kLocalRowsPerCta, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), output,
+            W8SmallTMmaResidualEpilogue{});
+}
+
+template <class Geometry, std::size_t... Offsets>
+constexpr auto make_exact_residual_launchers(std::index_sequence<Offsets...>) {
+    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
+        &launch_exact_residual<Geometry, 1 + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kMtpAttentionOutputLaunchers =
+    make_exact_residual_launchers<W8MtpAttentionOutputGeometry>(
+        std::make_index_sequence<48>{});
+constexpr auto kMtpDownLaunchers =
+    make_exact_residual_launchers<W8MtpDownProjectionGeometry>(
+        std::make_index_sequence<48>{});
 
 template <int Hidden, int ActiveCols>
 void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_out,
@@ -94,6 +126,20 @@ void dispatch_medium_shape(const Tensor& x, const Weight& weight, Tensor& residu
 
 void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual_out,
                                      cudaStream_t stream) {
+    if (weight.n == 5120) {
+        if (x.ne[1] < 1 || x.ne[1] > 48) {
+            throw std::invalid_argument("W8 linear_add 5120 requires exact T=1..48");
+        }
+        if (weight.k == 6144) {
+            kMtpAttentionOutputLaunchers[x.ne[1] - 1](x, weight, residual_out, stream);
+        } else if (weight.k == 17408) {
+            kMtpDownLaunchers[x.ne[1] - 1](x, weight, residual_out, stream);
+        } else {
+            throw std::invalid_argument("W8 linear_add 5120 unsupported K");
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (x.ne[1] < kFirstExactCols || x.ne[1] > 48) {
         throw std::invalid_argument("W8 linear_add split-K MMA requires exact T=2..48");
     }

@@ -62,6 +62,11 @@ constexpr std::array<RouteSpec, 33> kK6144Routes{{
     {2049, kAnyCols, W8LinearAddScheduleId::MmaR64C128},
 }};
 
+constexpr std::array<RouteSpec, 2> kN5120Routes{{
+    {1, 48, W8LinearAddScheduleId::SplitKMmaExactT},
+    {49, kAnyCols, W8LinearAddScheduleId::MmaR64C128},
+}};
+
 template <std::size_t N>
 constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
     std::int64_t expected = 1;
@@ -72,7 +77,8 @@ constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
     return routes.back().last == kAnyCols && expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes),
+static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes) &&
+                  routes_are_closed(kN5120Routes),
               "W8 LinearAdd routes must be exact, contiguous, and closed");
 
 std::int32_t schedule_rows(W8LinearAddScheduleId schedule) {
@@ -191,8 +197,10 @@ bool w8_linear_add_schedule_uses_mma(W8LinearAddScheduleId schedule) noexcept {
 }
 
 bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept {
-    return problem.rows == 2048 && (problem.k == 4096 || problem.k == 6144) &&
-           problem.padded_k == problem.k && problem.cols >= 1;
+    const bool valid_shape =
+        (problem.rows == 2048 && (problem.k == 4096 || problem.k == 6144)) ||
+        (problem.rows == 5120 && (problem.k == 6144 || problem.k == 17408));
+    return valid_shape && problem.padded_k == problem.k && problem.cols >= 1;
 }
 
 W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
@@ -207,6 +215,9 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
         }
         throw std::logic_error("w8 linear_add: admitted problem has no covering route");
     };
+    if (problem.rows == 5120) {
+        return resolve_from(kN5120Routes);
+    }
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
 }
 

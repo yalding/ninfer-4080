@@ -100,4 +100,81 @@ void launch_q3_mma_small_t_a8_swiglu_r16_c16(const A8G64Activation& act, const W
                           static_cast<const float*>(act.scale.data), w.k, act.q.ne[1], stream);
 }
 
+void launch_q3_mma_small_t_a8_r32_c8_pitched(const A8G64Activation& act, const Weight& w,
+                                             void* out, std::int32_t out_ld, cudaStream_t stream) {
+    const q3_small_t::Q3SmallTLinearProblem problem{
+        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint16_t*>(w.scales),
+        static_cast<__nv_bfloat16*>(out), out_ld, w.k / Q3RowSplitStorage::kGroupK};
+    q3_small_t_a8::launch(problem, w.n / q3_small_t::kRows,
+                          static_cast<const std::int8_t*>(act.q.data),
+                          static_cast<const float*>(act.scale.data), w.k, act.q.ne[1], stream);
+}
+
+void launch_q3_mma_small_t_a8_r32_c16_pitched(const A8G64Activation& act, const Weight& w,
+                                              void* out, std::int32_t out_ld, cudaStream_t stream) {
+    const q3_small_t::Q3SmallTLinearProblem problem{
+        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint16_t*>(w.scales),
+        static_cast<__nv_bfloat16*>(out), out_ld, w.k / Q3RowSplitStorage::kGroupK};
+    q3_small_t_a8::launch(problem, w.n / q3_small_t::kRows,
+                          static_cast<const std::int8_t*>(act.q.data),
+                          static_cast<const float*>(act.scale.data), w.k, act.q.ne[1], stream);
+}
+
+void launch_q3_mma_small_t_a8_r32_c8_split(const A8G64Activation& act, const Weight& w, void* out0,
+                                           std::int32_t out0_ld, void* out1, std::int32_t out1_ld,
+                                           std::int32_t split_rows, cudaStream_t stream) {
+    const q3_small_t::Q3SmallTSplitLinearProblem problem{
+        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint16_t*>(w.scales),
+        static_cast<__nv_bfloat16*>(out0),         out0_ld,
+        static_cast<__nv_bfloat16*>(out1),         out1_ld,
+        split_rows / q3_small_t::kRows,            w.k / Q3RowSplitStorage::kGroupK};
+    q3_small_t_a8::launch(problem, w.n / q3_small_t::kRows,
+                          static_cast<const std::int8_t*>(act.q.data),
+                          static_cast<const float*>(act.scale.data), w.k, act.q.ne[1], stream);
+}
+
+void launch_q3_mma_small_t_a8_r32_c16_split(const A8G64Activation& act, const Weight& w,
+                                            void* out0, std::int32_t out0_ld, void* out1,
+                                            std::int32_t out1_ld, std::int32_t split_rows,
+                                            cudaStream_t stream) {
+    const q3_small_t::Q3SmallTSplitLinearProblem problem{
+        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint16_t*>(w.scales),
+        static_cast<__nv_bfloat16*>(out0),         out0_ld,
+        static_cast<__nv_bfloat16*>(out1),         out1_ld,
+        split_rows / q3_small_t::kRows,            w.k / Q3RowSplitStorage::kGroupK};
+    q3_small_t_a8::launch(problem, w.n / q3_small_t::kRows,
+                          static_cast<const std::int8_t*>(act.q.data),
+                          static_cast<const float*>(act.scale.data), w.k, act.q.ne[1], stream);
+}
+
+void launch_q3_mma_small_t_a8_r32_c8_add(const A8G64Activation& act, const Weight& w,
+                                         Tensor& residual_out, cudaStream_t stream) {
+    require_small_t_a8_linear_shape(act, w, residual_out);
+    if (act.q.ne[1] > q3_small_t::kTokens) {
+        throw std::invalid_argument("q3 small-T A8 linear: the 8-column tile owns 1..8 tokens");
+    }
+    const q3_small_t::Q3SmallTLinearAddProblem problem{
+        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint16_t*>(w.scales),
+        static_cast<__nv_bfloat16*>(residual_out.data), residual_out.ne[0],
+        w.k / Q3RowSplitStorage::kGroupK};
+    q3_small_t_a8::launch(problem, w.n / q3_small_t::kRows,
+                          static_cast<const std::int8_t*>(act.q.data),
+                          static_cast<const float*>(act.scale.data), w.k, act.q.ne[1], stream);
+}
+
+void launch_q3_mma_small_t_a8_r32_c16_add(const A8G64Activation& act, const Weight& w,
+                                          Tensor& residual_out, cudaStream_t stream) {
+    require_small_t_a8_linear_shape(act, w, residual_out);
+    if (act.q.ne[1] <= q3_small_t::kTokens || act.q.ne[1] > q3_small_t::kWideTokens) {
+        throw std::invalid_argument("q3 small-T A8 linear: the 16-column tile owns 9..16 tokens");
+    }
+    const q3_small_t::Q3SmallTLinearAddProblem problem{
+        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint16_t*>(w.scales),
+        static_cast<__nv_bfloat16*>(residual_out.data), residual_out.ne[0],
+        w.k / Q3RowSplitStorage::kGroupK};
+    q3_small_t_a8::launch(problem, w.n / q3_small_t::kRows,
+                          static_cast<const std::int8_t*>(act.q.data),
+                          static_cast<const float*>(act.scale.data), w.k, act.q.ne[1], stream);
+}
+
 } // namespace ninfer::ops::detail

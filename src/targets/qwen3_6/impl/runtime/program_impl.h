@@ -9515,6 +9515,9 @@ AbortResult ProgramImplCore::abort(SequenceHandle sequence) noexcept {
     if (request.lifecycle == Lifecycle::Pending || request.lifecycle == Lifecycle::Empty) {
         return out;
     }
+    try {
+        device.synchronize();
+    } catch (...) { return out; }
     SequenceState& state = active_sequence(lane);
     if (!clear_lane_strict(state, request)) { return out; }
     out.timings     = request.timings;
@@ -10312,6 +10315,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
     std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
     bool needs_hidden_correction = false;
+    bool needs_sync              = speculative_backend != SpeculativeBackend::Mtp;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending ||
@@ -10348,7 +10352,10 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
         hidden_selectors[row] =
             static_cast<std::int32_t>(partial_terminal ? committed - 1U : pending.produced - 1U);
         needs_hidden_correction = needs_hidden_correction || partial_terminal;
+        needs_sync              = needs_sync || cancelled[row] != 0 || terminal[row] != 0 ||
+                     sequence.state.fork_pending;
     }
+    needs_sync = needs_sync || needs_hidden_correction;
 
     const auto tail_started = Clock::now();
     try {
@@ -10424,9 +10431,13 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             }
         }
 
-        timing.begin_wait();
-        device.synchronize();
-        timing.end_wait();
+        if (needs_sync) {
+            timing.begin_wait();
+            device.synchronize();
+            timing.end_wait();
+        } else {
+            timing.resume_post();
+        }
         work.reset();
     } catch (...) {
         try {

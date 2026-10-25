@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace ninfer::serve {
 
@@ -106,6 +107,7 @@ struct ThroughputReport {
     std::uint64_t decode_row_rounds       = 0;
     ninfer::RuntimeStats previous;
     ninfer::RuntimeStats current;
+    std::vector<std::uint64_t> active_request_ids;
 };
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,

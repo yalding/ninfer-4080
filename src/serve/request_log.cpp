@@ -663,6 +663,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
     record["scheduler"]    = Json{{"running", current.running_requests},
+                                  {"active_request_ids", report.active_request_ids},
                                   {"prefilling", current.prefilling_requests},
                                   {"decode_ready", current.decode_ready_requests},
                                   {"waiting", current.waiting_requests},

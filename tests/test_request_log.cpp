@@ -649,6 +649,29 @@ int main() {
             single_decode_pretty.find("prefill") == std::string::npos &&
             single_decode_pretty.find("waiting") == std::string::npos,
         "single-request pretty throughput is noisy or incomplete");
+    ThroughputReport active_req_report   = single_decode;
+    active_req_report.active_request_ids = {42};
+    failures += check(
+        render_throughput(active_req_report).message ==
+            "throughput | 5.0s | decode 205.0 tok/s (1,025 tok) | running 1 (req#42, decode-ready 1) | "
+            "batch 1.00 | host 1.4% (69.2 ms)",
+        "single-request pretty throughput with active request id mismatch");
+    ThroughputReport multi_req_report   = throughput;
+    multi_req_report.active_request_ids = {10, 11};
+    failures += check(
+        render_throughput(multi_req_report).message ==
+            "throughput | 2.0s | prefill 50.0 tok/s (100 tok) | decode 20.0 tok/s (40 tok) | "
+            "running 2 (req#10, req#11, prefill 1, decode-ready 1) | waiting 3 | materializing 1 | "
+            "capture-pending 1 | terminal-pending 1 | batch 1.80 | host 0.8% (15.0 ms)",
+        "multi-request pretty throughput with active request ids mismatch");
+    ThroughputReport no_breakdown_report               = single_decode;
+    no_breakdown_report.current.decode_ready_requests = 0;
+    no_breakdown_report.active_request_ids             = {7};
+    failures += check(
+        render_throughput(no_breakdown_report).message ==
+            "throughput | 5.0s | decode 205.0 tok/s (1,025 tok) | running 1 (req#7) | "
+            "batch 1.00 | host 1.4% (69.2 ms)",
+        "active request id without state breakdown mismatch");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
@@ -661,6 +684,15 @@ int main() {
                           throughput_json.at("scheduler").at("capture_pending") == 1 &&
                           throughput_json.at("scheduler").at("terminal_pending") == 1,
                       "context scheduler gauges missing");
+    failures += check(throughput_json.at("scheduler").at("active_request_ids").empty(),
+                      "throughput json active_request_ids mismatch");
+    ThroughputReport active_json_report   = throughput;
+    active_json_report.active_request_ids = {10, 11};
+    const Json active_json =
+        Json::parse(format_throughput_json("serve-test", 5000, active_json_report));
+    failures += check(
+        active_json.at("scheduler").at("active_request_ids") == std::vector<std::uint64_t>{10, 11},
+        "throughput json active_request_ids array mismatch");
     failures += check(
         std::abs(throughput_json.at("host_work").at("elapsed_seconds").at("total").get<double>() -
                  0.015) < 1.0e-15 &&

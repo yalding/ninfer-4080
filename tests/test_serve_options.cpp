@@ -106,7 +106,7 @@ int main() {
                       "--auto-save-evicted without --slot-save-path was not rejected");
     failures += check(defaults.context_cost_presets.empty(),
                       "external context-cost presets are unexpectedly configured by default");
-    failures += check(defaults.log_stats_interval_ms == 5000,
+    failures += check(defaults.log_stats_interval_ms == 10000,
                       "periodic throughput interval default mismatch");
     failures += check(defaults.media_cache_bytes == ninfer::kDefaultMediaCacheBytes &&
                           defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes &&

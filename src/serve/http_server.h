@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace ninfer::serve {
 
@@ -52,6 +53,7 @@ private:
     class RequestLifecycle {
     public:
         RequestLifecycle(HttpServer& owner, RequestLogContext context);
+        ~RequestLifecycle();
 
         void done(const GenerationOutcome& outcome);
         void failure(const RequestFailure& failure);
@@ -95,6 +97,9 @@ private:
     void record_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
     void record_response_failure(std::uint64_t request_id, const RequestFailure& failure);
+    void register_active_request(std::uint64_t request_id);
+    void unregister_active_request(std::uint64_t request_id);
+    [[nodiscard]] std::vector<std::uint64_t> active_request_ids_snapshot() const;
     void record_throughput(const ThroughputReport& report);
     void run_stats_reporter();
     void stop_stats_reporter();
@@ -112,6 +117,8 @@ private:
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
+    mutable std::mutex active_requests_mutex_;
+    std::vector<std::uint64_t> active_request_ids_;
     std::mutex stats_mutex_;
     std::condition_variable stats_cv_;
     std::thread stats_thread_;

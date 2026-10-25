@@ -10,6 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <exception>
@@ -50,7 +51,8 @@ void ensure_openai_request_id(const httplib::Request& request, httplib::Response
 
 ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
                                         const ninfer::RuntimeStats& current,
-                                        double interval_seconds) {
+                                        double interval_seconds,
+                                        std::vector<std::uint64_t> active_request_ids = {}) {
     return ThroughputReport{
         .interval_seconds = interval_seconds,
         .computed_prefill_tokens =
@@ -61,12 +63,14 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
         .decode_row_rounds = current.decode_row_rounds - previous.decode_row_rounds,
         .previous          = previous,
         .current           = current,
+        .active_request_ids = std::move(active_request_ids),
     };
 }
 
 bool report_has_activity(const ThroughputReport& report) {
     return report.computed_prefill_tokens != 0 || report.committed_decode_tokens != 0 ||
            report.decode_rounds != 0 || report.current.running_requests != 0 ||
+           !report.active_request_ids.empty() ||
            report.current.waiting_requests != 0 || report.current.materializing_requests != 0 ||
            report.current.capture_pending_requests != 0 ||
            report.current.terminal_pending_requests != 0 ||
@@ -241,12 +245,21 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
 
 HttpServer::RequestLifecycle::RequestLifecycle(HttpServer& owner, RequestLogContext context)
     : owner_(&owner), context_(std::move(context)) {
+    owner_->register_active_request(context_.id);
     owner_->record_request_start(context_);
+}
+
+HttpServer::RequestLifecycle::~RequestLifecycle() {
+    (void)claim(State::Error);
 }
 
 bool HttpServer::RequestLifecycle::claim(State terminal) noexcept {
     State expected = State::Pending;
-    return state_.compare_exchange_strong(expected, terminal, std::memory_order_acq_rel);
+    if (state_.compare_exchange_strong(expected, terminal, std::memory_order_acq_rel)) {
+        if (owner_ != nullptr) { owner_->unregister_active_request(context_.id); }
+        return true;
+    }
+    return false;
 }
 
 void HttpServer::RequestLifecycle::done(const GenerationOutcome& outcome) {
@@ -288,6 +301,25 @@ void HttpServer::record_request_failure(const RequestLogContext& context,
     operational_log_.request_failure(context, failure);
 }
 
+void HttpServer::register_active_request(std::uint64_t request_id) {
+    std::lock_guard lock(active_requests_mutex_);
+    if (std::find(active_request_ids_.begin(), active_request_ids_.end(), request_id) ==
+        active_request_ids_.end()) {
+        active_request_ids_.push_back(request_id);
+        std::sort(active_request_ids_.begin(), active_request_ids_.end());
+    }
+}
+
+void HttpServer::unregister_active_request(std::uint64_t request_id) {
+    std::lock_guard lock(active_requests_mutex_);
+    std::erase(active_request_ids_, request_id);
+}
+
+std::vector<std::uint64_t> HttpServer::active_request_ids_snapshot() const {
+    std::lock_guard lock(active_requests_mutex_);
+    return active_request_ids_;
+}
+
 void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
     operational_log_.response_failure(request_id, failure);
 }
@@ -315,7 +347,8 @@ void HttpServer::run_stats_reporter() {
         const ninfer::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
-            previous, current, std::chrono::duration<double>(now - previous_time).count());
+            previous, current, std::chrono::duration<double>(now - previous_time).count(),
+            active_request_ids_snapshot());
         if (report_has_activity(report)) { record_throughput(report); }
         previous      = current;
         previous_time = now;
@@ -327,7 +360,8 @@ void HttpServer::run_stats_reporter() {
     const ninfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
-        previous, current, std::chrono::duration<double>(now - previous_time).count());
+        previous, current, std::chrono::duration<double>(now - previous_time).count(),
+        active_request_ids_snapshot());
     // The exact partial interval remains useful to measurement consumers. Pretty throughput is a
     // fixed-cadence operational record and deliberately has no irregular shutdown tail.
     if (report_has_activity(tail)) { request_jsonl_.write_throughput(tail); }

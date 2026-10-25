@@ -46,7 +46,7 @@ struct ServeOptions {
     // See resolve_automatic_private_anchors.
     std::optional<std::uint32_t> auto_long_anchors;
     std::filesystem::path context_cost_presets;
-    std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
+    std::uint32_t log_stats_interval_ms    = 10000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;

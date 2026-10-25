@@ -357,10 +357,22 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
             << product::format_pretty_count(report.committed_decode_tokens) << " tok)";
     }
     out << " | running " << report.current.running_requests;
-    if (report.current.prefilling_requests != 0 || report.current.decode_ready_requests != 0) {
+    const bool has_req_ids =
+        report.current.running_requests != 0 && !report.active_request_ids.empty();
+    const bool has_state_breakdown =
+        report.current.prefilling_requests != 0 || report.current.decode_ready_requests != 0;
+    if (has_req_ids || has_state_breakdown) {
         out << " (";
         bool separator = false;
+        if (has_req_ids) {
+            for (std::size_t i = 0; i < report.active_request_ids.size(); ++i) {
+                if (i != 0) { out << ", "; }
+                out << "req#" << report.active_request_ids[i];
+            }
+            separator = true;
+        }
         if (report.current.prefilling_requests != 0) {
+            if (separator) { out << ", "; }
             out << "prefill " << report.current.prefilling_requests;
             separator = true;
         }

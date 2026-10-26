@@ -190,6 +190,10 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
             store_response ? CacheRetentionHint::LiveSession : CacheRetentionHint::Disposable;
         resolved.cache_hints.update_session_index = store_response;
     }
+    if (!resolved.session_key && resolved.generation.session_key) {
+        resolved.session_key             = resolved.generation.session_key;
+        resolved.cache_hints.session_key = resolved.session_key;
+    }
     return resolved;
 }
 

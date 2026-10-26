@@ -2951,6 +2951,43 @@ void test_repeated_private_reuse_selects_zero_prefill_shared_promotion() {
     const ActiveRequest second = start_active(manager, program, 81, observed_base(), 2);
     require(program.selected_shared_capture_frontiers == std::vector<std::uint32_t>{16},
             "repeated private base was not selected for zero-prefill shared promotion");
+    require(program.started_source_mode == PrivateSourceMode::Retain,
+            "multi-domain shared demand destructively consumed its private source");
+    {
+        FakeManager capture_manager = make_manager(1, 3, 1);
+        FakeProgram capture_program;
+        const ActiveRequest seed =
+            start_active(capture_manager, capture_program, 83, make_base(83), 1);
+        (void)finish_active(capture_manager, capture_program, seed);
+
+        FakeRequestBasePlan structural = make_base(84);
+        structural.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::EngineStructural,
+            .frontier = 64,
+        });
+        const ActiveRequest active =
+            start_active(capture_manager, capture_program, 84, structural, 2);
+        capture_program.required_pressure_actions    = 1;
+        capture_program.pressure_action_immediate_ns = 0;
+        capture_program.capture_assessment           = FakeCaptureAssessment{
+                      .shortlist_key          = FakeShortlistKey{.digest = 84, .frontier = 64},
+                      .shared_evidence        = ninfer::SharedCandidateEvidence::EngineStructural,
+                      .protected_rebuild_work = PrefillWork{.tokens = 64},
+                      .publishes_shared       = true,
+                      .physically_feasible    = false,
+        };
+        const auto reserved = capture_manager.reserve_active_capture(
+            capture_program, active.lane, FakeCaptureOffer{.id = 84}, 0, {});
+        require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+                "vacant-slot EngineStructural capture could not spill an idle private owner");
+        auto progress = capture_manager.progress_context_transaction(capture_program, {});
+        const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+        require(outcome.status == ContextTransactionStatus::Published,
+                "vacant-slot EngineStructural capture did not publish after private spill");
+        capture_program.required_pressure_actions = 0;
+        (void)finish_active(capture_manager, capture_program, active);
+    }
     (void)finish_active(manager, program, second, 16);
 }
 

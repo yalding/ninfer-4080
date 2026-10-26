@@ -954,6 +954,17 @@ std::string parse_model(const Json& body) {
 }
 
 void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& request) {
+    if (body.contains("metadata") && body.at("metadata").is_object()) {
+        const Json& metadata = body.at("metadata");
+        if (metadata.contains("user_id") && metadata.at("user_id").is_string()) {
+            const std::string user_id = metadata.at("user_id").get<std::string>();
+            if (!user_id.empty() &&
+                user_id.size() <= ninfer::kMaximumContextCacheSessionKeyBytes &&
+                !request.session_key) {
+                request.session_key = user_id;
+            }
+        }
+    }
     std::vector<std::optional<CacheBoundary>*> explicit_boundaries;
     for (ToolDefinition& tool : request.tools) {
         if (tool.cache_boundary_after) {
@@ -977,7 +988,7 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
 
     const std::optional<CacheBoundary::Ttl> automatic_ttl = cache_boundary(body, "cache_control");
     if (!automatic_ttl) { return; }
-    request.allow_engine_automatic_shared_prefixes = false;
+
 
     std::optional<CacheBoundary>* automatic_target = nullptr;
     for (auto turn = request.messages.rbegin(); turn != request.messages.rend(); ++turn) {

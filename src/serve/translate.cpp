@@ -292,6 +292,9 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     }
     input.context_cache.allow_engine_automatic_shared_prefixes =
         request.allow_engine_automatic_shared_prefixes;
+    if (request.session_key && !input.context_cache.session_key) {
+        input.context_cache.session_key = request.session_key;
+    }
     return input;
 }
 

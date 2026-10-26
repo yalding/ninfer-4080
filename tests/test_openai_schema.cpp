@@ -179,6 +179,22 @@ int test_standard_field_policy() {
     neutral["future_unknown_field"]   = Json{{"value", 1}};
     failures += check(parse(neutral).generation.messages.size() == 1,
                       "neutral controls and advisory hints are accepted");
+    const OpenAIChatRequest parsed_neutral = parse(neutral);
+    failures += check(parsed_neutral.generation.session_key == "cache-1" &&
+                          prompt(parsed_neutral.generation).context_cache.session_key == "cache-1" &&
+                          parsed_neutral.generation.allow_engine_automatic_shared_prefixes &&
+                          prompt(parsed_neutral.generation)
+                              .context_cache.allow_engine_automatic_shared_prefixes,
+                      "OpenAI prompt_cache_key and default automatic shared prefixes reach PromptInput");
+    Json user_only_session    = base_request();
+    user_only_session["user"] = "user-session-1";
+    failures += check(parse(user_only_session).generation.session_key == "user-session-1",
+                      "user field supplies fallback session key when prompt_cache_key is omitted");
+    Json explicit_cache_mode                    = base_request();
+    explicit_cache_mode["prompt_cache_options"] = Json{{"mode", "explicit"}};
+    failures += check(
+        !parse(explicit_cache_mode).generation.allow_engine_automatic_shared_prefixes,
+        "explicit prompt_cache_options.mode disables automatic shared prefixes");
 
     Json zero_limit                     = base_request();
     zero_limit["max_completion_tokens"] = 0;

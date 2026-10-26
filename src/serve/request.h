@@ -185,6 +185,7 @@ struct GenerationRequest {
     std::optional<bool> preserve_thinking;
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool allow_engine_automatic_shared_prefixes = true;
+    std::optional<std::string> session_key;
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {

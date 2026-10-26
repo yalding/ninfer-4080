@@ -358,9 +358,14 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                      remaining_media_bytes);
             });
         std::vector<PromptCacheMarker> protocol_markers = std::move(input.context_cache.markers);
+        std::optional<std::string> protocol_session_key =
+            std::move(input.context_cache.session_key);
         const bool protocol_allows_engine_automatic =
             input.context_cache.allow_engine_automatic_shared_prefixes;
         input.context_cache = std::move(context_cache);
+        if (!input.context_cache.session_key && protocol_session_key) {
+            input.context_cache.session_key = std::move(protocol_session_key);
+        }
         input.context_cache.markers.insert(input.context_cache.markers.end(),
                                            std::make_move_iterator(protocol_markers.begin()),
                                            std::make_move_iterator(protocol_markers.end()));

@@ -1445,6 +1445,18 @@ int test_automatic_private_anchor_opportunities() {
         const auto prepared = frontend.prepare(conversation());
         failures += check(anchors(FrontendFactory::inspect(prepared)).empty(),
                           "automatic private anchors appeared without being requested");
+        const auto& inspected_default = FrontendFactory::inspect(prepared);
+        std::size_t structural_shared = 0;
+        for (const auto& opportunity : inspected_default.context_cache.opportunities) {
+            if (opportunity.kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                ninfer::has_shared_candidate_evidence(
+                    opportunity.evidence, ninfer::SharedCandidateEvidence::EngineStructural)) {
+                ++structural_shared;
+            }
+        }
+        failures += check(structural_shared == 2,
+                          "multi-turn prompt did not emit both preamble and penultimate-turn "
+                          "EngineStructural shared prefix opportunities");
     }
 
     // N = 2 on four messages: the boundaries after message 3 and message 2, nothing at the

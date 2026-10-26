@@ -24,7 +24,7 @@ inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
-inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
+inline constexpr std::uint32_t kDefaultHostStateSlots    = 16;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
 
 enum class KvCacheStorage : std::uint8_t {
@@ -165,7 +165,7 @@ struct SlotAutoSaveEvent {
 
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=min(C,2), R=8, Host KV=8 GiB, P=2C, S=max(C,4) and L=2;
+    // defaults are H=min(C,2), R=16, Host KV=8 GiB, P=2C, S=max(C,4) and L=2;
     // Engine::options() returns those effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.

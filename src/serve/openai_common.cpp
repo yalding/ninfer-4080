@@ -81,6 +81,17 @@ OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body
     }
 
     OpenAIPromptCachePolicy policy;
+    if (body.contains("prompt_cache_key") && body.at("prompt_cache_key").is_string()) {
+        const std::string key = body.at("prompt_cache_key").get<std::string>();
+        if (!key.empty() && key.size() <= ninfer::kMaximumContextCacheSessionKeyBytes) {
+            policy.session_key = key;
+        }
+    } else if (body.contains("user") && body.at("user").is_string()) {
+        const std::string user = body.at("user").get<std::string>();
+        if (!user.empty() && user.size() <= ninfer::kMaximumContextCacheSessionKeyBytes) {
+            policy.session_key = user;
+        }
+    }
     if (!body.contains("prompt_cache_options") || body.at("prompt_cache_options").is_null()) {
         return policy;
     }
@@ -109,6 +120,9 @@ OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body
 }
 
 void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCachePolicy policy) {
+    if (policy.session_key && !request.session_key) {
+        request.session_key = std::move(policy.session_key);
+    }
     std::vector<std::optional<CacheBoundary>*> explicit_boundaries;
     for (ToolDefinition& tool : request.tools) {
         if (tool.cache_boundary_after) {
@@ -174,7 +188,8 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
     }
     // OpenAI already defines the automatic/explicit write policy for every request. Existing
     // exact shared residents are still considered by the Engine independently of this switch.
-    request.allow_engine_automatic_shared_prefixes = false;
+    request.allow_engine_automatic_shared_prefixes =
+        policy.automatic != OpenAIPromptCacheAutomatic::Disabled;
 }
 
 std::string make_models_list(const std::string& model_id, std::int64_t created,

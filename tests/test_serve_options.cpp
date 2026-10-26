@@ -115,7 +115,8 @@ int main() {
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
-    failures += check(defaults.context_cache.host_state_slots == ninfer::kDefaultHostStateSlots &&
+    failures += check(ninfer::kDefaultHostStateSlots == 16 &&
+                          defaults.context_cache.host_state_slots == ninfer::kDefaultHostStateSlots &&
                           defaults.context_cache.host_kv_capacity_bytes ==
                               ninfer::kDefaultHostKvCapacityBytes,
                       "Host context-cache defaults mismatch");

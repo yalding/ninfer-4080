@@ -332,10 +332,27 @@ public:
                         private_has_active_edge(index.slot)) {
                         continue;
                     }
+
+
+
+                    const bool has_vacant_private_slot =
+                        std::any_of(catalog_.begin(), catalog_.end(), [](const CatalogEntry& item) {
+                            return item.state == CatalogState::Vacant;
+                        });
+                    const bool branches_interior_checkpoint =
+                        has_vacant_private_slot &&
+                        index.checkpoint.kind != CheckpointKind::SessionEndpoint &&
+                        entry.summary.endpoint &&
+                        entry.summary.endpoint->ref.frontier > index.key.frontier;
+                    const bool multi_domain_shared_demand =
+                        has_vacant_private_slot &&
+                        matching_reuse_domains(index.key, provisional_demand) >= 2U;
+
                     const bool retain =
-                        entry.session && (!base.context_cache().session_key ||
-                                          *entry.session != *base.context_cache().session_key ||
-                                          !base.context_cache().update_session_index);
+                        branches_interior_checkpoint || multi_domain_shared_demand ||
+                        (entry.session && (!base.context_cache().session_key ||
+                                           *entry.session != *base.context_cache().session_key ||
+                                           !base.context_cache().update_session_index));
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
@@ -733,11 +750,19 @@ public:
                     }
                     return found->id;
                 };
-                if (pressure_evidence) {
+                const bool private_pressure_evidence =
+                    pressure_evidence ||
+                    (scenario.replacement == nullptr &&
+                     (has_shared_candidate_evidence(candidate.shared_evidence,
+                                                    SharedCandidateEvidence::DefaultAutomatic) ||
+                      has_shared_candidate_evidence(candidate.shared_evidence,
+                                                    SharedCandidateEvidence::EngineStructural)));
+                if (private_pressure_evidence) {
+
                     private_owners.reserve(catalog_count_);
                     private_owner_ids.reserve(catalog_count_);
-                    shared_owners.reserve(shared_catalog_count_);
-                    shared_owner_ids.reserve(shared_catalog_count_);
+
+
                     for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                         const CatalogEntry& entry = catalog_[slot];
                         if (entry.state != CatalogState::Catalogued || !entry.handle ||
@@ -748,6 +773,10 @@ public:
                         private_owner_ids.push_back(
                             owner_id_for(LogicalOwnerKind::PrivateContinuation, slot));
                     }
+                }
+                if (pressure_evidence) {
+                    shared_owners.reserve(shared_catalog_count_);
+                    shared_owner_ids.reserve(shared_catalog_count_);
                     for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
                         const SharedCatalogEntry& entry = shared_catalog_[slot];
                         if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
@@ -1870,7 +1899,7 @@ private:
         std::vector<std::uint32_t> selected_frontiers;
         std::uint64_t selected_gain = 0;
         ContextPortfolioValue projected_value;
-        if (shared_candidates.size() > 7U) {
+        if (shared_candidates.size() > 8U) {
             throw std::logic_error("prepared shared candidates exceeded the fixed subset bound");
         }
         const std::uint32_t subset_count = 1U << shared_candidates.size();

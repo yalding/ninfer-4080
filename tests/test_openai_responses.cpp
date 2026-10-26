@@ -200,6 +200,17 @@ int test_budgets_and_nonsemantic_hints() {
         parse_openai_responses_create_request(hints, limits());
     failures += check(accepted.max_tool_calls == 0,
                       "typed nonsemantic hints are accepted without changing generation");
+    failures += check(accepted.prompt.generation.session_key == "stable-prefix" &&
+                          !accepted.prompt.generation.allow_engine_automatic_shared_prefixes,
+                      "Responses prompt_cache_key and explicit cache mode reach GenerationRequest");
+    {
+        OpenAIResponsesStore store(8, 1ULL << 20);
+        const OpenAIResponsesResolvedPrompt stateless_resolved =
+            resolve_openai_responses_prompt(accepted.prompt, store, "resp_stateless", false);
+        failures += check(stateless_resolved.session_key == "stable-prefix" &&
+                              stateless_resolved.cache_hints.session_key == "stable-prefix",
+                          "stateless Responses request inherits prompt_cache_key session affinity");
+    }
 
     hints["client_metadata"] = nullptr;
     failures += check(parse_openai_responses_create_request(hints, limits()).prompt.model == "m",

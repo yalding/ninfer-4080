@@ -580,6 +580,15 @@ int test_content_and_cache_hints() {
                           translated.context_cache.markers[1].location ==
                               ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
                       "message-part cache boundary was not represented in PromptInput");
+    failures += check(request.allow_engine_automatic_shared_prefixes &&
+                          translated.context_cache.allow_engine_automatic_shared_prefixes,
+                      "Anthropic top-level cache_control suppressed automatic structural prefixes");
+    Json with_user_id          = base_request();
+    with_user_id["metadata"]   = Json{{"user_id", "claude-user-42"}};
+    const GenerationRequest uq = parse(with_user_id).generation;
+    failures += check(uq.session_key == "claude-user-42" &&
+                          prompt(uq).context_cache.session_key == "claude-user-42",
+                      "Anthropic metadata.user_id did not wire to context_cache.session_key");
 
     body                           = base_request();
     body["messages"][0]["content"] = Json::array(

@@ -402,8 +402,10 @@ Earlier schema-valid historical breakpoints are accepted but are not new write c
 reads of already-published prefixes do not require the request to repeat a marker.
 
 These fields are optimization hints. A legal boundary that cannot be represented as an exact
-rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` is not an
-Engine session key or prefix identity. Valid TTL/retention values are accepted, but NInfer does not
+rendered-token frontier is ignored without changing prompt content. When non-empty and within the
+256-byte session-key bound, `prompt_cache_key` (or `user` when `prompt_cache_key` is omitted)
+supplies the Engine session key for private continuation affinity; it does not alter rendered
+prefix identity. Valid TTL/retention values are accepted, but NInfer does not
 promise their wall-clock residency; physical retention follows the resource scheduler.
 
 ## OpenAI Responses Core
@@ -842,7 +844,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
-| `--host-state-slots N` | pinned Host StateImage capacity | `8` |
+| `--host-state-slots N` | pinned Host StateImage capacity | `16` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |

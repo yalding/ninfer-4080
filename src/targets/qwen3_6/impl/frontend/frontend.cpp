@@ -884,6 +884,12 @@ PreparedContextCache prepare_context_cache(
                             SharedCandidateEvidence::EngineStructural,
                             *message_boundaries[*leading_boundary], engine_order++);
         }
+        if (message_boundaries.size() >= 2U &&
+            message_boundaries[message_boundaries.size() - 2U]) {
+            add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
+                            SharedCandidateEvidence::EngineStructural,
+                            *message_boundaries[message_boundaries.size() - 2U], engine_order++);
+        }
         add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
                         SharedCandidateEvidence::EngineObserved, full_prompt_frontier,
                         engine_order);

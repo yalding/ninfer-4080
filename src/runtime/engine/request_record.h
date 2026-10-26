@@ -150,6 +150,16 @@ struct RequestRecord {
         return model_state == EngineRequestState::ModelFinished;
     }
 
+    [[nodiscard]] std::uint32_t remaining_prefill_tokens() const noexcept {
+        if (!admitted_begin ||
+            admitted_begin->reused_prompt_tokens >= admitted_begin->prompt_tokens) {
+            return 0;
+        }
+        const std::uint32_t suffix_tokens =
+            admitted_begin->prompt_tokens - admitted_begin->reused_prompt_tokens;
+        return computed_prompt_tokens < suffix_tokens ? suffix_tokens - computed_prompt_tokens : 0;
+    }
+
     // The process range follows Request ownership across submit, worker, and consumer threads.
     nvtx::ScopedAsyncRange generation_range;
     const std::uint64_t id;

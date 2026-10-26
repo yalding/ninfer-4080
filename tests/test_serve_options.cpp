@@ -408,7 +408,7 @@ int main() {
               "serve help omits --no-prefix-reuse");
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
-    failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=
+    failures += check(serve_usage_text("ninfer-serve").find("device-state=min(max-concurrency,2)") !=
                           std::string::npos,
                       "serve help omits context-cache defaults");
     failures +=

@@ -10315,7 +10315,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
     std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
     bool needs_hidden_correction = false;
-    bool needs_sync              = speculative_backend != SpeculativeBackend::Mtp;
+    bool needs_sync              = false;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending ||
@@ -11766,6 +11766,25 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             };
         }
         StateImageSelectors selectors = state_selectors(sequence);
+        set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
+        set_device_i32(io.backend_kv_table_row,
+                       sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                                            : 0);
+        set_device_i32(io.rope_delta, sequence.rope_delta);
+        if (is_masked_draft_backend(speculative_backend)) {
+            if (!dflash || !io.dflash_decode || (backend_kv_cache() && !sequence.kv->backend)) {
+                throw std::logic_error("DFlash prefill state is incomplete");
+            }
+            *dflash_host_ingress                            = {};
+            dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(sequence.lane);
+            dflash_host_ingress->state_source_slots[0]      = selectors.source;
+            dflash_host_ingress->state_destination_slots[0] = selectors.destination;
+            dflash_host_ingress->dflash_kv_table_rows[0]    =
+                sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
+            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
+                                       sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                                       device.stream));
+        }
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
         if (staged.next_capture < staged.capture_groups.size()) {

@@ -841,7 +841,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity,
                             static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
-                        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+                        return (final_visible <= 4096 ? 12ULL : 16ULL) * kMiB;
                     },
                     "DFlash graph allowance");
             };

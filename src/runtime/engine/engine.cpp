@@ -72,7 +72,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         return options;
     }
 
-    cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);
+    cache.device_state_slots =
+        cache.device_state_slots.value_or(std::min<std::uint32_t>(concurrency, 2U));
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));

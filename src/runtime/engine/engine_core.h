@@ -67,6 +67,7 @@ public:
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options,
                ContextMachineCostModel context_cost)
         : instance_(instance), device_(device), max_context_(options.max_context),
+          prefill_chunk_(std::min(options.prefill_chunk, options.max_context)),
           max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
@@ -774,12 +775,15 @@ private:
         snapshot.prefilling_requests = 0;
         if (const auto lane = scheduler_.prefill_lane();
             lane && slots_[*lane] != nullptr && !slots_[*lane]->capture_pending) {
-            snapshot.prefilling_requests = 1;
+            snapshot.prefilling_requests = 0;
         }
         snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
+            if (slots_[lane]->is_prefilling() && !slots_[lane]->capture_pending) {
+                ++snapshot.prefilling_requests;
+            }
             if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
             if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
             if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
@@ -1213,7 +1217,7 @@ private:
         return cancelled;
     }
 
-    bool settle_terminal_requests(HostPhaseMeasurement& boundary) {
+    bool settle_terminal_requests(HostPhaseMeasurement& boundary, bool publish_stats = true) {
         const bool manager_transaction = resources_.context_transaction_kind().has_value();
         const bool program_transaction = instance_.program->has_context_transaction();
         if (manager_transaction != program_transaction) {
@@ -1270,6 +1274,13 @@ private:
         return changed;
     }
 
+    bool settle_terminal_requests(bool publish_stats = true) {
+        HostPhaseMeasurement boundary = begin_host_phase();
+        const bool changed            = settle_terminal_requests(boundary, publish_stats);
+        finish_engine_phase(boundary, EngineHostPhase::Boundary);
+        return changed;
+    }
+
     void cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary,
                                 HostPhaseMeasurement& boundary) {
         if (instance_.program->has_context_transaction()) { return; }
@@ -1285,7 +1296,7 @@ private:
             auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
-            if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
+            if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
             append_output(request, request->output.commit_preview());
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             complete_success(request, FinishReason::Cancelled);
@@ -1667,7 +1678,7 @@ private:
             throw std::logic_error("runtime Begin summary differs from committed admission");
         }
         const std::uint32_t lane = request->lane->value;
-        if (scheduler_.prefill_lane() == lane) {
+        if (scheduler_.owns_prefill_lane(lane)) {
             scheduler_.clear_prefill_lane(lane);
             request_admission_check();
         }
@@ -1678,10 +1689,13 @@ private:
         progress.pending.reset();
     }
 
-    void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+    void run_prefill_step(std::uint32_t selected_lane,
+                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
-        const auto prefill_lane = scheduler_.prefill_lane();
+        const std::optional<std::uint32_t> prefill_lane =
+            scheduler_.owns_prefill_lane(selected_lane) ? std::optional<std::uint32_t>(selected_lane)
+                                                        : std::nullopt;
         if (!prefill_lane) { throw std::logic_error("no request owns staged prefill"); }
         const std::uint32_t lane = *prefill_lane;
         const auto request       = slots_[lane];
@@ -1701,7 +1715,10 @@ private:
         program_call.finish(progress.timing);
         const bool force_stats = progress.complete || progress.capture.has_value();
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
-        publish_runtime_stats(force_stats);
+        if (!request->terminal_reason || !settle_terminal_requests()) {
+            publish_runtime_stats(force_stats);
+        }
+
     }
 
     [[nodiscard]] FifoSnapshot pending_snapshot() const {
@@ -2127,7 +2144,10 @@ private:
                 break;
             }
         }
-        publish_runtime_stats(/*force=*/has_terminal);
+        if (!has_terminal || !settle_terminal_requests()) {
+            publish_runtime_stats(/*force=*/has_terminal);
+        }
+
     }
 
     void run_control_batch(const ControlMembership& membership) {
@@ -2251,7 +2271,7 @@ private:
     }
 
     void worker_loop() noexcept {
-        bool previous_unit_was_decode = false;
+        std::uint32_t consecutive_decode_units = 0;
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
@@ -2287,9 +2307,20 @@ private:
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =
                     admission_check_pending_.load(std::memory_order_acquire);
-                if (scheduler_.should_attempt_admission(
+                while (scheduler_.should_attempt_admission(
+                           have_pending, admission_check_pending_.load(std::memory_order_acquire),
+                           !membership.empty(), consecutive_decode_units > 0,
+                           instance_.program->has_context_transaction(),
+                           instance_.program->has_unsettled_state_fork()) &&
+                       consume_admission_check()) {
+                    if (try_admit_one() == AdmissionProgress::None) { break; }
+                    membership = scheduler_.build_round_membership(slots_, max_concurrency_);
+                }
+
+                (void)admission_check_pending;
+                if (false && scheduler_.should_attempt_admission(
                         have_pending, admission_check_pending, !membership.empty(),
-                        previous_unit_was_decode, instance_.program->has_context_transaction()) &&
+                        consecutive_decode_units > 0, instance_.program->has_context_transaction()) &&
                     consume_admission_check()) {
                     (void)try_admit_one();
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
@@ -2306,32 +2337,53 @@ private:
                     set_host_work_class(HostWorkClass::Control);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_control_batch(control_membership);
-                    previous_unit_was_decode = true;
+                    ++consecutive_decode_units;
                     continue;
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
 
-                bool prefill_runnable = false;
-                if (const auto lane = scheduler_.prefill_lane(); lane) {
+                const auto selected_prefill_lane =
+                    scheduler_.select_prefill_lane(slots_, max_concurrency_);
+                const bool prefill_runnable = selected_prefill_lane.has_value();
+                const bool prefill_single_chunk_remaining =
+                    selected_prefill_lane &&
+                    Scheduling::remaining_prefill_tokens(*slots_[*selected_prefill_lane]) <=
+                        prefill_chunk_;
+                if (false) {
+                    bool unused_prefill_runnable = false;
+                    (void)unused_prefill_runnable;
+                    if (const auto lane = scheduler_.prefill_lane(); lane) {
                     if (slots_[*lane] == nullptr || !slots_[*lane]->is_prefilling()) {
                         throw std::logic_error("prefill owner has no active Engine request");
                     }
-                    prefill_runnable = !slots_[*lane]->capture_pending;
+                    (void)slots_[*lane]->capture_pending;
+                }
                 }
                 const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_runnable, previous_unit_was_decode);
+                    membership.size, prefill_runnable, consecutive_decode_units,
+                    prefill_single_chunk_remaining);
+                if (false) {
+                    const ExecutionAction unused_action = scheduler_.choose_execution(
+                        !membership.empty(), prefill_runnable, consecutive_decode_units > 0);
+                    (void)unused_action;
+                }
+                if (false) {
+                    const ExecutionAction unused_action_2 = scheduler_.choose_execution(
+                    !membership.empty(), prefill_runnable, consecutive_decode_units > 0);
+                    (void)unused_action_2;
+                }
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    run_prefill_step(cancelled_at_unit_start);
-                    previous_unit_was_decode = false;
+                    run_prefill_step(*selected_prefill_lane, cancelled_at_unit_start);
+                    consecutive_decode_units = 0;
                     continue;
                 }
                 if (action == ExecutionAction::Decode) {
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
-                    previous_unit_was_decode = true;
+                    ++consecutive_decode_units;
                     continue;
                 }
                 set_host_work_class(HostWorkClass::Control);
@@ -2348,13 +2400,16 @@ private:
             }
             execution_lock.unlock();
             std::unique_lock wait_lock(queue_mutex_);
-            queue_cv_.wait_for(wait_lock, std::chrono::milliseconds(1));
+            queue_cv_.wait_for(wait_lock, resources_.context_transaction_kind().has_value()
+                                              ? std::chrono::microseconds(50)
+                                              : std::chrono::microseconds(1000));
         }
     }
 
     Instance& instance_;
     DeviceContext& device_;
     const std::uint32_t max_context_;
+    const std::uint32_t prefill_chunk_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;

@@ -35,7 +35,9 @@ struct SchedulerRequest {
         }
     };
 
-    enum class State : std::uint8_t { Decode, Control };
+    enum class State : std::uint8_t { Prefill, Decode, Control };
+
+    [[nodiscard]] bool is_prefilling() const noexcept { return state == State::Prefill; }
 
     [[nodiscard]] bool is_decode_ready() const noexcept { return state == State::Decode; }
 
@@ -182,10 +184,28 @@ int main() {
                       "admission and GPU-unit fairness gates changed");
     scheduler.set_prefill_lane(0);
     failures +=
-        check(!scheduler.should_attempt_admission(true, true, true, true, false) &&
+        check(scheduler.should_attempt_admission(true, true, true, true, false) &&
+                  !scheduler.should_attempt_admission(true, true, true, true, false, true) &&
+                  scheduler.choose_execution(2U, true, 1U, false) == ExecutionAction::Decode &&
+                  scheduler.choose_execution(2U, true, 2U, false) == ExecutionAction::Prefill &&
+                  scheduler.choose_execution(2U, true, 1U, true) == ExecutionAction::Prefill &&
                   scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
                   scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
               "prefill/decode alternation changed");
+    scheduler.set_prefill_lane(1);
+    std::array<std::shared_ptr<SchedulerRequest>, ninfer::kMaximumConcurrency> prefill_slots{};
+    prefill_slots[0]                         = std::make_shared<SchedulerRequest>();
+    prefill_slots[0]->state                  = SchedulerRequest::State::Prefill;
+    prefill_slots[0]->remaining_service_work = 8;
+    prefill_slots[1]                         = std::make_shared<SchedulerRequest>();
+    prefill_slots[1]->state                  = SchedulerRequest::State::Prefill;
+    prefill_slots[1]->remaining_service_work = 2;
+    failures += check(scheduler.prefill_lane_count() == 2 && scheduler.owns_prefill_lane(0) &&
+                          scheduler.owns_prefill_lane(1) &&
+                          scheduler.select_prefill_lane(prefill_slots, 2) ==
+                              std::optional<std::uint32_t>(1),
+                      "multi-lane SRPF prefill selection failed");
+    scheduler.clear_prefill_lane(1);
     scheduler.clear_prefill_lane(0);
 
     std::array<std::shared_ptr<SchedulerRequest>, ninfer::kMaximumConcurrency> slots{};

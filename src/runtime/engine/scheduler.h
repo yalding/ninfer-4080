@@ -230,24 +230,85 @@ public:
         request.remaining_service_work -= work;
     }
 
+    [[nodiscard]] static std::size_t remaining_prefill_tokens(const Request& request) noexcept {
+        if constexpr (requires { request.remaining_prefill_tokens(); }) {
+            return request.remaining_prefill_tokens();
+        } else if constexpr (requires {
+                                 request.total_prompt_tokens;
+                                 request.prefill_offset;
+                             }) {
+            return request.total_prompt_tokens > request.prefill_offset
+                       ? request.total_prompt_tokens - request.prefill_offset
+                       : 0;
+        } else {
+            return static_cast<std::size_t>(request.remaining_service_work);
+        }
+    }
+
     [[nodiscard]] bool should_attempt_admission(bool have_pending, bool admission_check_pending,
                                                 bool have_decode, bool previous_unit_was_decode,
-                                                bool context_transaction) const noexcept {
-        return have_pending && admission_check_pending && !context_transaction && !prefill_lane_ &&
-               (!have_decode || previous_unit_was_decode);
+                                                bool context_transaction,
+                                                bool unsettled_state_fork = false) const noexcept {
+        return have_pending && admission_check_pending && !context_transaction &&
+               !unsettled_state_fork && (!have_decode || previous_unit_was_decode);
+    }
+
+    [[nodiscard]] ExecutionAction
+    choose_execution(std::size_t decode_ready_count, bool prefill_runnable,
+                     std::uint32_t consecutive_decode_units,
+                     bool prefill_single_chunk_remaining = false) const noexcept {
+        if (prefill_runnable) {
+            if (decode_ready_count == 0) { return ExecutionAction::Prefill; }
+            if (prefill_single_chunk_remaining) {
+                return consecutive_decode_units == 0 ? ExecutionAction::Decode
+                                                     : ExecutionAction::Prefill;
+            }
+            const std::uint32_t decode_cadence = decode_ready_count >= 2 ? 2U : 1U;
+            return consecutive_decode_units < decode_cadence ? ExecutionAction::Decode
+                                                             : ExecutionAction::Prefill;
+        }
+        return decode_ready_count > 0 ? ExecutionAction::Decode : ExecutionAction::Wait;
     }
 
     [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
                                                    bool previous_unit_was_decode) const noexcept {
-        if (prefill_runnable) {
-            return have_decode && !previous_unit_was_decode ? ExecutionAction::Decode
-                                                            : ExecutionAction::Prefill;
+        return choose_execution(have_decode ? 1U : 0U, prefill_runnable,
+                                previous_unit_was_decode ? 1U : 0U, false);
+    }
+
+    template <class Slots>
+    [[nodiscard]] std::optional<std::uint32_t>
+    select_prefill_lane(const Slots& slots, std::uint32_t max_concurrency) const {
+        std::optional<std::uint32_t> best_lane;
+        std::size_t best_remaining = 0;
+        for (std::size_t i = 0; i < prefill_lane_count_; ++i) {
+            const std::uint32_t lane = prefill_lanes_[i];
+            if (lane >= max_concurrency || slots[lane] == nullptr ||
+                !slots[lane]->is_prefilling()) {
+                throw std::logic_error("prefill lane does not match an active prefilling request");
+            }
+            if (slots[lane]->capture_pending) { continue; }
+            const std::size_t remaining = remaining_prefill_tokens(*slots[lane]);
+            if (!best_lane || remaining < best_remaining) {
+                best_lane      = lane;
+                best_remaining = remaining;
+            }
         }
-        return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
+        return best_lane;
     }
 
     [[nodiscard]] std::optional<std::uint32_t> prefill_lane() const noexcept {
-        return prefill_lane_;
+        return prefill_lane_count_ > 0 ? std::optional<std::uint32_t>(prefill_lanes_[0])
+                                       : std::nullopt;
+    }
+
+    [[nodiscard]] std::size_t prefill_lane_count() const noexcept { return prefill_lane_count_; }
+
+    [[nodiscard]] bool owns_prefill_lane(std::uint32_t lane) const noexcept {
+        for (std::size_t i = 0; i < prefill_lane_count_; ++i) {
+            if (prefill_lanes_[i] == lane) { return true; }
+        }
+        return false;
     }
 
     [[nodiscard]] std::optional<std::uint64_t> protection_epoch() const noexcept {
@@ -255,15 +316,29 @@ public:
     }
 
     void set_prefill_lane(std::uint32_t lane) {
-        if (prefill_lane_) { throw std::logic_error("multiple requests own staged prefill"); }
-        prefill_lane_ = lane;
+        if (lane >= kMaximumConcurrency) {
+            throw std::logic_error("prefill lane exceeds maximum concurrency");
+        }
+        if (owns_prefill_lane(lane)) {
+            throw std::logic_error("lane already owns staged prefill");
+        }
+        if (prefill_lane_count_ >= kMaximumConcurrency) {
+            throw std::logic_error("staged prefill lane capacity exceeded");
+        }
+        prefill_lanes_[prefill_lane_count_++] = lane;
     }
 
     void clear_prefill_lane(std::uint32_t lane) {
-        if (!prefill_lane_ || *prefill_lane_ != lane) {
-            throw std::logic_error("request does not own staged prefill");
+        for (std::size_t i = 0; i < prefill_lane_count_; ++i) {
+            if (prefill_lanes_[i] == lane) {
+                for (std::size_t j = i + 1; j < prefill_lane_count_; ++j) {
+                    prefill_lanes_[j - 1] = prefill_lanes_[j];
+                }
+                --prefill_lane_count_;
+                return;
+            }
         }
-        prefill_lane_.reset();
+        throw std::logic_error("request does not own staged prefill");
     }
 
     void observe_fifo_head(std::optional<std::uint64_t> request_id) noexcept {
@@ -354,13 +429,14 @@ public:
     }
 
     void reset() noexcept {
-        prefill_lane_.reset();
+        prefill_lane_count_ = 0;
         fifo_head_id_.reset();
         protection_.reset();
     }
 
 private:
-    std::optional<std::uint32_t> prefill_lane_;
+    std::array<std::uint32_t, kMaximumConcurrency> prefill_lanes_{};
+    std::size_t prefill_lane_count_ = 0;
     std::optional<std::uint64_t> fifo_head_id_;
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

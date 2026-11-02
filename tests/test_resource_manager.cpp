@@ -1047,6 +1047,9 @@ public:
         return false;
     }
 
+    bool unsettled_state_fork{false};
+    [[nodiscard]] bool has_unsettled_state_fork() const noexcept { return unsettled_state_fork; }
+
     void skip_capture(FakeCaptureOffer&&) { ++skipped_captures; }
 
     [[nodiscard]] ContextTransactionReserveStatus
@@ -3270,6 +3273,19 @@ void test_terminal_settlement_waits_for_open_resource_transaction() {
             "terminal settlement changed topology during an open resource transaction");
 }
 
+void test_reserve_active_capture_skips_unsettled_state_fork() {
+    FakeManager manager = make_manager(2, 2);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 31, make_base(31), 1);
+
+    program.unsettled_state_fork = true;
+    const auto capture =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 11}, false, {});
+    require(capture == FakeManager::ActiveCaptureReserveResult::Skipped &&
+                program.skipped_captures == 1,
+            "capture was not skipped during unsettled state fork");
+}
+
 void test_commit_and_discard_terminal_states() {
     FakeManager manager = make_manager(2, 2);
     FakeProgram program;
@@ -3567,6 +3583,8 @@ int main() {
     run_test("terminal fallback", test_terminal_fallback_releases_failed_retention);
     run_test("terminal waits for resource transaction",
              test_terminal_settlement_waits_for_open_resource_transaction);
+    run_test("capture skips unsettled state fork",
+             test_reserve_active_capture_skips_unsettled_state_fork);
     run_test("commit and discard", test_commit_and_discard_terminal_states);
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",

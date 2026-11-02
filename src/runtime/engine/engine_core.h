@@ -1555,7 +1555,7 @@ private:
                         continuations[row] == ContinuationAction::ApplyTargetControl
                             ? EngineRequestState::ControlReady
                             : EngineRequestState::DecodeReady;
-                    if (terminal_in_batch) {
+                    if (terminal_in_batch || instance_.program->has_unsettled_state_fork()) {
                         instance_.program->skip_capture(std::move(*committed.captures[row]));
                         request->model_state = post_capture_state;
                     } else {

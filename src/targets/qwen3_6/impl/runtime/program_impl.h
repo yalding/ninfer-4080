@@ -7929,8 +7929,12 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     const SharedPrefixHandle* replacement,
     std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
     std::optional<CapturePressureCandidate> pressure, runtime::CancellationFlagView cancellation) {
-    if (has_context_transaction() || has_unsettled_state_fork() || !valid_capture_offer(offer)) {
+    if (has_context_transaction() || !valid_capture_offer(offer)) {
         throw std::logic_error("capture transaction is not reservable");
+    }
+    if (has_unsettled_state_fork()) {
+        skip_capture(std::move(offer));
+        return runtime::ContextTransactionReserveStatus::Aborted;
     }
     if (cancellation.requested()) {
         skip_capture(std::move(offer));

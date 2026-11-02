@@ -532,6 +532,12 @@ public:
             program.skip_capture(std::move(offer));
             return ActiveCaptureReserveResult::Skipped;
         }
+        if constexpr (requires { program.has_unsettled_state_fork(); }) {
+            if (program.has_unsettled_state_fork()) {
+                program.skip_capture(std::move(offer));
+                return ActiveCaptureReserveResult::Skipped;
+            }
+        }
         rebuild_prefix_index();
 
         CaptureAssessment private_baseline =

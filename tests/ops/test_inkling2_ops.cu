@@ -12,6 +12,8 @@ using namespace ninfer;
 using namespace ninfer::test;
 namespace {
 constexpr ReductionCriterion bf16_criterion{1.85e-3,1e-5,3.95e-3};
+constexpr ReductionCriterion attn_mma_criterion{6e-3,3e-5,8e-3};
+constexpr ReductionCriterion moe_mma_criterion{6e-3,2e-5,1e-2};
 constexpr PointwiseCriterion f32_criterion{2e-5,2e-5};
 std::vector<float> pattern(std::size_t n,int seed,float scale=1){
     std::vector<float> a(n);fill_uniform(a,seed,-scale,scale);round_to_bf16(a);return a;
@@ -72,7 +74,8 @@ int attention_oracle(const std::vector<float>& q,const std::vector<float>& gate,
             }
         }
     }
-    return verify_reduction(swa?"inkling2 SWA oracle":"inkling2 full oracle",actual,ref,bf16_criterion);
+    return verify_reduction(swa?"inkling2 SWA oracle":"inkling2 full oracle",actual,ref,
+                            tokens>=16?attn_mma_criterion:bf16_criterion);
 }
 int full_case(DeviceContext& ctx,int count,int tokens,bool i8){
     int pages=(count+63)/64,start=count-tokens;
@@ -206,7 +209,8 @@ int moe_case(DeviceContext& ctx,bool q3,int tokens){
             for(int row=0;row<2304;++row)ref[row+2304*t]+=8*probs[e]/norm*down.dot(e*2304+row,[&](int k){return act[k];});
         }
     }
-    int failures=verify_reduction("inkling2 MoE FP64",from_device_bf16(out.data(),ref.size()),ref,bf16_criterion);
+    int failures=verify_reduction("inkling2 MoE FP64",from_device_bf16(out.data(),ref.size()),ref,
+                                  tokens>=16?moe_mma_criterion:bf16_criterion);
     failures+=out.verify_guards("moe guards");failures+=workspace.used()!=0;
     std::cout<<"moe q3="<<q3<<" T="<<tokens<<" failures="<<failures<<'\n';return failures;
 }
@@ -215,10 +219,10 @@ int main(){
     try{
         if(cuda_unavailable())return 77;DeviceContext ctx;int failures=0;
         failures+=rel_case(ctx,1,false);failures+=rel_case(ctx,3,true);
-        for(bool i8:{false,true})for(int t:{1,3,17})failures+=full_case(ctx,257,t,i8);
+        for(bool i8:{false,true})for(int count:{64,257,2049})for(int t:{1,15,16,17,64,257})if(t<=count)failures+=full_case(ctx,count,t,i8);
         failures+=full_case(ctx,131072,1,true);
-        failures+=swa_case(ctx,0,3);failures+=swa_case(ctx,1025,1);failures+=swa_case(ctx,2049,1024);
-        for(bool q3:{false,true})for(int t:{1,3,17})failures+=moe_case(ctx,q3,t);
+        for(int start:{0,513,1025,2049})for(int t:{1,15,16,17,64,129,1024})failures+=swa_case(ctx,start,t);
+        for(bool q3:{false,true})for(int t:{1,3,15,16,17,64,65,256,1024})failures+=moe_case(ctx,q3,t);
         std::cout<<"inkling2 attention/MoE failures="<<failures<<'\n';return failures?1:0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
 }

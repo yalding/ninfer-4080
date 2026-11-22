@@ -14,6 +14,7 @@ using namespace ninfer::test;
 namespace {
 constexpr ReductionCriterion kBF{1.85e-3, 1e-5, 3.95e-3};
 constexpr ReductionCriterion kFP{2e-6, 2e-5, 5e-6};
+constexpr ReductionCriterion kFPMma{1e-5, 2e-5, 2e-5};
 std::vector<float> values(std::size_t n, int seed, float scale = 1, bool represented = true) {
     std::vector<float> out(n);
     fill_uniform(out, seed, -scale, scale);
@@ -30,13 +31,14 @@ void graph_run(DeviceContext& device, const std::function<void()>& body, bool gr
     device.synchronize();
 }
 int check(const char* label, const GuardedDeviceBuffer& out, const std::vector<double>& expected,
-          bool fp32 = false) {
+          bool fp32 = false, const ReductionCriterion* custom = nullptr) {
     std::vector<double> actual;
     if (fp32) {
         auto floats = from_device<float>(out.data(), expected.size());
         actual.assign(floats.begin(), floats.end());
     } else actual = from_device_bf16(out.data(), expected.size());
-    return verify_reduction(label, actual, expected, fp32 ? kFP : kBF) + out.verify_guards(label);
+    const auto& crit = custom ? *custom : (fp32 ? kFP : kBF);
+    return verify_reduction(label, actual, expected, crit) + out.verify_guards(label);
 }
 double invnorm(const float* data, int n) {
     double ss = 0;
@@ -56,7 +58,7 @@ int projection(DeviceContext& dev, int t, int n, bool fp32, bool graph) {
             for (int k = 0; k < 2304; ++k)
                 expected[i * n + j] += double(x[i * 2304 + k]) * w[j * 2304 + k];
     graph_run(dev, [&] { ops::inkling2_small_bf16_proj(tx, tw, out, dev.stream); }, graph);
-    return check("inkling2 projection", result, expected, fp32);
+    return check("inkling2 projection", result, expected, fp32, fp32 ? &kFPMma : nullptr);
 }
 
 int convolution(DeviceContext& dev, int c, int t, int dynamic_type, bool alias, bool residual,
@@ -253,7 +255,7 @@ int main() {
         if (cuda_unavailable()) return 77;
         DeviceContext device;
         int failures = 0;
-        for (int t : {1, 3, 17}) for (int n : {1, 24, 32, 64})
+        for (int t : {1, 3, 15, 16, 17, 64, 129}) for (int n : {1, 24, 32, 64})
             for (bool fp32 : {false, true}) failures += projection(device, t, n, fp32, t != 1);
         for (int t : {1, 2, 3, 17, 1024}) for (int c : {1024, 2304})
             for (bool alias : {false, true}) {
@@ -263,8 +265,9 @@ int main() {
         for (int m : {1, 2, 5, 8}) for (int r : {1, 3, 4}) for (bool norm : {false, true})
             failures += mixing(device, 3, m, r, norm, true);
         failures += mixing(device, 1, 5, 4, true, false, 0);
-        for (int c : {1, 3}) for (bool norm : {false, true}) for (bool alias : {false, true})
-            failures += control(device, 3, c, norm, true, alias);
+        for (int t : {3, 15, 16, 17, 64, 129})
+            for (int c : {1, 3}) for (bool norm : {false, true}) for (bool alias : {false, true})
+                failures += control(device, t, c, norm, true, alias);
         failures += control(device, 1, 1, false, false, false);
         for (bool alias : {false, true}) for (bool tau : {false, true})
             for (float scale : {0.f, 1e-5f, 5.f}) failures += clipping(device, 4, tau, alias, true, scale);

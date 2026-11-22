@@ -207,13 +207,7 @@ public:
         auto layer = [&](int physical, int visit, bool loop) {
             const auto& w      = model.layers[physical];
             const int branches = w.full_attention ? 3 : 1;
-            Tensor mixed       = Tensor(mix.data, DType::BF16, {C, t, branches});
-            if (physical) {
-                auto values = states_and_cur();
-                ops::inkling2_attn_res_mix(std::span(values.data(), block_count + 1),
-                                           w.attention_res_query, {}, mixed, stream);
-            } else
-                copy(cur, mixed, stream);
+            Tensor mixed = Tensor(mix.data, DType::BF16, {C, t, branches});
             std::array<Tensor, 3> norms;
             for (int j = 0; j < 3; ++j)
                 norms[j] =
@@ -221,7 +215,11 @@ public:
                         ? (j == 0 ? w.attention_q_input_norm
                                   : (j == 1 ? w.attention_k_input_norm : w.attention_v_input_norm))
                         : w.attention_input_norm;
+            Tensor attn_in;
             if (loop) {
+                auto values = states_and_cur();
+                ops::inkling2_attn_res_mix(std::span(values.data(), block_count + 1),
+                                           w.attention_res_query, {}, mixed, stream);
                 if (branches == 1) {
                     auto first = branch(mixed, 0);
                     for (int j = 0; j < 3; ++j) {
@@ -234,13 +232,23 @@ public:
                 ops::inkling2_loop_control(inputs, msg3, controls(w.loop_ctrl_down, 0, 3),
                                            controls(w.loop_ctrl_gain_forget, 0, 3), norms, inputs,
                                            workspace, stream);
+                attn_in = inputs;
+            } else if (physical) {
+                auto values = states_and_cur();
+                ops::inkling2_attn_res_mix(std::span(values.data(), block_count + 1),
+                                           w.attention_res_query, std::span(norms.data(), branches),
+                                           mixed, stream);
+                attn_in = mixed;
             } else {
-                for (int j = 0; j < 3; ++j) {
-                    auto src = branch(mixed, branches == 1 ? 0 : j), dst = branch(inputs, j);
-                    ops::rmsnorm(src, norms[j], 1e-6f, false, dst, stream);
+                for (int j = 0; j < branches; ++j) {
+                    auto dst = branch(inputs, j);
+                    ops::rmsnorm(cur, norms[j], 1e-6f, false, dst, stream);
                 }
+                attn_in = inputs;
             }
-            auto qi = branch(inputs, 0), ki = branch(inputs, 1), vi = branch(inputs, 2);
+            const int kv_idx = (loop || branches == 3) ? 1 : 0;
+            const int v_idx  = (loop || branches == 3) ? 2 : 0;
+            auto qi = branch(attn_in, 0), ki = branch(attn_in, kv_idx), vi = branch(attn_in, v_idx);
             ops::linear(qi, w.attention_qgr, qgr, ops::LinearPolicy::A16Only, workspace, stream);
             ops::linear(ki, w.attention_k, kraw, ops::LinearPolicy::A16Only, workspace, stream);
             ops::linear(vi, w.attention_v, vraw, ops::LinearPolicy::A16Only, workspace, stream);
@@ -290,16 +298,16 @@ public:
             std::array<Tensor, 5> values;
             for (int i = 0; i < block_count; ++i) values[i] = blocks[i];
             values[block_count] = residual;
-            ops::inkling2_attn_res_mix(std::span(values.data(), block_count + 1), w.ffn_res_query,
-                                       {}, ffn, stream);
+            const std::array<Tensor, 1> fnorm{w.ffn_input_norm};
+            ops::inkling2_attn_res_mix(
+                std::span(values.data(), block_count + 1), w.ffn_res_query,
+                loop ? std::span<const Tensor>{} : std::span<const Tensor>(fnorm), ffn, stream);
             if (loop) {
                 auto msg = branch(messages, 3);
-                const std::array<Tensor, 1> fnorm{w.ffn_input_norm};
                 ops::inkling2_loop_control(ffn, msg, controls(w.loop_ctrl_down, 3, 1),
                                            controls(w.loop_ctrl_gain_forget, 3, 1), fnorm, ffn,
                                            workspace, stream);
-            } else
-                ops::rmsnorm(ffn, w.ffn_input_norm, 1e-6f, false, ffn, stream);
+            }
             ops::Inkling2MoeWeights mw{w.ffn_router, w.ffn_exp_probs_bias, w.ffn_routed_gate_up,
                                        w.ffn_routed_down};
             ops::inkling2_moe(ffn, mw, moe, workspace, stream);

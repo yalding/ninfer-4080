@@ -74,20 +74,22 @@ std::size_t inkling2_full_attention_workspace_capacity_bytes(KvCacheStorage stor
         hi < lo)
         throw std::invalid_argument("inkling2_full_attention: workspace envelope");
     std::size_t peak = 0;
-    for (int t : {lo, std::min(hi, 16), hi}) {
+    for (int t : {lo, std::min(hi, 15), hi}) {
         if (t < lo) continue;
         peak = std::max(peak, std::size_t(t) * 24 * inkling2_detail::splits(keys, t) * 130 *
                                   sizeof(float));
     }
-    return (peak + 255) & ~std::size_t(255);
+    return std::max<std::size_t>(256, (peak + 255) & ~std::size_t(255));
 }
 
 void inkling2_full_attention(const Tensor& q, const Tensor& gate, const Tensor& rel,
                              const Tensor& pos, const PagedKVLayerView& cache, std::uint32_t keys,
                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     common(q, gate, rel, pos, out);
-    const auto bytes =
-        inkling2_full_attention_workspace_capacity_bytes(cache.storage, keys, q.ne[2], q.ne[2]);
+    const auto bytes = q.ne[2] >= 16
+                           ? std::size_t(0)
+                           : inkling2_full_attention_workspace_capacity_bytes(
+                                 cache.storage, keys, q.ne[2], q.ne[2]);
     if (cache.head_dim != 128 || cache.num_kv_heads != 8)
         throw std::invalid_argument("inkling2_full_attention: cache geometry");
     shape(cache.block_table, DType::I32, cache.block_table.ne[0]);
@@ -103,9 +105,9 @@ void inkling2_full_attention(const Tensor& q, const Tensor& gate, const Tensor& 
         plane(cache.k_scale_pages, DType::FP16, 2, 8, pages);
         plane(cache.v_scale_pages, DType::FP16, 2, 8, pages);
     }
-    auto scope   = workspace.scope();
-    auto scratch = workspace.alloc_bytes(bytes);
-    inkling2_detail::full_launch(q, gate, rel, pos, cache, keys, static_cast<float*>(scratch.data),
-                                 out, stream);
+    auto scope = workspace.scope();
+    float* scratch_ptr =
+        bytes > 0 ? static_cast<float*>(workspace.alloc_bytes(bytes).data) : nullptr;
+    inkling2_detail::full_launch(q, gate, rel, pos, cache, keys, scratch_ptr, out, stream);
 }
 } // namespace ninfer::ops

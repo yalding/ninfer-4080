@@ -75,20 +75,20 @@ Measured on NVIDIA GeForce RTX 4060 Ti 16 GB (`sm_89`, Windows WDDM, MSVC 14.44,
 | NInfer `inkling2_mini_q3g128.ninfer` *(RTN `Q3G128`)* | `BF16` | `8.71009` |
 | NInfer `inkling2_mini_q3g128.ninfer` *(RTN `Q3G128`)* | `Int8Group64` | `8.73496` *(+0.285% vs BF16)* |
 
-### Phase 1 SIMT Baseline Throughput (`ninfer_bench`)
+### Phase 2 Tensor Core Prefill & Schedule Fusion (`ninfer_bench`)
 
-Conditions: `--max-ctx 131072 --kv-dtype int8 -r 1 --warmup 0`, tiled `131,072`-token corpus. Current Phase 1 kernels use SIMT attention and warp-dot MoE (bulk Tensor Core prefill and MoE are not yet implemented):
+Conditions: `--max-ctx 131072 --kv-dtype int8 -r 1 --warmup 0`, `bench/fixtures/bench_corpus.ids` (`131,072`-max-context, `prefill_chunk = 1024`, `54.8 MiB` peak workspace). Phase 2 replaces the Phase 1 SIMT prefill paths with grouped Tensor Core `inkling2_moe` (`Q3G128_F16S` / `Q4G64_F16S`), tiled Tensor Core FlashAttention-2 (`Br=64, Bc=64, D=128`), tiled Tensor Core `inkling2_loop_control` & `inkling2_small_bf16_proj`, coalesced `inkling2_rel_bias_prepare` & decode `control_out_kernel`, and fused `Executor::schedule` AttnRes+RMSNorm passes:
 
-| Case | Prefill (tok/s) | Decode (tok/s) | Notes |
-|---|---:|---:|---|
-| `pp512` | `92.16` | — | |
-| `pp2048` | `86.17` | — | |
-| `tg128` (`d=0`) | — | `30.98` | CUDA Graph replay |
-| `pp4096+tg128` | `82.34` | `20.63` | |
-| `pp16384+tg128` | `70.95` | `19.07` | |
-| `pp32768+tg128` | `59.21` | `16.59` | `1.33 GiB` free after startup |
+| Case | Phase 1 Prefill (tok/s) | Phase 2 Prefill (tok/s) | Speedup | Phase 1 Decode (tok/s) | Phase 2 Decode (tok/s) |
+|---|---:|---:|---:|---:|---:|
+| `pp512` | `92.16` | `1,771.39` | `19.2×` | — | — |
+| `pp2048` | `86.17` | `1,921.90` | `22.3×` | — | — |
+| `tg128` (`d=0`) | — | — | — | `30.98` | `34.68` |
+| `pp4096+tg128` | `82.34` | `1,885.36` | `22.9×` | `20.63` | `22.15` |
+| `pp16384+tg128` | `70.95` | `1,796.11` | `25.3×` | `19.07` | `20.39` |
+| `pp32768+tg128` | `59.21` | `1,693.18` | `28.6×` | `16.59` | `18.53` |
 
-*`pp120384+tg128` was intentionally deferred until Tensor Core prefill/MoE optimization replaces the Phase 1 SIMT kernels.*
+*`ninfer-perplexity` (`profiles/perplexity/inkling2-phase1/fixture.txt`, `--context 768 --stride 256`, `3,791` scored tokens / `13` windows) measured `7.670918` (`bf16` KV, `294.8 tok/s`) and `7.664999` (`int8-g64` KV, `295.4 tok/s`).*
 
 ### Local HTTP Serving Verification
 
@@ -98,8 +98,7 @@ Conditions: `--max-ctx 131072 --kv-dtype int8 -r 1 --warmup 0`, tiled `131,072`-
 
 ## 5. Follow-On Roadmap (Phase 2 / 3)
 
-1. **Tensor Core prefill & MoE:** Replace Phase 1 SIMT prefill attention and warp-dot MoE with tiled Tensor Core FlashAttention prefill and bulk Tensor Core `Q3`/`Q4` MoE kernels.
-2. **Quality upgrade option:** Add imatrix/AWQ calibration or `Q4G64_F16S` `ffn/routed_down` if closing the `8.71` vs `8.16` PPL gap is prioritized over `1.28 GiB` 128K slack.
-3. **Phase 2a (`RK4V4E8` `D=128` KV):** Halve full-attention KV footprint (`2.06 GiB -> ~1.05 GiB` @ 128K) to unlock 256K+ context on 16 GB.
-4. **Phase 2b (DSpark speculator):** Port `mtp.safetensors` (`~450 MiB` quantized) for speculative decode.
-5. **Phase 3 (Vision):** Port Inkling-2's 23-layer ViT (`dim=1024`, `patch=20`, `merge=2`, axial RoPE `theta=10000`).
+1. **Quality upgrade option:** Add imatrix/AWQ calibration or `Q4G64_F16S` `ffn/routed_down` if closing the `8.71` vs `8.16` PPL gap is prioritized over `1.28 GiB` 128K slack.
+2. **Phase 2a (`RK4V4E8` `D=128` KV):** Halve full-attention KV footprint (`2.06 GiB -> ~1.05 GiB` @ 128K) to unlock 256K+ context on 16 GB.
+3. **Phase 2b (DSpark speculator):** Port `mtp.safetensors` (`~450 MiB` quantized) for speculative decode.
+4. **Phase 3 (Vision):** Port Inkling-2's 23-layer ViT (`dim=1024`, `patch=20`, `merge=2`, axial RoPE `theta=10000`).

@@ -13,7 +13,7 @@ void inkling2_sconv_launch(const Tensor&, const Tensor&, const Tensor&, const Te
                           const Tensor&, Tensor&, cudaStream_t);
 void inkling2_mix_launch(Inkling2Branches, const Tensor&, Tensor&, cudaStream_t);
 void inkling2_control_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
-                            Inkling2Branches, Tensor&, float*, cudaStream_t);
+                            Inkling2Branches, Tensor&, float*, float*, float*, cudaStream_t);
 void inkling2_clip_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                          const Tensor&, bool, Tensor&, Tensor&, Tensor&, Tensor&, cudaStream_t);
 void inkling2_softcap_launch(const Tensor&, float, int, Tensor&, cudaStream_t);

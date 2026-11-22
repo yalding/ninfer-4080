@@ -95,16 +95,27 @@ void inkling2_attn_res_mix(std::span<const Tensor> states, const Tensor& q,
 std::size_t inkling2_loop_control_workspace_capacity_bytes(int c, int lo, int hi) {
     require((c == 1 || c == 3) && lo > 0 && hi >= lo, "control workspace envelope");
     const auto n = static_cast<std::size_t>(hi) * c;
-    if (n > (std::numeric_limits<std::size_t>::max() - 255) / (64 * sizeof(float)))
+    if (n > (std::numeric_limits<std::size_t>::max() - 255) / (2304 * sizeof(float)))
         throw std::overflow_error("inkling2 control workspace overflow");
-    return (n * 64 * sizeof(float) + 255) & ~std::size_t(255);
+    const auto z_bytes = (n * 64 * sizeof(float) + 255) & ~std::size_t(255);
+    const auto inv_bytes =
+        hi >= 16 ? ((n * 2 * sizeof(float) + 255) & ~std::size_t(255)) : std::size_t(0);
+    const auto y_bytes =
+        hi >= 16 ? ((n * 2304 * sizeof(float) + 255) & ~std::size_t(255)) : std::size_t(0);
+    return z_bytes + inv_bytes + y_bytes;
 }
 
 void inkling2_loop_control(const Tensor& cur, const Tensor& msg, const Tensor& down,
                            const Tensor& gf, std::span<const Tensor> nw, Tensor& out,
                            WorkspaceArena& workspace, cudaStream_t s) {
     const int t = cur.ne[1], c = cur.ne[2];
-    const auto capacity = inkling2_loop_control_workspace_capacity_bytes(c, t, t);
+    const auto n = static_cast<std::size_t>(t) * c;
+    const auto z_bytes = (n * 64 * sizeof(float) + 255) & ~std::size_t(255);
+    const auto inv_bytes =
+        t >= 16 ? ((n * 2 * sizeof(float) + 255) & ~std::size_t(255)) : std::size_t(0);
+    const auto y_bytes =
+        (t >= 16 && !nw.empty()) ? ((n * 2304 * sizeof(float) + 255) & ~std::size_t(255))
+                                 : std::size_t(0);
     shape(cur, DType::BF16, {2304, t, c}); shape(msg, DType::BF16, {2304, t, c});
     shape(out, DType::BF16, {2304, t, c}); shape(down, DType::BF16, {4608, 64, c});
     shape(gf, DType::BF16, {64, 2304, 2, c});
@@ -113,9 +124,11 @@ void inkling2_loop_control(const Tensor& cur, const Tensor& msg, const Tensor& d
     auto branches = norms(nw, c);
     for (const auto& weight : nw) disjoint(out, weight);
     auto scope = workspace.scope();
-    auto scratch = workspace.alloc_bytes(capacity);
+    auto z_buf = workspace.alloc_bytes(z_bytes);
+    float* inv_ptr = inv_bytes ? static_cast<float*>(workspace.alloc_bytes(inv_bytes).data) : nullptr;
+    float* y_ptr = y_bytes ? static_cast<float*>(workspace.alloc_bytes(y_bytes).data) : nullptr;
     detail::inkling2_control_launch(cur, msg, down, gf, branches, out,
-                                    static_cast<float*>(scratch.data), s);
+                                    static_cast<float*>(z_buf.data), inv_ptr, y_ptr, s);
 }
 
 void inkling2_qkr_clip_v_norm(const Tensor& qgr, const Tensor& k, const Tensor& v,

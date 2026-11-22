@@ -7,6 +7,9 @@ function(ninfer_add_op_bench name)
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src)
   target_link_libraries(${name} PRIVATE ninfer_ops)
+  if(WIN32)
+    set_target_properties(${name} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  endif()
   target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
 
@@ -83,6 +86,9 @@ target_include_directories(ninfer_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party)
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_bench PRIVATE ninfer_engine ${NINFER_CUDART_TARGET})
+if(WIN32)
+  set_target_properties(ninfer_bench PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+endif()
 
 # Static context-cost calibrator. Transfer measurements call production Paged-KV copy primitives,
 # then release their synthetic fixtures before the public Engine optionally loads one real artifact
@@ -103,7 +109,10 @@ target_include_directories(ninfer_context_cost_bench PRIVATE
 target_compile_definitions(ninfer_context_cost_bench PRIVATE
   NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_context_cost_bench PRIVATE
-  ninfer_engine ninfer_core CUDA::cudart)
+  ninfer_engine ninfer_core ${NINFER_CUDART_TARGET})
+if(WIN32)
+  set_target_properties(ninfer_context_cost_bench PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+endif()
 
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.
@@ -117,6 +126,9 @@ target_include_directories(ninfer_qwen3_6_27b_mtp_round_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_qwen3_6_27b_mtp_round_bench PRIVATE
   ninfer_engine ninfer_core)
+if(WIN32)
+  set_target_properties(ninfer_qwen3_6_27b_mtp_round_bench PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+endif()
 
 # Complete production DFlash steady round: confirmed-context append, next proposal, target
 # verification/acceptance, and host publication over a real 35B artifact.
@@ -130,5 +142,8 @@ target_include_directories(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
   ninfer_engine ninfer_core)
+if(WIN32)
+  set_target_properties(ninfer_qwen3_6_35b_a3b_dflash_round_bench PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+endif()
 
 ninfer_add_op_bench(ninfer_q4_linear_swiglu_variants_bench SOURCES ops/q4_linear_swiglu_variants_bench.cu)

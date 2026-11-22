@@ -426,23 +426,31 @@ struct ChatMessage {
 };
 
 enum class ReasoningEffort : std::uint8_t {
+    Minimal,
     Low,
     Medium,
+    High,
     XHigh,
 };
 
 struct ReasoningEffortCapabilities {
+    bool minimal = false;
     bool low    = false;
     bool medium = false;
+    bool high   = false;
     bool xhigh  = false;
     std::optional<ReasoningEffort> default_effort;
 
     [[nodiscard]] constexpr bool supports(ReasoningEffort effort) const noexcept {
         switch (effort) {
+        case ReasoningEffort::Minimal:
+            return minimal;
         case ReasoningEffort::Low:
             return low;
         case ReasoningEffort::Medium:
             return medium;
+        case ReasoningEffort::High:
+            return high;
         case ReasoningEffort::XHigh:
             return xhigh;
         }

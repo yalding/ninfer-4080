@@ -135,15 +135,16 @@ std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_
 
 class PreparedPrompt::Impl {
 public:
+    template <class TargetPrompt>
     Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
-         targets::qwen3_6::PreparedPrompt prepared)
+         TargetPrompt prepared)
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    targets::qwen3_6::PreparedPrompt value;
+    std::variant<targets::qwen3_6::PreparedPrompt,targets::inkling2_mini::PreparedPrompt> value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -241,8 +242,11 @@ public:
     using Core35      = runtime::EngineCore<targets::Qwen3_6_35BA3BInstance>;
     using ScoreCore27 = runtime::CausalScoreCore<targets::Qwen3_6_27BInstance>;
     using ScoreCore35 = runtime::CausalScoreCore<targets::Qwen3_6_35BA3BInstance>;
+    using CoreInkling2Mini = runtime::EngineCore<targets::Inkling2MiniInstance>;
+    using ScoreCoreInkling2Mini = runtime::CausalScoreCore<targets::Inkling2MiniInstance>;
     using Core = std::variant<std::monostate, std::unique_ptr<Core27>, std::unique_ptr<Core35>,
-                              std::unique_ptr<ScoreCore27>, std::unique_ptr<ScoreCore35>>;
+                              std::unique_ptr<ScoreCore27>, std::unique_ptr<ScoreCore35>,
+                              std::unique_ptr<CoreInkling2Mini>,std::unique_ptr<ScoreCoreInkling2Mini>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize_engine_options(std::move(engine_options))),
@@ -263,12 +267,18 @@ public:
                     }
                     return std::make_unique<Core27>(*target_ptr, device, options,
                                                     std::move(constructed.context_cost));
-                } else {
+                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_35BA3BInstance>) {
                     if (options.purpose == EnginePurpose::CausalScoring) {
                         return std::make_unique<ScoreCore35>(*target_ptr, device);
                     }
                     return std::make_unique<Core35>(*target_ptr, device, options,
                                                     std::move(constructed.context_cost));
+                } else {
+                    if (options.purpose == EnginePurpose::CausalScoring) {
+                        return std::make_unique<ScoreCoreInkling2Mini>(*target_ptr, device);
+                    }
+                    return std::make_unique<CoreInkling2Mini>(*target_ptr, device, options,
+                                                              std::move(constructed.context_cost));
                 }
             },
             active);
@@ -280,12 +290,12 @@ public:
                                           std::string(),
                                           std::function<void(
                                               std::string,
-                                              targets::qwen3_6::RetainedSessionSnapshot&&)>());
+                                              runtime::RetainedSessionSnapshot&&)>());
                                   }) {
                         constructed_core->set_eviction_sink(
                             slot_model_binding(load),
                             [this](std::string path,
-                                   targets::qwen3_6::RetainedSessionSnapshot&& snapshot) {
+                                   runtime::RetainedSessionSnapshot&& snapshot) {
                                 enqueue_write(std::move(path), std::move(snapshot));
                             });
                     }
@@ -308,10 +318,10 @@ public:
     // publishes each file with the same write-then-rename discipline as an explicit save.
     struct PendingWrite {
         std::string path;
-        targets::qwen3_6::RetainedSessionSnapshot snapshot;
+        runtime::RetainedSessionSnapshot snapshot;
     };
 
-    void enqueue_write(std::string path, targets::qwen3_6::RetainedSessionSnapshot&& snapshot) {
+    void enqueue_write(std::string path, runtime::RetainedSessionSnapshot&& snapshot) {
         std::unique_lock lock(writer_mutex);
         if (!writer.joinable()) { writer = std::thread([this] { writer_loop(); }); }
         pending_writes.push_back(PendingWrite{std::move(path), std::move(snapshot)});
@@ -489,8 +499,10 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>>) {
-                return core->score(std::move(prompt.impl_->value), first_target);
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCoreInkling2Mini>>) {
+                using TargetPrompt=typename CoreState::element_type::PreparedPrompt;
+                return core->score(std::get<TargetPrompt>(std::move(prompt.impl_->value)), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
             }
@@ -585,10 +597,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
                 throw std::logic_error("Engine core is unavailable");
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
-                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>>) {
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>> ||
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCoreInkling2Mini>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
-                auto submission = core->submit(std::move(prompt.impl_->value), prompt_summary,
+                using TargetPrompt=typename CoreState::element_type::PreparedPrompt;
+                auto submission = core->submit(std::get<TargetPrompt>(std::move(prompt.impl_->value)), prompt_summary,
                                                prepare_seconds, std::move(resolved_options),
                                                consumer_mode, observation, pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
@@ -702,8 +716,8 @@ SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path,
     // A pending auto-save of the same path must not land after this explicit save.
     impl_->drain_writes();
     const std::string binding = slot_model_binding(impl_->load);
-    targets::qwen3_6::RetainedSessionSnapshot snapshot = std::visit(
-        [&](auto& core) -> targets::qwen3_6::RetainedSessionSnapshot {
+    runtime::RetainedSessionSnapshot snapshot = std::visit(
+        [&](auto& core) -> runtime::RetainedSessionSnapshot {
             if constexpr (requires { core->save_retained_lane(lane, binding, expected_digest,
                                                               path); }) {
                 return core->save_retained_lane(lane, binding, expected_digest, path);

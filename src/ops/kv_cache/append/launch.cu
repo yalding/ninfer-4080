@@ -18,38 +18,43 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
-    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
-        Tensor& cache_k_scale = cache.k_scale_pages;
-        Tensor& cache_v_scale = cache.v_scale_pages;
-        if (tokens >= 128 && Geometry::KVHeads == 2) {
-            constexpr int TokensPerTile = 8;
-            const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
-            const dim3 fill_grid(static_cast<unsigned>(max_tiles),
-                                 static_cast<unsigned>(Geometry::KVHeads));
-            kv_cache_append_full_fp8_page_kernel<Geometry, Metadata>
-                <<<fill_grid, kBlock, 0, stream>>>(
-                    static_cast<const __nv_bfloat16*>(k.data),
-                    static_cast<const __nv_bfloat16*>(v.data),
-                    static_cast<const std::int32_t*>(positions.data), metadata,
-                    static_cast<std::uint8_t*>(cache_k.data),
-                    static_cast<std::uint8_t*>(cache_v.data),
-                    static_cast<__half*>(cache_k_scale.data),
-                    static_cast<__half*>(cache_v_scale.data), tokens);
-        } else {
-            constexpr int FillWarps       = kBlock / 32;
-            const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
-            const int fill_grid =
-                static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
-            kv_cache_append_full_fp8_kernel<Geometry, Metadata><<<fill_grid, kBlock, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(k.data),
-                static_cast<const __nv_bfloat16*>(v.data),
-                static_cast<const std::int32_t*>(positions.data), metadata,
-                static_cast<std::uint8_t*>(cache_k.data), static_cast<std::uint8_t*>(cache_v.data),
-                static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
-                tokens);
+    if constexpr (Geometry::HeadDim == 256) {
+        if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
+            Tensor& cache_k_scale = cache.k_scale_pages;
+            Tensor& cache_v_scale = cache.v_scale_pages;
+            if (tokens >= 128 && Geometry::KVHeads == 2) {
+                constexpr int TokensPerTile = 8;
+                const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
+                const dim3 fill_grid(static_cast<unsigned>(max_tiles),
+                                     static_cast<unsigned>(Geometry::KVHeads));
+                kv_cache_append_full_fp8_page_kernel<Geometry, Metadata>
+                    <<<fill_grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::uint8_t*>(cache_k.data),
+                        static_cast<std::uint8_t*>(cache_v.data),
+                        static_cast<__half*>(cache_k_scale.data),
+                        static_cast<__half*>(cache_v_scale.data), tokens);
+            } else {
+                constexpr int FillWarps       = kBlock / 32;
+                const std::int64_t fill_units =
+                    static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
+                const int fill_grid =
+                    static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
+                kv_cache_append_full_fp8_kernel<Geometry, Metadata>
+                    <<<fill_grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::uint8_t*>(cache_k.data),
+                        static_cast<std::uint8_t*>(cache_v.data),
+                        static_cast<__half*>(cache_k_scale.data),
+                        static_cast<__half*>(cache_v_scale.data), tokens);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
         }
-        CUDA_CHECK(cudaGetLastError());
-        return;
     }
     if (kv_storage_is_int8_family(cache.storage)) {
         const KvForkModeFlags mode = kv_fork_mode_flags(cache.storage);
@@ -62,7 +67,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
                 const int max_tiles = static_cast<int>(div_up(tokens + TokensPerTile, TokensPerTile));
                 const dim3 fill_grid(static_cast<unsigned>(max_tiles),
                                      static_cast<unsigned>(Geometry::KVHeads),
-                                     static_cast<unsigned>(kKVCacheInt8Groups));
+                                     static_cast<unsigned>(Geometry::Int8Groups));
                 kv_cache_append_full_i8_page_kernel<Geometry, PackedV, RotateK, RotateV, PackedK,
                                                     E8Lattice, E8Root, Metadata>
                     <<<fill_grid, kBlock, 0, stream>>>(
@@ -76,7 +81,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
             } else {
                 constexpr int FillWarps = kBlock / 32;
                 const std::int64_t fill_units =
-                    static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kKVCacheInt8Groups;
+                    static_cast<std::int64_t>(tokens) * Geometry::KVHeads * Geometry::Int8Groups;
                 const int fill_grid =
                     static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
                 kv_cache_append_full_i8_kernel<Geometry, PackedV, RotateK, RotateV, PackedK,
@@ -91,14 +96,18 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
                         static_cast<__half*>(cache_v_scale.data), tokens);
             }
         };
-        if (mode.e8_root) {
-            launch_fill.template operator()<true, true, true, false, false, true>();
-        } else if (mode.e8_lattice) {
-            launch_fill.template operator()<true, true, true, true, true, false>();
-        } else if (mode.packed_k) {
-            launch_fill.template operator()<true, true, true, true, false, false>();
-        } else if (mode.packed_v) {
-            launch_fill.template operator()<true, true, true, false, false, false>();
+        if constexpr (Geometry::HeadDim == 256) {
+            if (mode.e8_root) {
+                launch_fill.template operator()<true, true, true, false, false, true>();
+            } else if (mode.e8_lattice) {
+                launch_fill.template operator()<true, true, true, true, true, false>();
+            } else if (mode.packed_k) {
+                launch_fill.template operator()<true, true, true, true, false, false>();
+            } else if (mode.packed_v) {
+                launch_fill.template operator()<true, true, true, false, false, false>();
+            } else {
+                launch_fill.template operator()<false, false, false, false, false, false>();
+            }
         } else {
             launch_fill.template operator()<false, false, false, false, false, false>();
         }
@@ -106,10 +115,10 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         return;
     }
 
-    constexpr int Block         = Geometry::KVHeads == 4 ? 128 : 96;
+    constexpr int Block         = Geometry::KVHeads == 2 ? 96 : 128;
     constexpr int VecElems      = 8;
-    const std::int64_t elements = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
-                                  (kKVCacheAppendFullHeadDim / VecElems);
+    const std::int64_t elements =
+        static_cast<std::int64_t>(tokens) * Geometry::KVHeads * (Geometry::HeadDim / VecElems);
     const int fill_grid = static_cast<int>(div_up(elements, static_cast<std::int64_t>(Block)));
     kv_cache_append_full_bf16_kernel<Geometry, Metadata><<<fill_grid, Block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
@@ -181,6 +190,9 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
                    const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     validate_plan(k, plan);
     switch (cache.capacity) {
+    case 1024:
+        launch_cyclic_profile<1024>(k, v, positions, counts, lanes, cache, plan, stream);
+        return;
     case 2048:
         launch_cyclic_profile<2048>(k, v, positions, counts, lanes, cache, plan, stream);
         return;
@@ -197,6 +209,10 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
 void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                             PagedKVLayerView cache, cudaStream_t stream) {
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
+    if (k.ne[0] == KVCacheAppendD128Kv8::HeadDim) {
+        launch_full<KVCacheAppendD128Kv8>(k, v, positions, cache, metadata, stream);
+        return;
+    }
     if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
         launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
         return;
@@ -225,6 +241,10 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
         };
+        if (k.ne[0] == KVCacheAppendD128Kv8::HeadDim) {
+            launch_full<KVCacheAppendD128Kv8>(k, v, positions, cache, metadata, stream);
+            return;
+        }
         if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
             launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
             return;

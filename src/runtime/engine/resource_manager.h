@@ -3440,27 +3440,29 @@ private:
     void observe_transfer(const ContextTransferObservation& observation) noexcept {
         const double seconds = static_cast<double>(observation.elapsed_ns) * 1.0e-9;
         context_stats_.actual_context_transfer_seconds += seconds;
-        const std::uint64_t bytes = observation.units;
         switch (observation.resource) {
-        case ContextResourceClass::State:
+        case ContextResourceClass::State: {
+            const std::uint64_t state_count = observation.units != 0 ? observation.units : 1ULL;
+            const std::uint64_t state_bytes = observation.work.payload_bytes;
             switch (observation.direction) {
             case ContextTransferDirection::DeviceToHost:
-                ++context_stats_.state_d2h_count;
-                context_stats_.state_d2h_bytes += bytes;
+                context_stats_.state_d2h_count += state_count;
+                context_stats_.state_d2h_bytes += state_bytes;
                 context_stats_.state_d2h_seconds += seconds;
                 break;
             case ContextTransferDirection::HostToDevice:
-                ++context_stats_.state_h2d_count;
-                context_stats_.state_h2d_bytes += bytes;
+                context_stats_.state_h2d_count += state_count;
+                context_stats_.state_h2d_bytes += state_bytes;
                 context_stats_.state_h2d_seconds += seconds;
                 break;
             case ContextTransferDirection::DeviceToDevice:
-                ++context_stats_.state_d2d_count;
-                context_stats_.state_d2d_bytes += bytes;
+                context_stats_.state_d2d_count += state_count;
+                context_stats_.state_d2d_bytes += state_bytes;
                 context_stats_.state_d2d_seconds += seconds;
                 break;
             }
             break;
+        }
         case ContextResourceClass::MainKV:
             observe_kv_transfer(
                 observation, context_stats_.main_kv_d2h_pages, context_stats_.main_kv_h2d_pages,

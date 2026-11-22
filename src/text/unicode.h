@@ -19,6 +19,9 @@ CodepointSpan utf8_codepoint_at(std::string_view text, std::size_t offset,
 std::vector<CodepointSpan> utf8_codepoints(std::string_view text, std::string_view context);
 std::string codepoint_to_utf8(std::int32_t codepoint);
 
+bool is_upper_or_title_letter(std::int32_t codepoint) noexcept;
+bool is_lower_letter(std::int32_t codepoint) noexcept;
+bool is_other_or_modifier_letter(std::int32_t codepoint) noexcept;
 bool is_letter(std::int32_t codepoint) noexcept;
 bool is_mark(std::int32_t codepoint) noexcept;
 bool is_number(std::int32_t codepoint) noexcept;

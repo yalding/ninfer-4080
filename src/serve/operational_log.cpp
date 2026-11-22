@@ -108,10 +108,14 @@ const char* resolved_reasoning_effort_name(const RequestLogContext& context) noe
     if (!context.enable_thinking) { return "none"; }
     if (!context.resolved_reasoning_effort) { return "on"; }
     switch (*context.resolved_reasoning_effort) {
+    case ninfer::ReasoningEffort::Minimal:
+        return "minimal";
     case ninfer::ReasoningEffort::Low:
         return "low";
     case ninfer::ReasoningEffort::Medium:
         return "medium";
+    case ninfer::ReasoningEffort::High:
+        return "high";
     case ninfer::ReasoningEffort::XHigh:
         return "xhigh";
     }

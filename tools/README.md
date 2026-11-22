@@ -14,6 +14,7 @@ for the selected tool.
 | Build the 27B artifact | [`convert/qwen3_6_27b/`](convert/qwen3_6_27b/) |
 | Build the Qwen3.8-27B artifact | [`convert/qwen3_8_27b/`](convert/qwen3_8_27b/) |
 | Build the 35B-A3B artifact | [`convert/qwen3_6_35b_a3b/`](convert/qwen3_6_35b_a3b/) |
+| Build the Inkling-2-Mini artifact | [`convert/inkling2_mini/`](convert/inkling2_mini/) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
@@ -39,6 +40,10 @@ python3 -m tools.convert.qwen3_6_35b_a3b.convert \
   --model /path/to/Qwen3.6-35B-A3B-base \
   --dflash-model /path/to/Qwen3.6-35B-A3B-DFlash \
   --out out/qwen3_6_35b_a3b.ninfer
+
+python3 -m tools.convert.inkling2_mini.convert \
+  --model /path/to/Inkling-2-Mini \
+  --out out/inkling2_mini_q3g128.ninfer
 ```
 
 Inspect either result:

@@ -27,6 +27,36 @@ using ::ninfer::StopString;
 using ::ninfer::TokenId;
 using U128 = ::ninfer::detail::u128;
 
+struct RetainedSessionSnapshot {
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t tokens = 0;
+    std::string session_digest;
+};
+
+// Fork-local: cumulative transfer volume moved by session save/restore. These copies run outside
+// the context-cache transactions, so their pages never appear in the transaction-observed stats;
+// the Engine adds this on top when it publishes runtime stats.
+struct SessionSnapshotTraffic {
+    std::uint64_t main_kv_d2d_pages    = 0;
+    std::uint64_t main_kv_d2d_bytes    = 0;
+    std::uint64_t state_d2d_count      = 0;
+    std::uint64_t state_d2d_bytes      = 0;
+    std::uint64_t main_kv_d2h_pages    = 0;
+    std::uint64_t main_kv_h2d_pages    = 0;
+    std::uint64_t backend_kv_d2h_pages = 0;
+    std::uint64_t backend_kv_h2d_pages = 0;
+    std::uint64_t main_kv_d2h_bytes    = 0;
+    std::uint64_t main_kv_h2d_bytes    = 0;
+    std::uint64_t backend_kv_d2h_bytes = 0;
+    std::uint64_t backend_kv_h2d_bytes = 0;
+    std::uint64_t state_d2h_count      = 0;
+    std::uint64_t state_h2d_count      = 0;
+    std::uint64_t state_d2h_bytes      = 0;
+    std::uint64_t state_h2d_bytes      = 0;
+};
+
+
+
 // One Program execution may alternate between Host submission, a blocking Device completion
 // wait, and Host post-processing. The three monotonic components are returned to Engine as part of
 // the execution capability; serve never infers them from total request time.

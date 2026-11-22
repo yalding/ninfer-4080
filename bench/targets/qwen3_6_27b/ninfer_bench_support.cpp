@@ -488,10 +488,12 @@ std::vector<TokenId> load_corpus_ids(const std::string& path) {
 }
 
 std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt) {
-    if (n_prompt <= 0 || static_cast<std::size_t>(n_prompt) > corpus.size()) {
+    if (n_prompt <= 0 || corpus.empty()) {
         throw std::invalid_argument("invalid prompt slice length: " + std::to_string(n_prompt));
     }
-    return {corpus.begin(), corpus.begin() + n_prompt};
+    std::vector<TokenId> result(static_cast<std::size_t>(n_prompt));
+    for (std::size_t i = 0; i < result.size(); ++i) result[i] = corpus[i % corpus.size()];
+    return result;
 }
 
 std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& speculative) {

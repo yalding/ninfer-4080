@@ -78,12 +78,12 @@ __global__ void kv_cache_append_full_bf16_kernel(const __nv_bfloat16* __restrict
     constexpr int VecElems = 8;
     const int tokens       = metadata.valid_tokens(width);
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::int64_t n   = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
-                           (kKVCacheAppendFullHeadDim / VecElems);
+    const std::int64_t n =
+        static_cast<std::int64_t>(tokens) * Geometry::KVHeads * (Geometry::HeadDim / VecElems);
     if (idx >= n) return;
 
-    const int vec      = static_cast<int>(idx % (kKVCacheAppendFullHeadDim / VecElems));
-    const int tmp      = static_cast<int>(idx / (kKVCacheAppendFullHeadDim / VecElems));
+    const int vec      = static_cast<int>(idx % (Geometry::HeadDim / VecElems));
+    const int tmp      = static_cast<int>(idx / (Geometry::HeadDim / VecElems));
     const int kv_head  = tmp % Geometry::KVHeads;
     const int token    = tmp / Geometry::KVHeads;
     const int d        = vec * VecElems;
@@ -92,13 +92,13 @@ __global__ void kv_cache_append_full_bf16_kernel(const __nv_bfloat16* __restrict
     const std::int32_t* block_table = metadata.block_table();
     int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     const std::int64_t src_off =
-        static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kKVCacheAppendFullHeadDim) *
-                                           (kv_head + Geometry::KVHeads * token);
+        static_cast<std::int64_t>(d) +
+        static_cast<std::int64_t>(Geometry::HeadDim) * (kv_head + Geometry::KVHeads * token);
     const int4 k_value = load_vec<int4>(&k[src_off]);
     const int4 v_value = bf16x8_bits_to_f16x8_bits(load_vec<int4>(&v[src_off]));
     physical_page      = __shfl_sync(0xffffffffu, physical_page, 0);
     const std::int64_t cache_off =
-        paged_kv_element_offset<kKVCacheAppendFullHeadDim, Geometry::KVHeads>(
+        paged_kv_element_offset<Geometry::HeadDim, Geometry::KVHeads>(
             physical_page, kv_head, position & kPagedKVPageMask, d);
     store_vec(&cache_k[cache_off], k_value);
     store_vec(&cache_v[cache_off], v_value);
@@ -183,11 +183,11 @@ __launch_bounds__(256) __global__
     const int warp              = static_cast<int>(threadIdx.x) >> 5;
     const int lane              = static_cast<int>(threadIdx.x) & 31;
     const int unit              = static_cast<int>(blockIdx.x) * Warps + warp;
-    const int units             = tokens * Geometry::KVHeads * kKVCacheInt8Groups;
+    const int units             = tokens * Geometry::KVHeads * Geometry::Int8Groups;
     if (unit >= units) { return; }
 
-    const int group                 = unit % kKVCacheInt8Groups;
-    const int tmp                   = unit / kKVCacheInt8Groups;
+    const int group                 = unit % Geometry::Int8Groups;
+    const int tmp                   = unit / Geometry::Int8Groups;
     const int kv_head               = tmp % Geometry::KVHeads;
     const int token                 = tmp / Geometry::KVHeads;
     const int position              = positions[0] + token;
@@ -359,8 +359,8 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_i8_page_kernel(
     const int position = base_position + token;
     const int page_off = position & kPagedKVPageMask;
     const std::int64_t code_base =
-        paged_kv_page_head_offset<kKVCacheInt8HeadDim, Geometry::KVHeads>(physical_page, kv_head) +
-        static_cast<std::int64_t>(page_off) * kKVCacheInt8HeadDim + group * kKVCacheInt8Group;
+        paged_kv_page_head_offset<Geometry::HeadDim, Geometry::KVHeads>(physical_page, kv_head) +
+        static_cast<std::int64_t>(page_off) * Geometry::HeadDim + group * kKVCacheInt8Group;
     if constexpr (E8Root) {
         uint8_t c1_0, c2_0, c1_1, c2_1;
         e8_encode_cylinder_8d_warp(k0, ks, c1_0, c2_0, lane);
@@ -437,9 +437,9 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_i8_page_kernel(
     }
     if (lane == 0) {
         const std::int64_t scale_offset =
-            paged_kv_page_head_offset<kKVCacheInt8Groups, Geometry::KVHeads>(physical_page,
-                                                                            kv_head) +
-            static_cast<std::int64_t>(page_off) * kKVCacheInt8Groups + group;
+            paged_kv_page_head_offset<Geometry::Int8Groups, Geometry::KVHeads>(physical_page,
+                                                                               kv_head) +
+            static_cast<std::int64_t>(page_off) * Geometry::Int8Groups + group;
         scale_k[scale_offset] = ksh;
         scale_v[scale_offset] = vsh;
     }
@@ -502,7 +502,7 @@ __global__ void kv_cache_append_prefix_cyclic_kernel(
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
     const std::int32_t* __restrict__ lanes, __nv_bfloat16* __restrict__ cache_k,
     __half* __restrict__ cache_v, int min_count, int max_count, int width, int padded_capacity) {
-    static_assert(Capacity == 2048 || Capacity == 4096);
+    static_assert(Capacity == 1024 || Capacity == 2048 || Capacity == 4096);
     static_assert((Capacity & (Capacity - 1)) == 0);
     constexpr int UnitsPerToken = kKVCacheAppendPrefixHeads * kKVCacheAppendPrefixHeadDim / 8;
     const int unit              = static_cast<int>(blockIdx.x) * Threads + threadIdx.x;

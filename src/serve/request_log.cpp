@@ -114,10 +114,14 @@ std::string tool_choice_name(const ToolChoice& choice) {
 
 const char* reasoning_effort_name(ninfer::ReasoningEffort effort) {
     switch (effort) {
+    case ninfer::ReasoningEffort::Minimal:
+        return "minimal";
     case ninfer::ReasoningEffort::Low:
         return "low";
     case ninfer::ReasoningEffort::Medium:
         return "medium";
+    case ninfer::ReasoningEffort::High:
+        return "high";
     case ninfer::ReasoningEffort::XHigh:
         return "xhigh";
     }

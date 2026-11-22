@@ -353,6 +353,9 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
     }
 
     switch (options.reasoning_effort.value_or(ReasoningEffort::XHigh)) {
+    case ReasoningEffort::Minimal:
+    case ReasoningEffort::High:
+        throw std::invalid_argument("unsupported reasoning effort");
     case ReasoningEffort::Low:
         return kLowReasoningInstructions;
     case ReasoningEffort::Medium:

@@ -96,6 +96,34 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             break;
         }
         break;
+    case 2304:
+        switch (n) {
+        case 1024:
+        case 3072:
+        case 6528:
+            if (t == 1) { return launch_q4_gemv_r1_w8_dynamic; }
+            if (t <= 7) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        case 201024:
+            if (t == 1) { return launch_q4_gemv_r1_w8_dynamic; }
+            if (t <= 7) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            if (t <= 32) { return launch_q4_mma_r64_c32; }
+            if (t <= 64) { return launch_q4_mma_r64_c64; }
+            return launch_q4_mma_r64_c128;
+        default:
+            break;
+        }
+        break;
+    case 3072:
+        if (n == 2304) {
+            if (t == 1) { return launch_q4_gemv_r1_w8_dynamic; }
+            if (t <= 7) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        }
+        break;
     default:
         break;
     }

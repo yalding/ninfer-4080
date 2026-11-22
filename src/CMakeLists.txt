@@ -64,12 +64,19 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
     CUDA_SEPARABLE_COMPILATION OFF
     CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
   target_compile_options(ninfer_nvfp4_non_rdc PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-  target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+  target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cuda_driver)
 endif()
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC
+  ops/inkling2/inkling2_fused.cpp
+  ops/inkling2/fused.cu
+  ops/inkling2_moe/inkling2_moe.cpp
+  ops/inkling2_moe/inkling2_moe.cu
+  ops/softmax_attention/inkling2/inkling2_attention.cpp
+  ops/softmax_attention/inkling2/rel_bias_prepare.cu
+  ops/softmax_attention/inkling2/attention.cu
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
@@ -390,6 +397,7 @@ target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_6_27b)
 add_subdirectory(targets/qwen3_6_35b_a3b)
+add_subdirectory(targets/inkling2_mini)
 
 target_link_libraries(ninfer_engine
   PRIVATE

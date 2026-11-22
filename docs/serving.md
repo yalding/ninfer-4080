@@ -261,8 +261,9 @@ post-close model token, preparation is rejected with HTTP 400 code
 not promise that the model will emit nonempty content or a tool call after the marker.
 
 For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medium`, and `xhigh`
-select the corresponding template effort when available. The other OpenAI protocol values
-`minimal`, `high`, and `max` are parsed but rejected when the loaded template does not expose them.
+select the corresponding template effort when available. `minimal` and `high` preserve native
+tiers when the template exposes them; otherwise they map to `low` and `xhigh`, respectively.
+`max` maps to `xhigh`. A resolved tier that the loaded template does not expose is rejected.
 `enable_thinking` controls the same new-turn thinking switch; a contradictory combination with
 `reasoning_effort` returns `conflicting_template_option`. The aliases under `chat_template_kwargs`
 are the llama.cpp and vLLM spellings. When an option is supplied both at the top level and under
@@ -463,7 +464,7 @@ wire response contains typed `output` Items.
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
-| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.effort` | `none` disables thinking; effort selects a supported template tier; `minimal`/`high` preserve native tiers or map to `low`/`xhigh`; `max` maps to `xhigh` |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -871,6 +872,8 @@ Engine selects sampling defaults from the loaded model and the request's resolve
 Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
 temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in
 non-thinking mode. Qwen3.6-35B-A3B differs only in its thinking presence penalty, which is `1.5`.
+Inkling-2-Mini uses `1.0/1.0/0/0/0` (with `top_k=0` resolving to `20`) in both thinking and
+non-thinking modes.
 Frequency penalty is `0` for all registered presets. Process flags override registered values,
 request fields override process flags, and `--greedy` finally forces temperature `0`.
 

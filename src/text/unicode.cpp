@@ -78,6 +78,18 @@ std::string codepoint_to_utf8(std::int32_t codepoint) {
     return {reinterpret_cast<const char*>(buffer), static_cast<std::size_t>(length)};
 }
 
+bool is_upper_or_title_letter(std::int32_t codepoint) noexcept {
+    const auto category = utf8proc_category(codepoint);
+    return category == UTF8PROC_CATEGORY_LU || category == UTF8PROC_CATEGORY_LT;
+}
+bool is_lower_letter(std::int32_t codepoint) noexcept {
+    return utf8proc_category(codepoint) == UTF8PROC_CATEGORY_LL;
+}
+bool is_other_or_modifier_letter(std::int32_t codepoint) noexcept {
+    const auto category = utf8proc_category(codepoint);
+    return category == UTF8PROC_CATEGORY_LO || category == UTF8PROC_CATEGORY_LM;
+}
+
 bool is_letter(std::int32_t codepoint) noexcept {
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_LU:

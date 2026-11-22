@@ -790,6 +790,32 @@ int test_stream() {
 
 int main() {
     int failures = 0;
+    {
+        ServeOptions server;
+        auto supported = capabilities();
+        GenerationRequest request;
+        request.reasoning_effort = RequestedReasoningEffort::Minimal;
+        failures += check(resolve_prompt_semantics(request, server, supported).reasoning_effort ==
+                              ninfer::ReasoningEffort::Low,
+                          "Qwen minimal tier maps to low");
+        request.reasoning_effort = RequestedReasoningEffort::High;
+        failures += check(resolve_prompt_semantics(request, server, supported).reasoning_effort ==
+                              ninfer::ReasoningEffort::XHigh,
+                          "Qwen high tier maps to xhigh");
+        supported.reasoning_effort.minimal = true;
+        supported.reasoning_effort.high = true;
+        failures += check(resolve_prompt_semantics(request, server, supported).reasoning_effort ==
+                              ninfer::ReasoningEffort::High,
+                          "native high reasoning tier survives protocol translation");
+        request.reasoning_effort = RequestedReasoningEffort::Minimal;
+        failures += check(resolve_prompt_semantics(request, server, supported).reasoning_effort ==
+                              ninfer::ReasoningEffort::Minimal,
+                          "native minimal reasoning tier survives protocol translation");
+        request.reasoning_effort = RequestedReasoningEffort::Max;
+        failures += check(resolve_prompt_semantics(request, server, supported).reasoning_effort ==
+                              ninfer::ReasoningEffort::XHigh,
+                          "maximum protocol effort maps to xhigh");
+    }
     failures += test_envelope_and_field_policy();
     failures += test_message_normalization();
     failures += test_attribution_system_block();

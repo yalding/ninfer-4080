@@ -105,6 +105,25 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
                           {4304, 1152, 139U, Comparison::Sampled, false, kN4304K1152});
 
+    // Inkling-2-Mini geometries: K=2304 -> N in {1024, 3072, 6528, 201024} and K=3072 -> N=2304.
+    constexpr std::array kInklingK2304{
+        convenience(1), a16(2), a16(7), a16(8), a16(16), a16(17), a16(64), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {1024, 2304, 141U, Comparison::Full, true, kInklingK2304});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {3072, 2304, 143U, Comparison::Sampled, false, kInklingK2304});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {6528, 2304, 145U, Comparison::Sampled, false, kInklingK2304});
+
+    constexpr std::array kN201024K2304{
+        a16(1), a16(4), a16(8), a16(16), a16(17), a16(32), a16(33), a16(64), a16(65), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {201024, 2304, 147U, Comparison::Sampled, false, kN201024K2304});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {2304, 3072, 149U, Comparison::Sampled, false, kInklingK2304});
+
     return failures;
 }
 

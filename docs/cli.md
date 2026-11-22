@@ -39,7 +39,7 @@ failures remain direct command diagnostics:
 ```
 
 Thinking is enabled by default. If the chat template embedded in the loaded artifact exposes
-reasoning effort, `--reasoning-effort low|medium|xhigh` selects it; omitting the option uses the
+reasoning effort, `--reasoning-effort minimal|low|medium|high|xhigh` selects it; omitting the option uses the
 template's default. An artifact whose template does not expose effort rejects the option. Add
 `--no-thinking` for direct-response prompt rendering; it cannot be combined with
 `--reasoning-effort`. `--greedy` selects exact argmax decoding independently.
@@ -234,7 +234,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
-| `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
+| `--reasoning-effort minimal\|low\|medium\|high\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
@@ -255,6 +255,8 @@ the loaded model and the rendered prompt mode. The current presets are:
 | Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Inkling-2-Mini | thinking | `1.0` | `1.00` | `0` *(resolved to `20`)* | `0` | `0` |
+| Inkling-2-Mini | non-thinking | `1.0` | `1.00` | `0` *(resolved to `20`)* | `0` | `0` |
 
 Frequency penalty is `0` in every registered preset. Task-specific profiles such as Qwen's
 precise-coding profile use explicit sampling overrides.
@@ -267,7 +269,8 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 
 ## Context and memory
 
-The registered model IDs have a native context limit of 262,144 tokens. The practical
+The registered Qwen3.6/3.8 model IDs have a native context limit of 262,144 tokens, and
+Inkling-2-Mini has a native context limit of 1,048,576 tokens. The practical
 allocation on one RTX 4090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
 Use `--kv-dtype int8` for the maximum-precision profile. `--kv-dtype fp8` selects row-scaled

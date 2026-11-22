@@ -27,6 +27,9 @@ function(ninfer_add_test name)
   else()
     target_link_libraries(${name} PRIVATE ninfer_core)
   endif()
+  if(WIN32)
+    set_target_properties(${name} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  endif()
   if(arg_NEEDS_SOURCE_DIR)
     target_compile_definitions(${name} PRIVATE
       NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
@@ -45,12 +48,32 @@ function(ninfer_add_op_test name)
   endif()
 endfunction()
 
+ninfer_add_test(test_inkling2_frontend NEEDS_SOURCE_DIR
+  SOURCES targets/test_inkling2_frontend.cpp
+  LIBRARIES ninfer_engine ninfer_artifact ninfer_text)
+target_include_directories(test_inkling2_frontend PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/inkling2_mini/export)
+set_tests_properties(test_inkling2_frontend PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_op_test(test_inkling2_state
+  SOURCES targets/test_inkling2_state.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(test_inkling2_state PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/inkling2_mini/export)
+ninfer_add_op_test(test_inkling2_program
+  SOURCES targets/test_inkling2_program.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(test_inkling2_program PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/inkling2_mini/export)
+
 function(ninfer_add_linear_test name source)
   ninfer_add_op_test(${name}
     SOURCES ${source}
             ops/linear/linear_test_common.cpp
     LIBRARIES ninfer_ops)
 endfunction()
+
+ninfer_add_op_test(test_inkling2_ops SOURCES ops/test_inkling2_ops.cu LIBRARIES ninfer_ops)
+ninfer_add_op_test(test_inkling2_fused SOURCES ops/test_inkling2_fused.cu LIBRARIES ninfer_ops)
 
 function(ninfer_add_fused_linear_test name source common)
   ninfer_add_op_test(${name}
@@ -172,7 +195,7 @@ ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
 target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
-target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
@@ -189,7 +212,7 @@ ninfer_add_test(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
 target_include_directories(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
-target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
   PROPERTIES SKIP_RETURN_CODE 77)
 

@@ -1361,9 +1361,210 @@ int cyclic_variable_prefix_tests() {
     for (int width : {1, 3, 8, 9, 16, 17})
         for (int batch : {1, 8}) failures += dflash.run(width, batch, 1, true);
     failures += dflash.run(4096, 1, 2, true);
+    CyclicPrefixFixture inkling(1024);
+    for (int width : {1, 8, 16})
+        for (int batch : {1, 8}) failures += inkling.run(width, batch, 1, true);
+    failures += inkling.run(1025, 1, 1, true, 16);
+    failures += inkling.run(1024, 1, 2, true);
     return failures;
 }
 
+int full_append_d128_case(KvCacheStorage storage, int tokens, bool graph_replay = false) {
+    constexpr int d_head         = kHeadDim;
+    constexpr int kv_heads       = kKVHeads;
+    constexpr int i8_group       = 64;
+    constexpr int i8_groups      = d_head / i8_group;
+    const int first_position     = tokens >= 128 ? 61 : 63;
+    const int logical_pages      = (first_position + tokens + kPage - 1) / kPage;
+    const int physical_pages     = 2 * logical_pages + 1;
+    std::vector<std::int32_t> mapping(static_cast<std::size_t>(logical_pages));
+    for (int page = 0; page < logical_pages; ++page) {
+        mapping[static_cast<std::size_t>(page)] = 2 * page + 1;
+    }
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
+    for (int token = 0; token < tokens; ++token) {
+        positions[static_cast<std::size_t>(token)] = first_position + token;
+    }
+    const std::size_t input_count = static_cast<std::size_t>(d_head) * kv_heads * tokens;
+    const auto plane_count        = [=](int leading_extent) {
+        return static_cast<std::size_t>(leading_extent) * kPage * kv_heads * physical_pages;
+    };
+    std::vector<float> host_k(input_count);
+    std::vector<float> host_v(input_count);
+    fill_uniform(host_k, 0x35791u + static_cast<std::uint32_t>(tokens), -0.75f, 0.75f);
+    fill_uniform(host_v, 0x46802u + static_cast<std::uint32_t>(tokens), -1.25f, 1.25f);
+    round_to_bf16(host_k);
+    round_to_bf16(host_v);
+    for (int i = 0; i < i8_group; ++i) {
+        host_k[static_cast<std::size_t>(i)]                 = 0.0f;
+        host_v[static_cast<std::size_t>(i8_group + i)]      = 0.0f;
+    }
+    std::vector<std::uint16_t> input_k(input_count);
+    std::vector<std::uint16_t> input_v(input_count);
+    for (std::size_t i = 0; i < input_count; ++i) {
+        input_k[i] = f32_to_bf16(host_k[i]);
+        input_v[i] = f32_to_bf16(host_v[i]);
+    }
+
+    DeviceBuffer d_k         = to_device(input_k);
+    DeviceBuffer d_v         = to_device(input_v);
+    DeviceBuffer d_positions = to_device(positions);
+    DeviceBuffer d_mapping   = to_device(mapping);
+    Tensor k(d_k.p, DType::BF16, {d_head, kv_heads, tokens});
+    Tensor v(d_v.p, DType::BF16, {d_head, kv_heads, tokens});
+    Tensor position_tensor(d_positions.p, DType::I32, {tokens});
+
+    const bool is_i8             = storage == KvCacheStorage::Int8Group64;
+    const DType k_dtype          = is_i8 ? DType::I8 : DType::BF16;
+    const DType v_dtype          = is_i8 ? DType::I8 : DType::FP16;
+    const std::size_t code_count = plane_count(d_head);
+    const std::size_t scl_count  = is_i8 ? plane_count(i8_groups) : 1;
+    GuardedDeviceBuffer cache_k(code_count * dtype_size(k_dtype));
+    GuardedDeviceBuffer cache_v(code_count * dtype_size(v_dtype));
+    GuardedDeviceBuffer scale_k(scl_count * dtype_size(DType::FP16));
+    GuardedDeviceBuffer scale_v(scl_count * dtype_size(DType::FP16));
+    PagedKVLayerView cache{
+        .k_pages      = Tensor(cache_k.data(), k_dtype, {d_head, kPage, kv_heads, physical_pages}),
+        .v_pages      = Tensor(cache_v.data(), v_dtype, {d_head, kPage, kv_heads, physical_pages}),
+        .block_table  = Tensor(d_mapping.p, DType::I32, {logical_pages}),
+        .head_dim     = d_head,
+        .num_kv_heads = kv_heads,
+        .storage      = storage,
+    };
+
+    const auto run_op = [&]() {
+        if (!graph_replay) {
+            ops::kv_cache_append(k, v, position_tensor, cache, nullptr);
+            cuda_synchronize();
+            return;
+        }
+        cudaStream_t stream        = nullptr;
+        cudaGraph_t graph          = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        cuda_check(cudaStreamCreate(&stream), "create d128 kv append stream");
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+                   "begin d128 kv append capture");
+        ops::kv_cache_append(k, v, position_tensor, cache, stream);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "end d128 kv append capture");
+        cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+                   "instantiate d128 kv append graph");
+        cuda_check(cudaGraphLaunch(executable, stream), "launch d128 kv append graph");
+        cuda_check(cudaStreamSynchronize(stream), "sync d128 kv append graph");
+        cudaGraphExecDestroy(executable);
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+    };
+
+    int failures            = 0;
+    const std::string label = std::string("kv_cache_append full d128 ") +
+                              (is_i8 ? "i8" : "bf16") + " T=" + std::to_string(tokens) +
+                              (graph_replay ? " graph" : "");
+    if (!is_i8) {
+        auto expected_k = patterned_bits(code_count, 0x1122aabbU);
+        auto expected_v = patterned_bits(code_count, 0x3344ccddU);
+        cache_k.copy_from_host(expected_k.data(), expected_k.size() * sizeof(std::uint16_t));
+        cache_v.copy_from_host(expected_v.data(), expected_v.size() * sizeof(std::uint16_t));
+        for (int token = 0; token < tokens; ++token) {
+            const int position = positions[static_cast<std::size_t>(token)];
+            const int page     = mapping[static_cast<std::size_t>(position / kPage)];
+            for (int head = 0; head < kv_heads; ++head) {
+                for (int d = 0; d < d_head; ++d) {
+                    const std::size_t src =
+                        static_cast<std::size_t>(d) +
+                        static_cast<std::size_t>(d_head) *
+                            (head + static_cast<std::size_t>(kv_heads) * token);
+                    const std::size_t dst =
+                        full_cache_index(d_head, d, head, position, page, kv_heads);
+                    expected_k[dst] = input_k[src];
+                    expected_v[dst] = bf16_bits_to_f16_bits(input_v[src]);
+                }
+            }
+        }
+        run_op();
+        failures += verify_exact((label + " k").c_str(),
+                                 from_device<std::uint16_t>(cache_k.data(), code_count), expected_k);
+        failures += verify_exact((label + " v").c_str(),
+                                 from_device<std::uint16_t>(cache_v.data(), code_count), expected_v);
+    } else {
+        std::vector<std::int8_t> expected_k(code_count, static_cast<std::int8_t>(0x55));
+        std::vector<std::int8_t> expected_v(code_count, static_cast<std::int8_t>(0xaa));
+        auto expected_scale_k = patterned_bits(scl_count, 0x01234567U);
+        auto expected_scale_v = patterned_bits(scl_count, 0x89abcdefU);
+        cache_k.copy_from_host(expected_k.data(), expected_k.size());
+        cache_v.copy_from_host(expected_v.data(), expected_v.size());
+        scale_k.copy_from_host(expected_scale_k.data(),
+                               expected_scale_k.size() * sizeof(std::uint16_t));
+        scale_v.copy_from_host(expected_scale_v.data(),
+                               expected_scale_v.size() * sizeof(std::uint16_t));
+        cache.k_scale_pages =
+            Tensor(scale_k.data(), DType::FP16, {i8_groups, kPage, kv_heads, physical_pages});
+        cache.v_scale_pages =
+            Tensor(scale_v.data(), DType::FP16, {i8_groups, kPage, kv_heads, physical_pages});
+        const auto encode_d128_group = [&](const std::vector<float>& src, std::size_t base,
+                                           std::vector<std::int8_t>& codes, int head, int position,
+                                           int page, int group,
+                                           std::vector<std::uint16_t>& scales) {
+            float absmax = 0.0f;
+            for (int i = 0; i < i8_group; ++i) {
+                absmax = std::max(absmax, std::abs(src[base + static_cast<std::size_t>(i)]));
+            }
+            const std::uint16_t s_bits = f32_to_f16_bits(absmax / 127.0f);
+            const float s_val          = f16_bits_to_f32(s_bits);
+            const float inv            = s_val == 0.0f ? 0.0f : 1.0f / s_val;
+            for (int i = 0; i < i8_group; ++i) {
+                const int code =
+                    s_val == 0.0f
+                        ? 0
+                        : std::max(-127, std::min(127, round_even_to_i32(
+                                                           src[base + static_cast<std::size_t>(i)] *
+                                                           inv)));
+                codes[full_cache_index(d_head, group * i8_group + i, head, position, page,
+                                       kv_heads)] = static_cast<std::int8_t>(code);
+            }
+            scales[full_cache_index(i8_groups, group, head, position, page, kv_heads)] = s_bits;
+        };
+        for (int token = 0; token < tokens; ++token) {
+            const int position = positions[static_cast<std::size_t>(token)];
+            const int page     = mapping[static_cast<std::size_t>(position / kPage)];
+            for (int head = 0; head < kv_heads; ++head) {
+                for (int group = 0; group < i8_groups; ++group) {
+                    const std::size_t base =
+                        static_cast<std::size_t>(group * i8_group) +
+                        static_cast<std::size_t>(d_head) *
+                            (head + static_cast<std::size_t>(kv_heads) * token);
+                    encode_d128_group(host_k, base, expected_k, head, position, page, group,
+                                      expected_scale_k);
+                    encode_d128_group(host_v, base, expected_v, head, position, page, group,
+                                      expected_scale_v);
+                }
+            }
+        }
+        run_op();
+        failures += verify_exact((label + " k codes").c_str(),
+                                 from_device<std::int8_t>(cache_k.data(), code_count), expected_k);
+        failures += verify_exact((label + " v codes").c_str(),
+                                 from_device<std::int8_t>(cache_v.data(), code_count), expected_v);
+        failures +=
+            verify_exact((label + " k scales").c_str(),
+                         from_device<std::uint16_t>(scale_k.data(), scl_count), expected_scale_k);
+        failures +=
+            verify_exact((label + " v scales").c_str(),
+                         from_device<std::uint16_t>(scale_v.data(), scl_count), expected_scale_v);
+        failures += scale_k.verify_guards((label + " k scale guards").c_str());
+        failures += scale_v.verify_guards((label + " v scale guards").c_str());
+    }
+    failures += verify_exact((label + " input k unchanged").c_str(),
+                             from_device<std::uint16_t>(d_k.p, input_count), input_k);
+    failures += verify_exact((label + " input v unchanged").c_str(),
+                             from_device<std::uint16_t>(d_v.p, input_count), input_v);
+    failures += verify_exact((label + " positions unchanged").c_str(),
+                             from_device<std::int32_t>(d_positions.p, positions.size()), positions);
+    failures += verify_exact((label + " block table unchanged").c_str(),
+                             from_device<std::int32_t>(d_mapping.p, mapping.size()), mapping);
+    failures += cache_k.verify_guards((label + " k guards").c_str());
+    failures += cache_v.verify_guards((label + " v guards").c_str());
+    return failures;
+}
 
 } // namespace
 
@@ -1414,6 +1615,12 @@ int main(int argc, char** argv) {
     failures += full_append_case(2, KvCacheStorage::Nvfp4Group16, 129);
     failures += full_append_case(2, KvCacheStorage::Fp8KeyNvfp4Value, 129);
 #endif
+    for (const int t : {1, 3, 129}) {
+        failures += full_append_d128_case(KvCacheStorage::BFloat16, t);
+        failures += full_append_d128_case(KvCacheStorage::Int8Group64, t);
+    }
+    failures += full_append_d128_case(KvCacheStorage::BFloat16, 3, true);
+    failures += full_append_d128_case(KvCacheStorage::Int8Group64, 3, true);
     failures += run_case(1, 0, 0, false, {0, 1, 2});
     failures += run_case(1, 1, 63, false, {2, 3, 4});
     failures += run_case(16, 7, 60, false, {5, 1, 4}, 5);
@@ -1428,13 +1635,19 @@ int main(int argc, char** argv) {
     failures += run_case(8, 8, 3 * kDFlash2Window - 4, true, {}, 8, kDFlash2Window);
     failures += run_case(kDFlash2Window, kDFlash2Window, 3 * kDFlash2Window - kDFlash2Window / 2,
                          true, {}, kDFlash2Window, kDFlash2Window);
+    failures += run_case(1, 0, 1023, true, {}, 0, 1024);
+    failures += run_case(8, 7, 2 * 1024 - 2, true, {}, 0, 1024);
+    failures += run_case(1024, 1024, 3 * 1024 - 512, true, {}, 1024, 1024);
     failures += cyclic_graph_replay_case(kDFlashWindow, 16);
     failures += cyclic_graph_replay_case(kDFlash2Window, 8);
+    failures += cyclic_graph_replay_case(1024, 16);
     failures += paged_graph_replay_case();
     failures += batch_selector_case(true, kDFlashWindow);
+    failures += batch_selector_case(true, 1024);
     failures += batch_selector_case(false);
     failures += cyclic_decode_batch_case(kDFlashWindow);
     failures += cyclic_decode_batch_case(kDFlash2Window);
+    failures += cyclic_decode_batch_case(1024);
     failures += cyclic_variable_prefix_tests();
 
     if (failures != 0) {

@@ -45,6 +45,13 @@ int q6_a16_conformance() {
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6g64_f16s_weight,
                           {1152, 1536, 197U, Comparison::Sampled, false, kN1152K1536Large});
 
+    constexpr std::array kN201024K2304{
+        convenience(1), a16(3),  a16(4),  a16(16), a16(17),
+        a16(32),        a16(33), a16(64), a16(65), a16(128),
+    };
+    failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6g64_f16s_weight,
+                          {201024, 2304, 199U, Comparison::Sampled, false, kN201024K2304});
+
     return failures;
 }
 

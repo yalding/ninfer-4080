@@ -898,6 +898,9 @@ int test_reasoning_effort_chat_template() {
               "low reasoning effort did not render the official instruction");
     failures += check(render_effort(ninfer::ReasoningEffort::Medium) == tail,
                       "medium reasoning effort injected an instruction");
+    for (const auto effort : {ninfer::ReasoningEffort::Minimal, ninfer::ReasoningEffort::High})
+        failures += check(throws_invalid_argument([&] { (void)render_effort(effort); }),
+                          "Qwen frontend accepted an unsupported native effort tier");
 
     fi::ChatRenderOptions disabled;
     disabled.enable_thinking = false;

@@ -891,6 +891,10 @@ public:
                     };
                 }
             }
+            if (!next_transfer_observations.empty()) {
+                result.transfer_observations = std::move(next_transfer_observations);
+                next_transfer_observations.clear();
+            }
             return result;
         }
 
@@ -973,6 +977,10 @@ public:
             const std::uint32_t sequence_id        = next_sequence_id_++;
             sequence_content_keys_.at(sequence_id) = pending_prompt_.content_key;
             result.published = FakeStartResult{.sequence = FakeSequenceHandle{sequence_id}};
+        }
+        if (!next_transfer_observations.empty()) {
+            result.transfer_observations = std::move(next_transfer_observations);
+            next_transfer_observations.clear();
         }
         return result;
     }
@@ -1181,6 +1189,7 @@ public:
     std::vector<std::uint64_t> started_action_ids;
     std::vector<std::uint32_t> selected_shared_capture_frontiers;
     std::vector<std::uint32_t> released_continuations;
+    std::vector<ContextTransferObservation> next_transfer_observations;
 
 private:
     void advance_revision() noexcept {
@@ -3504,6 +3513,56 @@ void test_publication_only_pressure_constructs_adoptable_target() {
             "publication-only closure did not release exactly one private slot");
 }
 
+void test_state_and_kv_transfer_observation_accounting() {
+    using ninfer::TransferWork;
+    using ninfer::runtime::ContextResourceClass;
+    using ninfer::runtime::ContextTransferDirection;
+
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    constexpr std::uint64_t kStateBytes = 169'689'088ULL;
+    constexpr std::uint64_t kKvPageBytes = 1'081'344ULL;
+    program.next_transfer_observations   = {
+        {.resource   = ContextResourceClass::State,
+           .direction  = ContextTransferDirection::DeviceToHost,
+           .units      = 1,
+           .page_count = 0,
+           .work       = TransferWork{kStateBytes, 81},
+           .elapsed_ns = 1'000'000},
+        {.resource   = ContextResourceClass::State,
+           .direction  = ContextTransferDirection::HostToDevice,
+           .units      = 2,
+           .page_count = 0,
+           .work       = TransferWork{kStateBytes * 2ULL, 162},
+           .elapsed_ns = 2'000'000},
+        {.resource   = ContextResourceClass::State,
+           .direction  = ContextTransferDirection::DeviceToDevice,
+           .units      = 0,
+           .page_count = 0,
+           .work       = TransferWork{kStateBytes, 81},
+           .elapsed_ns = 500'000},
+        {.resource   = ContextResourceClass::MainKV,
+           .direction  = ContextTransferDirection::HostToDevice,
+           .units      = kKvPageBytes * 5ULL,
+           .page_count = 5,
+           .work       = TransferWork{kKvPageBytes * 5ULL, 5},
+           .elapsed_ns = 1'500'000},
+    };
+    const auto active = start_active(manager, program, 700, make_base(700), 1);
+    (void)finish_active(manager, program, active);
+
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.state_d2h_count == 1 && stats.state_d2h_bytes == kStateBytes,
+            "State D2H count and payload bytes mismatch");
+    require(stats.state_h2d_count == 2 && stats.state_h2d_bytes == kStateBytes * 2ULL,
+            "State H2D count and payload bytes mismatch");
+    require(stats.state_d2d_count == 1 && stats.state_d2d_bytes == kStateBytes,
+            "State D2D zero-unit fallback count and payload bytes mismatch");
+    require(stats.main_kv_h2d_pages == 5 && stats.main_kv_h2d_bytes == kKvPageBytes * 5ULL,
+            "MainKV H2D page and byte accounting mismatch");
+}
+
 
 } // namespace
 
@@ -3589,6 +3648,8 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
+    run_test("state and kv transfer observation accounting",
+             test_state_and_kv_transfer_observation_accounting);
 #ifdef _WIN32
     timeEndPeriod(1);
 #endif

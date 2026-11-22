@@ -29,6 +29,7 @@ if(MSVC)
   add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:C,CXX>:/bigobj>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
   # /utf-8: the bundled fmt (spdlog) static-asserts that narrow literals are UTF-8 on MSVC
   # (error C2338 otherwise). Applies to all C/CXX targets, incl. third_party/spdlog.

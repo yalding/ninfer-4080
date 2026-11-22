@@ -10,7 +10,6 @@
 #include "runtime/engine/resource_manager.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/generation/generation_budget.h"
-#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h"
 
 #include <algorithm>
 #include <functional>
@@ -306,9 +305,10 @@ public:
     // session back (see spill_catalog_slot). The binding lives exactly as long as the catalog
     // entry that owns it - the resource manager's slot-release observer clears it - so it can
     // never outlive its session and be applied to the next one.
-    [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot
+    [[nodiscard]] runtime::RetainedSessionSnapshot
     save_retained_lane(std::uint32_t slot, std::string_view model_binding,
                        std::string_view expected_digest, std::string_view session_path = {}) {
+        if constexpr (requires(Program& p, const typename Package::ContinuationHandle& h) { p.save_continuation(h, std::string_view{}); }) {
         std::scoped_lock lock(execution_mutex_);
         require_settled_slot(slot);
         const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
@@ -319,11 +319,14 @@ public:
         auto snapshot = instance_.program->save_continuation(*view.handle, model_binding);
         bind_slot_session(slot, session_path);
         return snapshot;
+
+        } else { throw std::invalid_argument("target does not support disk session persistence"); }
     }
 
     [[nodiscard]] std::pair<std::uint32_t, std::string>
     restore_retained_lane(std::uint32_t slot, std::span<const std::uint8_t> snapshot,
                           std::string_view model_binding, std::string_view session_path = {}) {
+        if constexpr (requires(Program& p) { p.restore_continuation(std::span<const std::uint8_t>{}, std::string_view{}); }) {
         std::scoped_lock lock(execution_mutex_);
         if (!context_cache_enabled_) {
             // Without the cache no finished request retains its session, so a restored
@@ -365,6 +368,8 @@ public:
         bind_slot_session(slot, session_path);
         publish_runtime_stats();
         return {tokens, std::move(digest)};
+
+        } else { throw std::invalid_argument("target does not support disk session persistence"); }
     }
 
     std::uint32_t erase_retained_lane(std::uint32_t slot, std::string_view expected_digest) {
@@ -401,7 +406,7 @@ public:
     // that receives (path, snapshot) for each spilled session and writes the file off-thread.
     void set_eviction_sink(
         std::string model_binding,
-        std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> sink) {
+        std::function<void(std::string, runtime::RetainedSessionSnapshot&&)> sink) {
         std::scoped_lock lock(execution_mutex_);
         eviction_model_binding_ = std::move(model_binding);
         eviction_sink_          = std::move(sink);
@@ -443,6 +448,7 @@ private:
     // spilled, and a spill failure never blocks the eviction itself.
     void spill_catalog_slot(std::uint32_t slot,
                             const typename Package::ContinuationHandle& handle) noexcept {
+        if constexpr (requires(Program& p, const typename Package::ContinuationHandle& h) { p.save_continuation(h, std::string_view{}); }) {
         if (!eviction_sink_ || slot >= slot_session_paths_.size() ||
             slot_session_paths_[slot].empty()) {
             return;
@@ -458,6 +464,8 @@ private:
         // clears the binding too; doing it here as well keeps the spill correct even for a
         // destroying path that never reaches clear_catalog_entry.
         clear_slot_session(slot);
+
+        } else { (void)slot; (void)handle; }
     }
 
     void clear_slot_session(std::uint32_t slot) noexcept {
@@ -753,9 +761,16 @@ private:
         {
             // Session save/restore copies run outside the context-cache transactions, so the
             // populated transfer stats cannot see them; add the Program's snapshot counters.
-            const targets::qwen3_6::SessionSnapshotTraffic traffic =
-                instance_.program->session_snapshot_traffic();
+            const runtime::SessionSnapshotTraffic traffic = [&] {
+                if constexpr (requires(Program& p) { p.session_snapshot_traffic(); }) {
+                    return instance_.program->session_snapshot_traffic();
+                } else { return runtime::SessionSnapshotTraffic{}; }
+            }();
             snapshot.main_kv_d2h_pages += traffic.main_kv_d2h_pages;
+            snapshot.main_kv_d2d_pages += traffic.main_kv_d2d_pages;
+            snapshot.main_kv_d2d_bytes += traffic.main_kv_d2d_bytes;
+            snapshot.state_d2d_count += traffic.state_d2d_count;
+            snapshot.state_d2d_bytes += traffic.state_d2d_bytes;
             snapshot.main_kv_h2d_pages += traffic.main_kv_h2d_pages;
             snapshot.backend_kv_d2h_pages += traffic.backend_kv_d2h_pages;
             snapshot.backend_kv_h2d_pages += traffic.backend_kv_h2d_pages;
@@ -2437,7 +2452,7 @@ private:
     // Auto-save sink installed by the Engine when auto_save_evicted is on; the writer thread
     // that drains it lives in Engine::Impl. Guarded by execution_mutex_.
     std::string eviction_model_binding_;
-    std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> eviction_sink_;
+    std::function<void(std::string, runtime::RetainedSessionSnapshot&&)> eviction_sink_;
     // Fork-local session persistence, guarded by execution_mutex_: the session file each slot
     // is bound to (spill target on eviction) and the digest/checkpoint cache that keeps stats
     // publication from hashing a deep ledger every unit.

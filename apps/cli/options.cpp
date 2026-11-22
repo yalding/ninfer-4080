@@ -71,8 +71,10 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 }
 
 ReasoningEffort parse_reasoning_effort(std::string_view text) {
+    if (text == "minimal") { return ReasoningEffort::Minimal; }
     if (text == "low") { return ReasoningEffort::Low; }
     if (text == "medium") { return ReasoningEffort::Medium; }
+    if (text == "high") { return ReasoningEffort::High; }
     if (text == "xhigh") { return ReasoningEffort::XHigh; }
     throw std::invalid_argument("invalid reasoning-effort: " + std::string(text));
 }
@@ -93,7 +95,7 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
-           "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-residency resident|overlay|cpu]\n"
+           "       [--reasoning-effort minimal|low|medium|high|xhigh] [--vision] [--vision-residency resident|overlay|cpu]\n"
            "       [--vision-offload on|off] [--vision-cpu] [--vision-max-tokens N] [--vision-max-merged N]\n"
            "       [--no-cuda-graph]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"

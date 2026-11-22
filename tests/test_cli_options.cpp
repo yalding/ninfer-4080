@@ -4,6 +4,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -54,6 +55,13 @@ int main() {
                "--reasoning-effort", "medium"});
     failures += check(with_effort.thinking_budget == 8 && with_effort.reasoning_effort,
                       "thinking budget did not coexist with reasoning effort");
+    for (const auto& [name, effort] :
+         std::vector<std::pair<std::string, ninfer::ReasoningEffort>>{
+             {"minimal", ninfer::ReasoningEffort::Minimal}, {"high", ninfer::ReasoningEffort::High}}) {
+        const auto parsed = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                   "--reasoning-effort", name});
+        failures += check(parsed.reasoning_effort == effort, "CLI lost native reasoning tier");
+    }
     const ninfer::cli::Options dflash_vision =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision", "--spec", "dflash",
                "--draft-tokens", "7"});

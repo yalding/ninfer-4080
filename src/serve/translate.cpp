@@ -158,14 +158,16 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     case RequestedReasoningEffort::XHigh:
         result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
         break;
-    // The Qwen3.8 template implements only low/medium/xhigh, but clients send the
-    // OpenAI vocabulary. Map the neighbouring tiers onto the nearest supported
-    // one rather than rejecting the request: Claude Code sends `high` for high
-    // effort, and failing the call outright is worse than a one-step rounding.
     case RequestedReasoningEffort::Minimal:
-        result.reasoning_effort = ninfer::ReasoningEffort::Low;
+        result.reasoning_effort = capabilities.reasoning_effort.minimal
+                                      ? ninfer::ReasoningEffort::Minimal
+                                      : ninfer::ReasoningEffort::Low;
         break;
     case RequestedReasoningEffort::High:
+        result.reasoning_effort = capabilities.reasoning_effort.high
+                                      ? ninfer::ReasoningEffort::High
+                                      : ninfer::ReasoningEffort::XHigh;
+        break;
     case RequestedReasoningEffort::Max:
         result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
         break;

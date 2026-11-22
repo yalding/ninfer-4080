@@ -4,6 +4,7 @@
 #include "runtime/engine/context_cost.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
+#include <ninfer/targets/inkling2_mini/package.h>
 
 #include <memory>
 #include <variant>
@@ -77,8 +78,40 @@ struct Qwen3_6_35BA3BInstance {
     Qwen3_6_35BA3BInstance& operator=(const Qwen3_6_35BA3BInstance&) = delete;
 };
 
+using Inkling2Mini = inkling2_mini::Package;
+
+struct LoadedInkling2Mini {
+    std::unique_ptr<Inkling2Mini::LoadedModel> model;
+    Inkling2Mini::Frontend frontend;
+
+    LoadedInkling2Mini(std::unique_ptr<Inkling2Mini::LoadedModel> stable_model,
+                       const EngineOptions& options);
+    ~LoadedInkling2Mini();
+
+    LoadedInkling2Mini(const LoadedInkling2Mini&)            = delete;
+    LoadedInkling2Mini& operator=(const LoadedInkling2Mini&) = delete;
+};
+
+struct Inkling2MiniInstance {
+    using Package = Inkling2Mini;
+    std::unique_ptr<LoadedInkling2Mini> loaded;
+    runtime::KvCapacityResolution kv_capacity_resolution;
+    const std::uint32_t capacity;
+    std::unique_ptr<Inkling2Mini::Program> program;
+
+    Inkling2MiniInstance(std::unique_ptr<LoadedInkling2Mini> stable_loaded,
+                         runtime::KvCapacityResolution resolution,
+                         Inkling2Mini::SequencePlan sequence_plan, DeviceContext& device,
+                         const StartupObserver& startup_observer);
+    ~Inkling2MiniInstance();
+
+    Inkling2MiniInstance(const Inkling2MiniInstance&)            = delete;
+    Inkling2MiniInstance& operator=(const Inkling2MiniInstance&) = delete;
+};
+
 using ActiveTarget =
-    std::variant<std::unique_ptr<Qwen3_6_27BInstance>, std::unique_ptr<Qwen3_6_35BA3BInstance>>;
+    std::variant<std::unique_ptr<Qwen3_6_27BInstance>, std::unique_ptr<Qwen3_6_35BA3BInstance>,
+                 std::unique_ptr<Inkling2MiniInstance>>;
 
 struct ConstructedTarget {
     ActiveTarget active;

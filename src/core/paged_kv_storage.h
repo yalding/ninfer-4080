@@ -10,6 +10,7 @@
 namespace ninfer {
 
 inline constexpr std::int32_t kD256KVCacheHeadDim = 256;
+inline constexpr std::int32_t kD128KVCacheHeadDim = 128;
 
 /** Physical data/scale planes for one K or V vector. */
 struct PagedKVVectorLayout {
@@ -70,6 +71,7 @@ struct PagedKVStorageLayout {
                 {DType::FP16, head_dim, DType::U8, 0}};
     case KvCacheStorage::Int8Group64:
         if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::I8, 256, DType::FP16, 4}); }
+        if (head_dim == kD128KVCacheHeadDim) { return symmetric({DType::I8, 128, DType::FP16, 2}); }
         break;
     case KvCacheStorage::Fp8E4M3Row256:
         if (head_dim == kD256KVCacheHeadDim) {

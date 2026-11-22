@@ -430,6 +430,18 @@ int test_human_and_csv_reports() {
 
 int main() {
     int failures = 0;
+    const std::vector<ninfer::TokenId> corpus{3, 5, 7};
+    failures += expect(qb::prompt_slice(corpus, 2) == std::vector<ninfer::TokenId>{3, 5},
+                       "prompt corpus prefix");
+    failures += expect(qb::prompt_slice(corpus, 8) == std::vector<ninfer::TokenId>{3, 5, 7, 3, 5, 7, 3, 5},
+                       "prompt corpus tiling");
+    const auto long_prompt = qb::prompt_slice(corpus, 131072);
+    failures += expect(long_prompt.size() == 131072 && long_prompt.back() == 5,
+                       "128K prompt corpus tiling");
+    failures += expect_throws<std::invalid_argument>([] { (void)qb::prompt_slice({}, 3); },
+                                                     "empty corpus tiling");
+    failures += expect_throws<std::invalid_argument>([&] { (void)qb::prompt_slice(corpus, 0); },
+                                                     "empty prompt tiling");
     failures += test_cli_contract();
     failures += test_measurement_contract();
     failures += test_report_contract();

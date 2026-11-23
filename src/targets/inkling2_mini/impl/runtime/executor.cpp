@@ -1,6 +1,7 @@
 #include "targets/inkling2_mini/impl/runtime/executor.h"
 #include "targets/inkling2_mini/impl/load/bindings.h"
 #include "targets/inkling2_mini/impl/state/state_image.h"
+#include "core/arena.h"
 #include "core/decode_graph.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/inkling2_attention.h"
@@ -14,6 +15,7 @@
 #include "ninfer/ops/target_logprobs.h"
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -161,14 +163,26 @@ public:
         DecodeGraphExecutable executable;
     };
 
+    struct HostStepStaging {
+        std::int32_t count;
+        std::int32_t lane;
+        std::int32_t sample_position;
+        TokenId sampled;
+        ops::SamplingConfig config;
+    };
+
     std::map<std::pair<std::uint32_t, std::uint32_t>, Graph> graphs;
-    std::vector<std::int32_t> host_positions;
+    PinnedHostBuffer pinned_step;
+    PinnedHostBuffer pinned_ids;
+    PinnedHostBuffer pinned_positions;
     std::vector<std::int32_t> host_counts;
 
     Impl(const RuntimeModelView& m, DeviceContext& d, const EngineOptions& o)
         : model(m), device(d), options(o), states(o, kv_tokens(o)), layout(scratch_layout(o)),
-          scratch(layout.bytes), workspace(op_workspace(o)), host_positions(chunk_capacity(o)),
-          host_counts(V) {}
+          scratch(layout.bytes), workspace(op_workspace(o)),
+          pinned_step(sizeof(HostStepStaging)),
+          pinned_ids(chunk_capacity(o) * sizeof(TokenId)),
+          pinned_positions(chunk_capacity(o) * sizeof(std::int32_t)), host_counts(V) {}
 
     Tensor bf(const TensorRegion& r, int a, int b = 1, int c = 1) {
         return region(r, scratch, {a, b, c});
@@ -220,16 +234,8 @@ public:
                 auto values = states_and_cur();
                 ops::inkling2_attn_res_mix(std::span(values.data(), block_count + 1),
                                            w.attention_res_query, {}, mixed, stream);
-                if (branches == 1) {
-                    auto first = branch(mixed, 0);
-                    for (int j = 0; j < 3; ++j) {
-                        auto dst = branch(inputs, j);
-                        copy(first, dst, stream);
-                    }
-                } else
-                    copy(mixed, inputs, stream);
                 Tensor msg3(messages.data, DType::BF16, {C, t, 3});
-                ops::inkling2_loop_control(inputs, msg3, controls(w.loop_ctrl_down, 0, 3),
+                ops::inkling2_loop_control(mixed, msg3, controls(w.loop_ctrl_down, 0, 3),
                                            controls(w.loop_ctrl_gain_forget, 0, 3), norms, inputs,
                                            workspace, stream);
                 attn_in = inputs;
@@ -373,16 +379,21 @@ Tensor Executor::forward(std::span<const TokenId> ids, std::uint32_t start, std:
     // Finish prior use of pinned table staging and transient storage before mutating the maps.
     sync();
     p.states.prepare_append(slot, start, t, p.device.stream);
-    for (int i = 0; i < t; ++i) p.host_positions[i] = static_cast<int>(start) + i;
+    auto* host_ids = static_cast<TokenId*>(p.pinned_ids.data());
+    std::memcpy(host_ids, ids.data(), ids.size_bytes());
+    auto* host_pos = static_cast<std::int32_t*>(p.pinned_positions.data());
+    for (int i = 0; i < t; ++i) host_pos[i] = static_cast<int>(start) + i;
     auto positions = p.bf(p.layout.positions, t), tokens = p.bf(p.layout.ids, t);
-    CUDA_CHECK(cudaMemcpyAsync(tokens.data, ids.data(), ids.size_bytes(), cudaMemcpyHostToDevice,
+    CUDA_CHECK(cudaMemcpyAsync(tokens.data, host_ids, ids.size_bytes(), cudaMemcpyHostToDevice,
                                p.device.stream));
-    CUDA_CHECK(cudaMemcpyAsync(positions.data, p.host_positions.data(), t * sizeof(int),
+    CUDA_CHECK(cudaMemcpyAsync(positions.data, host_pos, t * sizeof(int),
                                cudaMemcpyHostToDevice, p.device.stream));
-    const int count = t, lane = static_cast<int>(slot);
-    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.count, 1).data, &count, sizeof(int),
+    auto* step  = static_cast<Impl::HostStepStaging*>(p.pinned_step.data());
+    step->count = t;
+    step->lane  = static_cast<int>(slot);
+    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.count, 1).data, &step->count, sizeof(int),
                                cudaMemcpyHostToDevice, p.device.stream));
-    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.lane, 1).data, &lane, sizeof(int),
+    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.lane, 1).data, &step->lane, sizeof(int),
                                cudaMemcpyHostToDevice, p.device.stream));
     if (p.options.use_cuda_graph && t == 1 && !all) {
         std::uint32_t envelope = std::min(256U, p.options.max_context);
@@ -403,35 +414,43 @@ Tensor Executor::forward(std::span<const TokenId> ids, std::uint32_t start, std:
 
 TokenId Executor::sample(const Tensor& logits, const ResolvedSamplingParameters& sampling,
                          std::uint32_t logical_position, std::span<const TokenId> history) {
-    auto& p     = *impl_;
-    auto stream = p.device.stream;
-    std::fill(p.host_counts.begin(), p.host_counts.end(), 0);
-    for (auto id : history)
-        if (id >= 0 && id < V) ++p.host_counts[id];
-    auto counts = p.bf(p.layout.counts, V);
-    CUDA_CHECK(cudaMemcpyAsync(counts.data, p.host_counts.data(), V * sizeof(int),
-                               cudaMemcpyHostToDevice, stream));
-    ops::SamplingConfig config{sampling.temperature,
-                               sampling.top_k,
-                               sampling.top_p,
-                               sampling.min_p,
-                               sampling.presence_penalty,
-                               sampling.frequency_penalty,
-                               sampling.seed,
-                               static_cast<int*>(counts.data)};
-    auto* device_config = static_cast<ops::SamplingConfig*>(
+    auto& p                = *impl_;
+    auto stream            = p.device.stream;
+    const bool use_penalties =
+        sampling.presence_penalty != 0.0f || sampling.frequency_penalty != 0.0f;
+    int* counts_ptr = nullptr;
+    if (use_penalties) {
+        std::fill(p.host_counts.begin(), p.host_counts.end(), 0);
+        for (auto id : history)
+            if (id >= 0 && id < V) ++p.host_counts[id];
+        auto counts = p.bf(p.layout.counts, V);
+        CUDA_CHECK(cudaMemcpyAsync(counts.data, p.host_counts.data(), V * sizeof(int),
+                                   cudaMemcpyHostToDevice, stream));
+        counts_ptr = static_cast<int*>(counts.data);
+    }
+    auto* step           = static_cast<Impl::HostStepStaging*>(p.pinned_step.data());
+    step->config         = ops::SamplingConfig{sampling.temperature,
+                                               sampling.top_k,
+                                               sampling.top_p,
+                                               sampling.min_p,
+                                               sampling.presence_penalty,
+                                               sampling.frequency_penalty,
+                                               sampling.seed,
+                                               counts_ptr};
+    step->sample_position = static_cast<int>(logical_position);
+    auto* device_config   = static_cast<ops::SamplingConfig*>(
         p.layout.config.bind({p.scratch.p, p.scratch.bytes}).data);
     auto position = p.bf(p.layout.sample_position, 1), out = p.bf(p.layout.sampled, 1);
-    const int pos = static_cast<int>(logical_position);
-    CUDA_CHECK(
-        cudaMemcpyAsync(device_config, &config, sizeof(config), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(position.data, &pos, sizeof(pos), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(device_config, &step->config, sizeof(step->config),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(position.data, &step->sample_position, sizeof(step->sample_position),
+                               cudaMemcpyHostToDevice, stream));
     ops::sample(logits, out, V, device_config, position, ops::kSamplePurposeDecode, p.workspace,
                 stream);
-    TokenId token;
-    CUDA_CHECK(cudaMemcpyAsync(&token, out.data, sizeof(token), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(&step->sampled, out.data, sizeof(step->sampled),
+                               cudaMemcpyDeviceToHost, stream));
     sync();
-    return token;
+    return step->sampled;
 }
 
 void Executor::reset(std::uint32_t slot) { impl_->states.reset(slot, impl_->device.stream); }

@@ -210,23 +210,52 @@ __global__ void sconv_state_kernel(const BF* x, const BF* old, BF* state, int ch
     state[2 * channels + c] = __float2bfloat16_rn(d);
 }
 
-__global__ void mix_kernel(Inkling2Branches inputs, const float* query, BF* out, int tokens) {
+__global__ void mix_kernel(Inkling2Branches inputs, const float* __restrict__ query,
+                           BF* __restrict__ out, int tokens) {
     const int t = blockIdx.x % tokens, r = blockIdx.x / tokens, tid = threadIdx.x;
-    __shared__ float scratch[8], inverse[8], probability[8], values[2304];
+    __shared__ float scratch[8], inverse[8], probability[8];
+    const int kv0 = tid;
+    const int kv1 = 256 + tid;
+    const bool has_kv1 = tid < 32;
+    const float* qr = query + static_cast<std::int64_t>(r) * 2304;
+    const float4 q0a = load_vec<float4>(qr + kv0 * 8);
+    const float4 q0b = load_vec<float4>(qr + kv0 * 8 + 4);
+    float4 q1a{}, q1b{};
+    if (has_kv1) {
+        q1a = load_vec<float4>(qr + kv1 * 8);
+        q1b = load_vec<float4>(qr + kv1 * 8 + 4);
+    }
+
+    auto accum_state = [&](const void* state_ptr, const float4& qa, const float4& qb, int kv,
+                           float& ss, float& dot) {
+        const uint4 vx = load_vec<uint4>(static_cast<const BF*>(state_ptr) +
+                                         static_cast<std::int64_t>(t) * 2304 + kv * 8);
+        const auto* px = reinterpret_cast<const __nv_bfloat162*>(&vx);
+        const float2 f0 = __bfloat1622float2(px[0]);
+        const float2 f1 = __bfloat1622float2(px[1]);
+        const float2 f2 = __bfloat1622float2(px[2]);
+        const float2 f3 = __bfloat1622float2(px[3]);
+        ss = fmaf(f0.x, f0.x, ss); ss = fmaf(f0.y, f0.y, ss);
+        ss = fmaf(f1.x, f1.x, ss); ss = fmaf(f1.y, f1.y, ss);
+        ss = fmaf(f2.x, f2.x, ss); ss = fmaf(f2.y, f2.y, ss);
+        ss = fmaf(f3.x, f3.x, ss); ss = fmaf(f3.y, f3.y, ss);
+        dot = fmaf(f0.x, qa.x, dot); dot = fmaf(f0.y, qa.y, dot);
+        dot = fmaf(f1.x, qa.z, dot); dot = fmaf(f1.y, qa.w, dot);
+        dot = fmaf(f2.x, qb.x, dot); dot = fmaf(f2.y, qb.y, dot);
+        dot = fmaf(f3.x, qb.z, dot); dot = fmaf(f3.y, qb.w, dot);
+    };
+
     for (int state = 0; state < inputs.count; ++state) {
-        float ss = 0, dot = 0;
-        for (int d = tid; d < 2304; d += 256) {
-            const float x = bf(inputs.states[state], static_cast<std::int64_t>(t) * 2304 + d);
-            ss = fmaf(x, x, ss);
-            dot = fmaf(x, query[r * 2304 + d], dot);
-        }
-        const float inv = rsqrtf(sum256(ss, scratch) / 2304.0f + 1e-6f);
+        float ss = 0.0f, dot = 0.0f;
+        accum_state(inputs.states[state], q0a, q0b, kv0, ss, dot);
+        if (has_kv1) accum_state(inputs.states[state], q1a, q1b, kv1, ss, dot);
+        const float inv   = rsqrtf(sum256(ss, scratch) / 2304.0f + 1e-6f);
         const float score = sum256(dot, scratch) * inv / 48.0f;
         if (tid == 0) { inverse[state] = inv; probability[state] = score; }
         __syncthreads();
     }
     if (tid == 0) {
-        float maximum = -CUDART_INF_F, denominator = 0;
+        float maximum = -CUDART_INF_F, denominator = 0.0f;
         for (int state = 0; state < inputs.count; ++state) maximum = fmaxf(maximum, probability[state]);
         for (int state = 0; state < inputs.count; ++state) {
             probability[state] = expf(probability[state] - maximum);
@@ -235,111 +264,156 @@ __global__ void mix_kernel(Inkling2Branches inputs, const float* query, BF* out,
         for (int state = 0; state < inputs.count; ++state) probability[state] /= denominator;
     }
     __syncthreads();
-    float ss = 0;
-    for (int d = tid; d < 2304; d += 256) {
-        float value = 0;
-        for (int state = 0; state < inputs.count; ++state)
-            value = fmaf(probability[state] * inverse[state],
-                         bf(inputs.states[state], static_cast<std::int64_t>(t) * 2304 + d), value);
-        values[d] = value; ss = fmaf(value, value, ss);
+
+    float v0[8] = {}, v1[8] = {};
+    for (int state = 0; state < inputs.count; ++state) {
+        const float w = probability[state] * inverse[state];
+        const auto base = static_cast<std::int64_t>(t) * 2304;
+        const uint4 vx0 = load_vec<uint4>(static_cast<const BF*>(inputs.states[state]) + base + kv0 * 8);
+        const auto* px0 = reinterpret_cast<const __nv_bfloat162*>(&vx0);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 f = __bfloat1622float2(px0[i]);
+            v0[2 * i]     = fmaf(w, f.x, v0[2 * i]);
+            v0[2 * i + 1] = fmaf(w, f.y, v0[2 * i + 1]);
+        }
+        if (has_kv1) {
+            const uint4 vx1 = load_vec<uint4>(static_cast<const BF*>(inputs.states[state]) + base + kv1 * 8);
+            const auto* px1 = reinterpret_cast<const __nv_bfloat162*>(&vx1);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 f = __bfloat1622float2(px1[i]);
+                v1[2 * i]     = fmaf(w, f.x, v1[2 * i]);
+                v1[2 * i + 1] = fmaf(w, f.y, v1[2 * i + 1]);
+            }
+        }
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) ss = fmaf(v0[i], v0[i], ss);
+    if (has_kv1) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) ss = fmaf(v1[i], v1[i], ss);
     }
     const float post = inputs.norm[r] ? rsqrtf(sum256(ss, scratch) / 2304.0f + 1e-6f) : 1.0f;
-    __syncthreads();
-    for (int d = tid; d < 2304; d += 256) {
-        float value = values[d] * post;
-        if (inputs.norm[r]) value *= bf(inputs.norm[r], d);
-        out[(static_cast<std::int64_t>(r) * tokens + t) * 2304 + d] = __float2bfloat16_rn(value);
+    auto store_vec8 = [&](const float* v, int kv) {
+        __nv_bfloat162 p[4];
+        if (inputs.norm[r]) {
+            const uint4 wn = load_vec<uint4>(static_cast<const BF*>(inputs.norm[r]) + kv * 8);
+            const auto* pw = reinterpret_cast<const __nv_bfloat162*>(&wn);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 fw = __bfloat1622float2(pw[i]);
+                p[i] = __floats2bfloat162_rn(v[2 * i] * post * fw.x, v[2 * i + 1] * post * fw.y);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                p[i] = __floats2bfloat162_rn(v[2 * i] * post, v[2 * i + 1] * post);
+            }
+        }
+        store_vec(out + (static_cast<std::int64_t>(r) * tokens + t) * 2304 + kv * 8,
+                  make_uint4(*reinterpret_cast<const unsigned*>(&p[0]),
+                             *reinterpret_cast<const unsigned*>(&p[1]),
+                             *reinterpret_cast<const unsigned*>(&p[2]),
+                             *reinterpret_cast<const unsigned*>(&p[3])));
+    };
+    store_vec8(v0, kv0);
+    if (has_kv1) store_vec8(v1, kv1);
+}
+
+__global__ void control_down_small_t_kernel(const BF* __restrict__ cur, const BF* __restrict__ msg,
+                                            const BF* __restrict__ down,
+                                            const float* __restrict__ inv_x,
+                                            const float* __restrict__ inv_m, float* __restrict__ z,
+                                            int tokens, int cur_c) {
+    const int tok    = static_cast<int>(blockIdx.y);
+    const int ch     = static_cast<int>(blockIdx.z);
+    const int cur_ch = cur_c == 1 ? 0 : ch;
+    const int warp   = static_cast<int>(threadIdx.x) >> 5;
+    const int lane   = static_cast<int>(threadIdx.x) & 31;
+    const int r      = static_cast<int>(blockIdx.x) * 4 + warp;
+    const auto cur_base = (static_cast<std::int64_t>(cur_ch) * tokens + tok) * 2304;
+    const auto msg_base = (static_cast<std::int64_t>(ch) * tokens + tok) * 2304;
+    const BF* dp      = down + static_cast<std::int64_t>(ch * 64 + r) * 4608;
+    float acc_cur = 0.0f, acc_msg = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        const int k = (i * 32 + lane) * 8;
+        acc_cur += dot_uint4_bf16(load_vec<uint4>(cur + cur_base + k), load_vec<uint4>(dp + k));
+        acc_msg +=
+            dot_uint4_bf16(load_vec<uint4>(msg + msg_base + k), load_vec<uint4>(dp + 2304 + k));
+    }
+    acc_cur = warp_sum(acc_cur);
+    acc_msg = warp_sum(acc_msg);
+    if (lane == 0) {
+        const auto idx = static_cast<std::int64_t>(ch) * tokens + tok;
+        z[idx * 64 + r] = fmaf(acc_cur, inv_x[idx], acc_msg * inv_m[idx]);
     }
 }
 
-__global__ void control_down_kernel(const BF* cur, const BF* msg, const BF* down, float* z,
-                                    int tokens) {
-    const int t = blockIdx.x % tokens, c = blockIdx.x / tokens, tid = threadIdx.x;
-    const auto base = (static_cast<std::int64_t>(c) * tokens + t) * 2304;
-    __shared__ float normalized[4608], scratch[8];
-    float sx = 0, sm = 0;
-    for (int d = tid; d < 2304; d += 256) {
-        const float x = __bfloat162float(cur[base + d]), m = __bfloat162float(msg[base + d]);
-        sx = fmaf(x, x, sx); sm = fmaf(m, m, sm);
-    }
-    const float ix = rsqrtf(sum256(sx, scratch) / 2304.0f + 1e-6f);
-    const float im = rsqrtf(sum256(sm, scratch) / 2304.0f + 1e-6f);
-    for (int d = tid; d < 2304; d += 256) {
-        normalized[d] = __bfloat162float(cur[base + d]) * ix;
-        normalized[2304 + d] = __bfloat162float(msg[base + d]) * im;
-    }
-    __syncthreads();
-    const int rank = tid / 32, lane = tid % 32;
-    for (int r = rank; r < 64; r += 8) {
-        float value = 0;
-        for (int k = lane; k < 4608; k += 32)
-            value = fmaf(normalized[k], __bfloat162float(down[(c * 64 + r) * 4608 + k]), value);
-        value = warp_sum(value);
-        if (lane == 0) z[(static_cast<std::int64_t>(c) * tokens + t) * 64 + r] = value;
-    }
-}
-__global__ void control_out_kernel(const BF* cur, const BF* msg, const BF* gf,
-                                   Inkling2Branches branches, const float* z, BF* out, int tokens) {
-    const int t = blockIdx.x % tokens, c = blockIdx.x / tokens, tid = threadIdx.x;
-    const auto base = (static_cast<std::int64_t>(c) * tokens + t) * 2304;
-    const float* latent = z + (static_cast<std::int64_t>(c) * tokens + t) * 64;
-    __shared__ float values[2304], scratch[8], zs[64];
+__global__ void control_out_small_t_kernel(const BF* __restrict__ cur, const BF* __restrict__ msg,
+                                           const BF* __restrict__ gf, const float* __restrict__ z,
+                                           float* __restrict__ y_fp32, BF* __restrict__ out,
+                                           int tokens, int cur_c) {
+    const int tok     = static_cast<int>(blockIdx.y);
+    const int ch      = static_cast<int>(blockIdx.z);
+    const int cur_ch  = cur_c == 1 ? 0 : ch;
+    const int tid     = static_cast<int>(threadIdx.x);
+    const int d_group = tid >> 3;
+    const int k8      = tid & 7;
+    const int k0      = k8 * 8;
+    const int d       = static_cast<int>(blockIdx.x) * 32 + d_group;
+    __shared__ float zs[64];
+    const float* latent = z + (static_cast<std::int64_t>(ch) * tokens + tok) * 64;
     if (tid < 64) zs[tid] = latent[tid];
     __syncthreads();
-    const int d_group = tid >> 3;
-    const int k8 = tid & 7;
-    const int k0 = k8 * 8;
-    float ss = 0;
-    for (int d = d_group; d < 2304; d += 32) {
-        const uint4 vg = load_vec<uint4>(&gf[((static_cast<std::int64_t>(c) * 2) * 2304 + d) * 64 + k0]);
-        const uint4 vf = load_vec<uint4>(&gf[((static_cast<std::int64_t>(c) * 2 + 1) * 2304 + d) * 64 + k0]);
-        const auto* pg = reinterpret_cast<const __nv_bfloat162*>(&vg);
-        const auto* pf = reinterpret_cast<const __nv_bfloat162*>(&vf);
-        float gain = 0.0f, forget = 0.0f;
+    const uint4 vg =
+        load_vec<uint4>(&gf[((static_cast<std::int64_t>(ch) * 2) * 2304 + d) * 64 + k0]);
+    const uint4 vf =
+        load_vec<uint4>(&gf[((static_cast<std::int64_t>(ch) * 2 + 1) * 2304 + d) * 64 + k0]);
+    const auto* pg = reinterpret_cast<const __nv_bfloat162*>(&vg);
+    const auto* pf = reinterpret_cast<const __nv_bfloat162*>(&vf);
+    float gain = 0.0f, forget = 0.0f;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float2 fg = __bfloat1622float2(pg[i]);
-            const float2 ff = __bfloat1622float2(pf[i]);
-            const float z0 = zs[k0 + i * 2];
-            const float z1 = zs[k0 + i * 2 + 1];
-            gain = fmaf(fg.x, z0, gain);
-            gain = fmaf(fg.y, z1, gain);
-            forget = fmaf(ff.x, z0, forget);
-            forget = fmaf(ff.y, z1, forget);
-        }
-#pragma unroll
-        for (int off = 4; off > 0; off >>= 1) {
-            gain += __shfl_down_sync(0xffffffffu, gain, off, 8);
-            forget += __shfl_down_sync(0xffffffffu, forget, off, 8);
-        }
-        if (k8 == 0) {
-            const float x = __bfloat162float(cur[base + d]);
-            const float value =
-                (x - tanhf(forget) * x) + tanhf(gain) * __bfloat162float(msg[base + d]);
-            values[d] = value;
-            ss = fmaf(value, value, ss);
-        }
+    for (int i = 0; i < 4; ++i) {
+        const float2 fg = __bfloat1622float2(pg[i]);
+        const float2 ff = __bfloat1622float2(pf[i]);
+        const float z0  = zs[k0 + i * 2];
+        const float z1  = zs[k0 + i * 2 + 1];
+        gain   = fmaf(fg.x, z0, gain);
+        gain   = fmaf(fg.y, z1, gain);
+        forget = fmaf(ff.x, z0, forget);
+        forget = fmaf(ff.y, z1, forget);
     }
-    const float inverse = branches.norm[c] ? rsqrtf(sum256(ss, scratch) / 2304.0f + 1e-6f) : 1.0f;
-    __syncthreads();
-    for (int d = tid; d < 2304; d += 256) {
-        float value = values[d] * inverse;
-        if (branches.norm[c]) value *= bf(branches.norm[c], d);
-        out[base + d] = __float2bfloat16_rn(value);
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+        gain += __shfl_down_sync(0xffffffffu, gain, off, 8);
+        forget += __shfl_down_sync(0xffffffffu, forget, off, 8);
+    }
+    if (k8 == 0) {
+        const auto cur_idx = (static_cast<std::int64_t>(cur_ch) * tokens + tok) * 2304 + d;
+        const auto idx     = (static_cast<std::int64_t>(ch) * tokens + tok) * 2304 + d;
+        const float x      = __bfloat162float(cur[cur_idx]);
+        const float y      = (x - tanhf(forget) * x) + tanhf(gain) * __bfloat162float(msg[idx]);
+        if (y_fp32) y_fp32[idx] = y;
+        else out[idx] = __float2bfloat16_rn(y);
     }
 }
 
 __global__ void control_inv_rms_kernel(const BF* __restrict__ cur, const BF* __restrict__ msg,
                                        float* __restrict__ inv_x, float* __restrict__ inv_m,
-                                       int tokens) {
-    const int t = static_cast<int>(blockIdx.x);
-    const int c = static_cast<int>(blockIdx.y);
-    const int tid = static_cast<int>(threadIdx.x);
-    const auto base = (static_cast<std::int64_t>(c) * tokens + t) * 2304;
+                                       int tokens, int cur_c) {
+    const int t        = static_cast<int>(blockIdx.x);
+    const int c        = static_cast<int>(blockIdx.y);
+    const int cur_c_id = cur_c == 1 ? 0 : c;
+    const int tid      = static_cast<int>(threadIdx.x);
+    const auto cur_base = (static_cast<std::int64_t>(cur_c_id) * tokens + t) * 2304;
+    const auto msg_base = (static_cast<std::int64_t>(c) * tokens + t) * 2304;
     float sx = 0.0f, sm = 0.0f;
     for (int kv = tid; kv < 288; kv += 256) {
-        const uint4 vx = load_vec<uint4>(cur + base + kv * 8);
-        const uint4 vm = load_vec<uint4>(msg + base + kv * 8);
+        const uint4 vx = load_vec<uint4>(cur + cur_base + kv * 8);
+        const uint4 vm = load_vec<uint4>(msg + msg_base + kv * 8);
         const auto* px = reinterpret_cast<const __nv_bfloat162*>(&vx);
         const auto* pm = reinterpret_cast<const __nv_bfloat162*>(&vm);
 #pragma unroll
@@ -365,7 +439,7 @@ __global__ void control_inv_rms_kernel(const BF* __restrict__ cur, const BF* __r
 __global__ __launch_bounds__(256, 2) void control_down_mma_kernel(
     const BF* __restrict__ cur, const BF* __restrict__ msg, const BF* __restrict__ down,
     const float* __restrict__ inv_x, const float* __restrict__ inv_m, float* __restrict__ z,
-    int tokens) {
+    int tokens, int cur_c) {
     constexpr int BM = 64;
     constexpr int BN = 64;
     constexpr int BK = 64;
@@ -380,6 +454,7 @@ __global__ __launch_bounds__(256, 2) void control_down_mma_kernel(
     const int lane = tid & 31;
     const int token0 = static_cast<int>(blockIdx.y) * BN;
     const int c = static_cast<int>(blockIdx.z);
+    const int cur_ch = cur_c == 1 ? 0 : c;
 
     if (tid < BN) {
         const int tt = token0 + tid;
@@ -395,7 +470,9 @@ __global__ __launch_bounds__(256, 2) void control_down_mma_kernel(
         const bool is_msg = kt >= 36;
         const int k0 = (kt - (is_msg ? 36 : 0)) * BK;
         const int down_k0 = kt * BK;
-        const BF* x_base = (is_msg ? msg : cur) + static_cast<std::int64_t>(c) * tokens * 2304;
+        const BF* x_base =
+            is_msg ? (msg + static_cast<std::int64_t>(c) * tokens * 2304)
+                   : (cur + static_cast<std::int64_t>(cur_ch) * tokens * 2304);
 #pragma unroll
         for (int it = 0; it < 2; ++it) {
             const int item = tid + it * 256;
@@ -500,7 +577,8 @@ __global__ __launch_bounds__(256, 2) void control_down_mma_kernel(
 
 __global__ __launch_bounds__(256, 2) void control_out_mma_kernel(
     const BF* __restrict__ cur, const BF* __restrict__ msg, const BF* __restrict__ gf,
-    const float* __restrict__ z, float* __restrict__ y_fp32, BF* __restrict__ out, int tokens) {
+    const float* __restrict__ z, float* __restrict__ y_fp32, BF* __restrict__ out, int tokens,
+    int cur_c) {
     constexpr int BM = 64;
     constexpr int BN = 64;
     constexpr int BK = 64;
@@ -514,6 +592,7 @@ __global__ __launch_bounds__(256, 2) void control_out_mma_kernel(
     const int d0 = static_cast<int>(blockIdx.x) * 32;
     const int token0 = static_cast<int>(blockIdx.y) * BN;
     const int c = static_cast<int>(blockIdx.z);
+    const int cur_ch = cur_c == 1 ? 0 : c;
 
 #pragma unroll
     for (int it = 0; it < 2; ++it) {
@@ -603,8 +682,9 @@ __global__ __launch_bounds__(256, 2) void control_out_mma_kernel(
         const int c1 = c0 + 1;
         auto write_elem = [&](int d, int tok, float gain, float forget) {
             if (tok < tokens) {
+                const auto cur_idx = (static_cast<std::int64_t>(cur_ch) * tokens + tok) * 2304 + d;
                 const auto idx = (static_cast<std::int64_t>(c) * tokens + tok) * 2304 + d;
-                const float x = __bfloat162float(cur[idx]);
+                const float x = __bfloat162float(cur[cur_idx]);
                 const float m = __bfloat162float(msg[idx]);
                 const float y = (x - tanhf(forget) * x) + tanhf(gain) * m;
                 if (y_fp32) y_fp32[idx] = y;
@@ -729,30 +809,30 @@ void inkling2_mix_launch(Inkling2Branches branches, const Tensor& q, Tensor& out
 void inkling2_control_launch(const Tensor& cur, const Tensor& msg, const Tensor& down,
                             const Tensor& gf, Inkling2Branches branches, Tensor& out, float* z,
                             float* inv_rms, float* y_fp32, cudaStream_t s) {
-    const int t = cur.ne[1], c = cur.ne[2];
+    const int t = msg.ne[1], c = msg.ne[2], cur_c = cur.ne[2];
+    float* inv_x = inv_rms;
+    float* inv_m = inv_rms + static_cast<std::size_t>(t) * c;
+    control_inv_rms_kernel<<<dim3(t, c), 256, 0, s>>>(
+        static_cast<const BF*>(cur.data), static_cast<const BF*>(msg.data), inv_x, inv_m, t,
+        cur_c);
     if (t >= 16) {
-        float* inv_x = inv_rms;
-        float* inv_m = inv_rms + static_cast<std::size_t>(t) * c;
-        control_inv_rms_kernel<<<dim3(t, c), 256, 0, s>>>(
-            static_cast<const BF*>(cur.data), static_cast<const BF*>(msg.data), inv_x, inv_m, t);
         control_down_mma_kernel<<<dim3(1, (t + 63) / 64, c), 256, 0, s>>>(
             static_cast<const BF*>(cur.data), static_cast<const BF*>(msg.data),
-            static_cast<const BF*>(down.data), inv_x, inv_m, z, t);
+            static_cast<const BF*>(down.data), inv_x, inv_m, z, t, cur_c);
         control_out_mma_kernel<<<dim3(2304 / 32, (t + 63) / 64, c), 256, 0, s>>>(
             static_cast<const BF*>(cur.data), static_cast<const BF*>(msg.data),
-            static_cast<const BF*>(gf.data), z, y_fp32, static_cast<BF*>(out.data), t);
-        if (y_fp32) {
-            control_post_rmsnorm_kernel<<<dim3(t, c), 256, 0, s>>>(
-                y_fp32, static_cast<BF*>(out.data), branches, t);
-        }
+            static_cast<const BF*>(gf.data), z, y_fp32, static_cast<BF*>(out.data), t, cur_c);
     } else {
-        const auto grid = static_cast<std::uint64_t>(t) * c;
-        control_down_kernel<<<grid, 256, 0, s>>>(static_cast<const BF*>(cur.data),
-                                                 static_cast<const BF*>(msg.data),
-                                                 static_cast<const BF*>(down.data), z, t);
-        control_out_kernel<<<grid, 256, 0, s>>>(
+        control_down_small_t_kernel<<<dim3(16, t, c), 128, 0, s>>>(
             static_cast<const BF*>(cur.data), static_cast<const BF*>(msg.data),
-            static_cast<const BF*>(gf.data), branches, z, static_cast<BF*>(out.data), t);
+            static_cast<const BF*>(down.data), inv_x, inv_m, z, t, cur_c);
+        control_out_small_t_kernel<<<dim3(72, t, c), 256, 0, s>>>(
+            static_cast<const BF*>(cur.data), static_cast<const BF*>(msg.data),
+            static_cast<const BF*>(gf.data), z, y_fp32, static_cast<BF*>(out.data), t, cur_c);
+    }
+    if (y_fp32) {
+        control_post_rmsnorm_kernel<<<dim3(t, c), 256, 0, s>>>(
+            y_fp32, static_cast<BF*>(out.data), branches, t);
     }
     CUDA_CHECK(cudaGetLastError());
 }

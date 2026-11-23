@@ -215,14 +215,23 @@ int moe_case(DeviceContext& ctx,bool q3,int tokens){
     std::cout<<"moe q3="<<q3<<" T="<<tokens<<" failures="<<failures<<'\n';return failures;
 }
 }
-int main(){
+int main(int argc,char** argv){
+    const std::string sel=argc>1?argv[1]:"all";
     try{
         if(cuda_unavailable())return 77;DeviceContext ctx;int failures=0;
-        failures+=rel_case(ctx,1,false);failures+=rel_case(ctx,3,true);
-        for(bool i8:{false,true})for(int count:{64,257,2049})for(int t:{1,15,16,17,64,257})if(t<=count)failures+=full_case(ctx,count,t,i8);
-        failures+=full_case(ctx,131072,1,true);
-        for(int start:{0,513,1025,2049})for(int t:{1,15,16,17,64,129,1024})failures+=swa_case(ctx,start,t);
-        for(bool q3:{false,true})for(int t:{1,3,15,16,17,64,65,256,1024})failures+=moe_case(ctx,q3,t);
+        if(sel=="all"||sel=="rel"){
+            failures+=rel_case(ctx,1,false);failures+=rel_case(ctx,3,true);
+        }
+        if(sel=="all"||sel=="full"){
+            for(bool i8:{false,true})for(int count:{64,257,2049})for(int t:{1,15,16,17,64,257})if(t<=count)failures+=full_case(ctx,count,t,i8);
+            failures+=full_case(ctx,131072,1,true);
+        }
+        if(sel=="all"||sel=="swa"){
+            for(int start:{0,513,1025,2049})for(int t:{1,15,16,17,64,129,1024})failures+=swa_case(ctx,start,t);
+        }
+        if(sel=="all"||sel=="moe"){
+            for(bool q3:{false,true})for(int t:{1,3,15,16,17,64,65,256,1024})failures+=moe_case(ctx,q3,t);
+        }
         std::cout<<"inkling2 attention/MoE failures="<<failures<<'\n';return failures?1:0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
 }

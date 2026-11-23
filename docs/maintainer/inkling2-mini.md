@@ -1,8 +1,8 @@
-# Inkling-2-Mini Model, Artifact, and Phase 1 Reference
+# Inkling-2-Mini Model, Artifact, and Optimization Reference
 
 This reference records the `inkling2_mini` native target (`inkling2-mini / q3g128`,
 `inkling2_loop`) in NInfer: model semantics, artifact and converter contract, runtime and state
-ownership, and the verified Phase 1 RTX 4060 Ti 16 GB (`sm_89`) baseline.
+ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–3 measurements.
 
 ## 1. Model Identity and Architecture
 
@@ -89,6 +89,26 @@ Conditions: `--max-ctx 131072 --kv-dtype int8 -r 1 --warmup 0`, `bench/fixtures/
 | `pp32768+tg128` | `59.21` | `1,693.18` | `28.6×` | `16.59` | `18.53` |
 
 *`ninfer-perplexity` (`profiles/perplexity/inkling2-phase1/fixture.txt`, `--context 768 --stride 256`, `3,791` scored tokens / `13` windows) measured `7.670918` (`bf16` KV, `294.8 tok/s`) and `7.664999` (`int8-g64` KV, `295.4 tok/s`).*
+
+### Phase 3 Decode Optimization (`ninfer_bench`)
+
+Conditions: `--max-ctx 131072 --kv-dtype int8 -r 1 --warmup 0`, `bench/fixtures/bench_corpus.ids` (`131,072`-max-context, `prefill_chunk = 1024`, `54.8 MiB` peak workspace, CUDA Graph decode, RTX 4060 Ti 16 GB `sm_89`). Phase 3 eliminates the small-$T$ ($T < 16$) decode bottlenecks across four components:
+
+1. **8-warp coalesced `inkling2_moe` decode (`T < 16`):** vectorized FP32 `router_kernel` (`dot_bf16x8` + `sum_warp`), 1-warp butterfly top-8 `route_kernel`, shared-`x` 8-warp `gate_up_kernel<Q3|Q4>`, and multi-row (`RowsPerCta = 4`) `down_kernel<Q3|Q4>`.
+2. **Barrier-free warp-parallel FlashDecoding (`T < 16`):** 4-channel-per-lane register online-softmax `attention_decode_kernel` for `inkling2_swa_attention` and `inkling2_full_attention` with fused zero-sink epilogue for `Swa` and `nsplits == 1`.
+3. **Multi-CTA vectorized `inkling2_loop_control` & `mix_kernel`:** `cur.ne[2] == 1` zero-copy branch broadcast (eliminating 64 D2D copies/token), `control_down_small_t_kernel` (`dim3(16, t, c)`) and `control_out_small_t_kernel` (`dim3(72, t, c)`), and `uint4`/`float4` register-accumulated `mix_kernel`.
+4. **`Q4G64_F16S` `T = 1` dispatch & pinned/penalty-skip staging:** `launch_q4_gemv_r4_w1_direct` for `k in {2304, 3072}` at `t == 1`, `PinnedHostBuffer` step staging, zero-penalty `host_counts` skip in `Executor::sample`, and single-sync `Program::decode`.
+
+| Case | Phase 2 Prefill (tok/s) | Phase 3 Prefill (tok/s) | Phase 2 Decode (tok/s) | Phase 3 Decode (tok/s) | Decode Speedup |
+|---|---:|---:|---:|---:|---:|
+| `pp512` | `1,771.39` | `1,781.74` | — | — | — |
+| `pp2048` | `1,921.90` | `1,936.37` | — | — | — |
+| `tg128` (`d=0`) | — | — | `34.68` | **`85.94`** *(11.64 ms/tok)* | **`2.48×`** |
+| `pp4096+tg128` | `1,885.36` | `1,904.42` | `22.15` | **`71.53`** | **`3.23×`** |
+| `pp16384+tg128` | `1,796.11` | `1,834.92` | `20.39` | **`65.59`** | **`3.22×`** |
+| `pp32768+tg128` | `1,693.18` | `1,726.92` | `18.53` | **`58.94`** | **`3.18×`** |
+
+*Verification: `test_inkling2_ops all`, `test_inkling2_fused`, `ninfer_linear_q4_a16_test`, `test_inkling2_state`, `test_inkling2_program`, and `test_inkling2_frontend` all passed (`0` failures); `ninfer-perplexity` (`int8-g64` KV, `profiles/perplexity/inkling2-phase1/fixture.txt`, `--context 768 --stride 256`, `3,791` scored tokens / `13` windows) measured `ppl = 7.684223` (`mean_nll = 2.039169`) at `313.4 tok/s`.*
 
 ### Local HTTP Serving Verification
 

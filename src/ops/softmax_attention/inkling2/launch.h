@@ -10,7 +10,8 @@ void full_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
 
 inline unsigned splits(unsigned keys, int tokens) {
     if (tokens >= 16) return 0u;
-    const unsigned n = (keys + 511u) / 512u;
-    return n < 256u ? n : 256u;
+    if (keys <= 256u) return 1u;
+    const unsigned n = (keys + 255u) / 256u;
+    return n < 128u ? n : 128u;
 }
 } // namespace ninfer::ops::inkling2_detail

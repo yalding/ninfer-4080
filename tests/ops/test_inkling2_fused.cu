@@ -145,16 +145,19 @@ int mixing(DeviceContext& dev, int t, int m, int r, bool norm, bool graph, float
     return check("inkling2 AttnRes", result, expected);
 }
 
-int control(DeviceContext& dev, int t, int controllers, bool norm, bool graph, bool alias) {
+int control(DeviceContext& dev, int t, int controllers, bool norm, bool graph, bool alias,
+            bool broadcast = false) {
+    const int cur_c = broadcast ? 1 : controllers;
+    const int cur_size = 2304 * t * cur_c;
     const int size = 2304 * t * controllers;
-    auto cur = values(size, 61), msg = values(size, 62);
+    auto cur = values(cur_size, 61), msg = values(size, 62);
     auto down = values(4608 * 64 * controllers, 63, .005);
     auto gf = values(64 * 2304 * 2 * controllers, 64, .01);
     auto nw = values(2304 * controllers, 65);
     auto dc = to_device_bf16(cur), dm = to_device_bf16(msg), dd = to_device_bf16(down);
     auto dg = to_device_bf16(gf), dn = to_device_bf16(nw);
     GuardedDeviceBuffer result(size * 2);
-    Tensor tc(dc.p, DType::BF16, {2304, t, controllers}), tm(dm.p, DType::BF16, {2304, t, controllers});
+    Tensor tc(dc.p, DType::BF16, {2304, t, cur_c}), tm(dm.p, DType::BF16, {2304, t, controllers});
     Tensor td(dd.p, DType::BF16, {4608, 64, controllers});
     Tensor tg(dg.p, DType::BF16, {64, 2304, 2, controllers});
     Tensor out(alias ? dc.p : result.data(), DType::BF16, {2304, t, controllers});
@@ -164,12 +167,13 @@ int control(DeviceContext& dev, int t, int controllers, bool norm, bool graph, b
     std::vector<double> expected(size);
     for (int controller = 0; controller < controllers; ++controller)
         for (int token = 0; token < t; ++token) {
-            const int base = (controller * t + token) * 2304;
-            const double ic = invnorm(cur.data() + base, 2304), im = invnorm(msg.data() + base, 2304);
+            const int cur_base = ((broadcast ? 0 : controller) * t + token) * 2304;
+            const int base     = (controller * t + token) * 2304;
+            const double ic = invnorm(cur.data() + cur_base, 2304), im = invnorm(msg.data() + base, 2304);
             double z[64]{};
             for (int r = 0; r < 64; ++r)
                 for (int d = 0; d < 2304; ++d) {
-                    z[r] += down[(controller * 64 + r) * 4608 + d] * cur[base + d] * ic;
+                    z[r] += down[(controller * 64 + r) * 4608 + d] * cur[cur_base + d] * ic;
                     z[r] += down[(controller * 64 + r) * 4608 + 2304 + d] * msg[base + d] * im;
                 }
             double ss = 0;
@@ -179,7 +183,7 @@ int control(DeviceContext& dev, int t, int controllers, bool norm, bool graph, b
                     g += gf[((controller * 2) * 2304 + d) * 64 + r] * z[r];
                     f += gf[((controller * 2 + 1) * 2304 + d) * 64 + r] * z[r];
                 }
-                const double y = cur[base + d] * (1 - std::tanh(f)) + msg[base + d] * std::tanh(g);
+                const double y = cur[cur_base + d] * (1 - std::tanh(f)) + msg[base + d] * std::tanh(g);
                 expected[base + d] = y; ss += y * y;
             }
             if (norm) for (int d = 0; d < 2304; ++d)
@@ -268,6 +272,9 @@ int main() {
         for (int t : {3, 15, 16, 17, 64, 129})
             for (int c : {1, 3}) for (bool norm : {false, true}) for (bool alias : {false, true})
                 failures += control(device, t, c, norm, true, alias);
+        for (int t : {1, 2, 15, 16, 64})
+            for (bool norm : {false, true})
+                failures += control(device, t, 3, norm, true, false, true);
         failures += control(device, 1, 1, false, false, false);
         for (bool alias : {false, true}) for (bool tau : {false, true})
             for (float scale : {0.f, 1e-5f, 5.f}) failures += clipping(device, 4, tau, alias, true, scale);

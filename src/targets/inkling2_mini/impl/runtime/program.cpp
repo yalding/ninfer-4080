@@ -806,13 +806,12 @@ PendingBatch Program::decode(std::span<const SequenceHandle> handles,
         auto input    = std::span(seq.ledger).subspan(depth);
         Tensor logits = impl_->executor.forward(input, depth, seq.slot);
         ++impl_->revision;
-        timing.begin_wait();
-        impl_->executor.sync();
-        timing.end_wait();
         pending.rows[i] = handles[i];
         pending.counts.push_back(1);
+        timing.begin_wait();
         pending.values.push_back(impl_->executor.sample(logits, seq.options.sampling,
                                                         seq.generated.size(), seq.generated));
+        timing.end_wait();
         timing.resume_submit();
     }
     impl_->observe_external();

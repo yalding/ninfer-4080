@@ -97,30 +97,28 @@ std::size_t inkling2_loop_control_workspace_capacity_bytes(int c, int lo, int hi
     const auto n = static_cast<std::size_t>(hi) * c;
     if (n > (std::numeric_limits<std::size_t>::max() - 255) / (2304 * sizeof(float)))
         throw std::overflow_error("inkling2 control workspace overflow");
-    const auto z_bytes = (n * 64 * sizeof(float) + 255) & ~std::size_t(255);
-    const auto inv_bytes =
-        hi >= 16 ? ((n * 2 * sizeof(float) + 255) & ~std::size_t(255)) : std::size_t(0);
-    const auto y_bytes =
-        hi >= 16 ? ((n * 2304 * sizeof(float) + 255) & ~std::size_t(255)) : std::size_t(0);
+    const auto z_bytes   = (n * 64 * sizeof(float) + 255) & ~std::size_t(255);
+    const auto inv_bytes = (n * 2 * sizeof(float) + 255) & ~std::size_t(255);
+    const auto y_bytes   = (n * 2304 * sizeof(float) + 255) & ~std::size_t(255);
     return z_bytes + inv_bytes + y_bytes;
 }
 
 void inkling2_loop_control(const Tensor& cur, const Tensor& msg, const Tensor& down,
                            const Tensor& gf, std::span<const Tensor> nw, Tensor& out,
                            WorkspaceArena& workspace, cudaStream_t s) {
-    const int t = cur.ne[1], c = cur.ne[2];
+    const int t = msg.ne[1], c = msg.ne[2], cur_c = cur.ne[2];
+    require((c == 1 || c == 3) && (cur_c == 1 || cur_c == c), "loop control branch count");
     const auto n = static_cast<std::size_t>(t) * c;
-    const auto z_bytes = (n * 64 * sizeof(float) + 255) & ~std::size_t(255);
-    const auto inv_bytes =
-        t >= 16 ? ((n * 2 * sizeof(float) + 255) & ~std::size_t(255)) : std::size_t(0);
+    const auto z_bytes   = (n * 64 * sizeof(float) + 255) & ~std::size_t(255);
+    const auto inv_bytes = (n * 2 * sizeof(float) + 255) & ~std::size_t(255);
     const auto y_bytes =
-        (t >= 16 && !nw.empty()) ? ((n * 2304 * sizeof(float) + 255) & ~std::size_t(255))
-                                 : std::size_t(0);
-    shape(cur, DType::BF16, {2304, t, c}); shape(msg, DType::BF16, {2304, t, c});
+        !nw.empty() ? ((n * 2304 * sizeof(float) + 255) & ~std::size_t(255)) : std::size_t(0);
+    shape(cur, DType::BF16, {2304, t, cur_c}); shape(msg, DType::BF16, {2304, t, c});
     shape(out, DType::BF16, {2304, t, c}); shape(down, DType::BF16, {4608, 64, c});
     shape(gf, DType::BF16, {64, 2304, 2, c});
     disjoint(out, down); disjoint(out, gf);
-    identical_or_disjoint(cur, out); identical_or_disjoint(msg, out);
+    if (cur_c == c) identical_or_disjoint(cur, out); else disjoint(cur, out);
+    identical_or_disjoint(msg, out);
     auto branches = norms(nw, c);
     for (const auto& weight : nw) disjoint(out, weight);
     auto scope = workspace.scope();

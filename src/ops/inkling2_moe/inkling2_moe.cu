@@ -44,73 +44,301 @@ __device__ float sum_warp(float x) {
     return x;
 }
 
-__global__ void router_kernel(const BF* x, const BF* router, float* probs, int tokens) {
-    int lane = threadIdx.x % 32, expert = blockIdx.x * 8 + threadIdx.x / 32, t = blockIdx.y;
-    float dot = 0;
-    for (int k = lane; k < 2304; k += 32)
-        dot = fmaf(__bfloat162float(x[k + 2304 * t]), __bfloat162float(router[k + 2304 * expert]),
-                   dot);
-    dot = sum_warp(dot);
-    if (lane == 0) probs[expert + 128 * t] = 1 / (1 + expf(-dot));
+__device__ __forceinline__ float moe_situ(float g, float u) {
+    return (4.0f * tanhf(g * 0.25f) / (1.0f + expf(-g))) * (25.0f * tanhf(u * 0.04f));
 }
 
+__device__ __forceinline__ float dot_bf16x8(const uint4& a, const uint4& b) {
+    const auto* ap = reinterpret_cast<const __nv_bfloat162*>(&a);
+    const auto* bp = reinterpret_cast<const __nv_bfloat162*>(&b);
+    float s = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 x = __bfloat1622float2(ap[i]);
+        const float2 y = __bfloat1622float2(bp[i]);
+        s = fmaf(x.x, y.x, s);
+        s = fmaf(x.y, y.y, s);
+    }
+    return s;
+}
+
+// 8 warps/CTA, one expert row per warp; each lane streams uint4 (8 BF16) over 9 iterations.
+__global__ void router_kernel(const BF* x, const BF* router, float* probs, int tokens) {
+    const int lane   = threadIdx.x & 31;
+    const int warp   = threadIdx.x >> 5;
+    const int expert = blockIdx.x * 8 + warp;
+    const int t      = blockIdx.y;
+    const BF* xp     = x + static_cast<std::int64_t>(t) * 2304;
+    const BF* rp     = router + static_cast<std::int64_t>(expert) * 2304;
+    float dot = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        dot += dot_bf16x8(load_vec<uint4>(xp + (i * 32 + lane) * 8),
+                          load_vec<uint4>(rp + (i * 32 + lane) * 8));
+    }
+    dot = sum_warp(dot);
+    if (lane == 0) probs[expert + 128 * t] = 1.0f / (1.0f + expf(-dot));
+}
+
+// One warp per token: parallel top-8 selection over 128 experts (4 experts per lane).
 __global__ void route_kernel(const float* probs, const float* bias, int* ids, float* alpha) {
-    int t = blockIdx.x; // finite E=128, top=8; serialized selection gives deterministic tie order.
-    if (threadIdx.x) return;
-    float sum = 0;
+    const int t    = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    float p[4];
+    float s[4];
+    bool used[4] = {};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int e = lane + 32 * j;
+        p[j] = probs[128 * t + e];
+        s[j] = p[j] + bias[e];
+    }
+    float sum = 0.0f;
+    int sel_ids[8];
+    float sel_p[8];
     for (int i = 0; i < 8; ++i) {
-        int best    = -1;
-        float score = -CUDART_INF_F;
-        for (int e = 0; e < 128; ++e) {
-            bool used = false;
-            for (int j = 0; j < i; ++j) used |= ids[8 * t + j] == e;
-            float s = probs[128 * t + e] + bias[e];
-            if (!used && (best < 0 || s > score)) {
-                best  = e;
-                score = s;
+        float best_s = -CUDART_INF_F;
+        int best_e   = 128;
+        float best_p = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int e = lane + 32 * j;
+            if (!used[j] && (s[j] > best_s || (s[j] == best_s && e < best_e))) {
+                best_s = s[j];
+                best_e = e;
+                best_p = p[j];
             }
         }
-        ids[8 * t + i] = best;
-        sum += probs[128 * t + best];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float os = __shfl_xor_sync(0xffffffffu, best_s, off);
+            const int oe   = __shfl_xor_sync(0xffffffffu, best_e, off);
+            const float op = __shfl_xor_sync(0xffffffffu, best_p, off);
+            if (os > best_s || (os == best_s && oe < best_e)) {
+                best_s = os;
+                best_e = oe;
+                best_p = op;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (lane + 32 * j == best_e) used[j] = true;
+        }
+        sel_ids[i] = best_e;
+        sel_p[i]   = best_p;
+        sum += best_p;
     }
-    for (int i = 0; i < 8; ++i)
-        alpha[8 * t + i] = 8 * probs[128 * t + ids[8 * t + i]] / (sum + 1e-20f);
+    if (lane == 0) {
+        const float inv = 8.0f / (sum + 1.0e-20f);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            ids[8 * t + i]   = sel_ids[i];
+            alpha[8 * t + i] = sel_p[i] * inv;
+        }
+    }
 }
 
+// 8 warps/CTA = 8 routed experts for one intermediate row. x[t] is staged into shared
+// memory once, then each warp decodes 3-bit/4-bit windows against it without re-reading x.
 template <bool Q3>
 __global__ void gate_up_kernel(const BF* x, Quant w, const int* ids, float* act) {
-    int lane = threadIdx.x % 32, row = blockIdx.x * 8 + threadIdx.x / 32, slot = blockIdx.y % 8,
-        t = blockIdx.y / 8;
-    if (row >= 1152) return;
-    int erow = ids[8 * t + slot] * 2304 + row;
-    float g = 0, u = 0;
-    for (int k = lane; k < 2304; k += 32) {
-        float a = __bfloat162float(x[k + 2304 * t]);
-        g       = fmaf(weight<Q3>(w, erow, k), a, g);
-        u       = fmaf(weight<Q3>(w, erow + 1152, k), a, u);
+    __shared__ __align__(16) BF x_shared[2304];
+
+    const int tid  = threadIdx.x;
+    const int t    = blockIdx.y;
+    const int row  = blockIdx.x;
+    const int slot = tid >> 5;
+    const int lane = tid & 31;
+
+    {
+        // 2304 BF16 = 288 uint4: every thread takes one, the first 32 take a second.
+        const BF* xp    = x + static_cast<std::int64_t>(t) * 2304;
+        const uint4 a   = load_vec<uint4>(xp + tid * 8);
+        store_vec(&x_shared[tid * 8], a);
+        if (tid < 32) {
+            const uint4 b = load_vec<uint4>(xp + 2048 + tid * 8);
+            store_vec(&x_shared[2048 + tid * 8], b);
+        }
     }
+    __syncthreads();
+
+    const int row_gate = ids[8 * t + slot] * 2304 + row;
+    const int row_up   = row_gate + 1152;
+    float g = 0, u = 0;
+
+    if constexpr (Q3) {
+        // 18 groups of 128; group_lane 0..1, each lane owns 8 codes (24-bit window).
+        const int group_lane = lane >> 4;
+        const int local      = lane & 15;
+#pragma unroll
+        for (int grp = 0; grp < 18; grp += 2) {
+            const int gi = grp + group_lane;
+            const unsigned char* cg =
+                w.code + static_cast<std::int64_t>(row_gate) * 864 +
+                static_cast<std::int64_t>(gi) * 48 + 3 * local;
+            const unsigned char* cu =
+                w.code + static_cast<std::int64_t>(row_up) * 864 +
+                static_cast<std::int64_t>(gi) * 48 + 3 * local;
+            const std::uint32_t wg = static_cast<std::uint32_t>(cg[0]) |
+                                     (static_cast<std::uint32_t>(cg[1]) << 8) |
+                                     (static_cast<std::uint32_t>(cg[2]) << 16);
+            const std::uint32_t wu = static_cast<std::uint32_t>(cu[0]) |
+                                     (static_cast<std::uint32_t>(cu[1]) << 8) |
+                                     (static_cast<std::uint32_t>(cu[2]) << 16);
+            const float sg = __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
+                &w.scale[static_cast<std::int64_t>(row_gate) * 18 + gi])));
+            const float su = __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
+                &w.scale[static_cast<std::int64_t>(row_up) * 18 + gi])));
+            float gw[8], uw[8];
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                gw[c] = static_cast<float>(detail::q3_signed_code((wg >> (3 * c)) & 7u)) * sg;
+                uw[c] = static_cast<float>(detail::q3_signed_code((wu >> (3 * c)) & 7u)) * su;
+            }
+            const uint4 xv = load_vec<uint4>(&x_shared[gi * 128 + 8 * local]);
+            const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&xv);
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const float2 xa = __bfloat1622float2(xb[c]);
+                g = fmaf(gw[2 * c], xa.x, g);
+                g = fmaf(gw[2 * c + 1], xa.y, g);
+                u = fmaf(uw[2 * c], xa.x, u);
+                u = fmaf(uw[2 * c + 1], xa.y, u);
+            }
+        }
+    } else {
+        // 36 groups of 64; lane_group 0..3, each lane owns 8 codes (uint32 window).
+        const int lane_group    = lane >> 3;
+        const int lane_in_group = lane & 7;
+#pragma unroll
+        for (int grp = 0; grp < 36; grp += 4) {
+            const int gi = grp + lane_group;
+            const std::uint32_t wg = *reinterpret_cast<const std::uint32_t*>(
+                w.code + static_cast<std::int64_t>(row_gate) * 1152 +
+                static_cast<std::int64_t>(gi) * 32 + 4 * lane_in_group);
+            const std::uint32_t wu = *reinterpret_cast<const std::uint32_t*>(
+                w.code + static_cast<std::int64_t>(row_up) * 1152 +
+                static_cast<std::int64_t>(gi) * 32 + 4 * lane_in_group);
+            const std::uint16_t sg = *reinterpret_cast<const std::uint16_t*>(
+                &w.scale[static_cast<std::int64_t>(row_gate) * 36 + gi]);
+            const std::uint16_t su = *reinterpret_cast<const std::uint16_t*>(
+                &w.scale[static_cast<std::int64_t>(row_up) * 36 + gi]);
+            float gw[8], uw[8];
+            detail::Q4SimtDecodeAtom::decode_eight(wg, sg, gw);
+            detail::Q4SimtDecodeAtom::decode_eight(wu, su, uw);
+            const uint4 xv = load_vec<uint4>(&x_shared[gi * 64 + 8 * lane_in_group]);
+            const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&xv);
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const float2 xa = __bfloat1622float2(xb[c]);
+                g = fmaf(gw[2 * c], xa.x, g);
+                g = fmaf(gw[2 * c + 1], xa.y, g);
+                u = fmaf(uw[2 * c], xa.x, u);
+                u = fmaf(uw[2 * c + 1], xa.y, u);
+            }
+        }
+    }
+
     g = sum_warp(g);
     u = sum_warp(u);
-    if (lane == 0)
-        act[row + 1152 * (slot + 8 * t)] =
-            (4 * tanhf(g * 0.25f) / (1 + expf(-g))) * (25 * tanhf(u * 0.04f));
+    if (lane == 0) act[row + 1152 * (slot + 8 * t)] = moe_situ(g, u);
 }
 
-template <bool Q3>
+// 8 warps/CTA = 8 routed experts; each warp owns RowsPerCta adjacent output rows and reuses
+// its act window across all of them. Final 8-slot combine happens in shared memory.
+template <bool Q3, int RowsPerCta>
 __global__ void down_kernel(Quant w, const int* ids, const float* alpha, const float* act,
                             BF* out) {
-    int lane = threadIdx.x % 32, row = blockIdx.x * 8 + threadIdx.x / 32, t = blockIdx.y;
-    if (row >= 2304) return;
-    float total = 0;
-    for (int slot = 0; slot < 8; ++slot) {
-        int erow  = ids[8 * t + slot] * 2304 + row;
-        float dot = 0;
-        for (int k = lane; k < 1152; k += 32)
-            dot = fmaf(weight<Q3>(w, erow, k), act[k + 1152 * (slot + 8 * t)], dot);
-        dot = sum_warp(dot);
-        if (lane == 0) total = fmaf(dot, alpha[8 * t + slot], total);
+    __shared__ float paths[8][RowsPerCta];
+
+    const int tid     = threadIdx.x;
+    const int t       = blockIdx.y;
+    const int slot    = tid >> 5;
+    const int lane    = tid & 31;
+    const int expert  = ids[8 * t + slot];
+    const float a     = alpha[8 * t + slot];
+    const float* act_s = act + 1152 * (slot + 8 * t);
+    float dot[RowsPerCta] = {};
+
+    if constexpr (Q3) {
+        // K = 1152 = 9 groups of 128: paired steps g = 0,2,4,6 plus solo group 8.
+        const int group_lane = lane >> 4;
+        const int local      = lane & 15;
+#pragma unroll
+        for (int grp = 0; grp < 9; grp += 2) {
+            const int gi = grp + group_lane;
+            if (gi < 9) {
+                float xv[8];
+                const float4 f0 = *reinterpret_cast<const float4*>(act_s + gi * 128 + 8 * local);
+                const float4 f1 = *reinterpret_cast<const float4*>(act_s + gi * 128 + 8 * local + 4);
+                xv[0] = f0.x; xv[1] = f0.y; xv[2] = f0.z; xv[3] = f0.w;
+                xv[4] = f1.x; xv[5] = f1.y; xv[6] = f1.z; xv[7] = f1.w;
+#pragma unroll
+                for (int r = 0; r < RowsPerCta; ++r) {
+                    const int erow = expert * 2304 + blockIdx.x * RowsPerCta + r;
+                    const unsigned char* c =
+                        w.code + static_cast<std::int64_t>(erow) * 432 +
+                        static_cast<std::int64_t>(gi) * 48 + 3 * local;
+                    const std::uint32_t w3 = static_cast<std::uint32_t>(c[0]) |
+                                             (static_cast<std::uint32_t>(c[1]) << 8) |
+                                             (static_cast<std::uint32_t>(c[2]) << 16);
+                    const float sc = __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
+                        &w.scale[static_cast<std::int64_t>(erow) * 9 + gi])));
+#pragma unroll
+                    for (int c2 = 0; c2 < 8; ++c2)
+                        dot[r] = fmaf(static_cast<float>(detail::q3_signed_code((w3 >> (3 * c2)) & 7u)) * sc,
+                                      xv[c2], dot[r]);
+                }
+            }
+        }
+    } else {
+        // K = 1152 = 18 groups of 64: quad steps g = 0,4,8,12 plus final pair 16,17.
+        const int lane_group    = lane >> 3;
+        const int lane_in_group = lane & 7;
+#pragma unroll
+        for (int grp = 0; grp < 18; grp += 4) {
+            const int gi = grp + lane_group;
+            if (gi < 18) {
+                float xv[8];
+                const float4 f0 = *reinterpret_cast<const float4*>(act_s + gi * 64 + 8 * lane_in_group);
+                const float4 f1 = *reinterpret_cast<const float4*>(act_s + gi * 64 + 8 * lane_in_group + 4);
+                xv[0] = f0.x; xv[1] = f0.y; xv[2] = f0.z; xv[3] = f0.w;
+                xv[4] = f1.x; xv[5] = f1.y; xv[6] = f1.z; xv[7] = f1.w;
+#pragma unroll
+                for (int r = 0; r < RowsPerCta; ++r) {
+                    const int erow = expert * 2304 + blockIdx.x * RowsPerCta + r;
+                    const std::uint32_t w4 = *reinterpret_cast<const std::uint32_t*>(
+                        w.code + static_cast<std::int64_t>(erow) * 576 +
+                        static_cast<std::int64_t>(gi) * 32 + 4 * lane_in_group);
+                    const std::uint16_t sb = *reinterpret_cast<const std::uint16_t*>(
+                        &w.scale[static_cast<std::int64_t>(erow) * 18 + gi]);
+                    float ww[8];
+                    detail::Q4SimtDecodeAtom::decode_eight(w4, sb, ww);
+#pragma unroll
+                    for (int c2 = 0; c2 < 8; ++c2)
+                        dot[r] = fmaf(ww[c2], xv[c2], dot[r]);
+                }
+            }
+        }
     }
-    if (lane == 0) out[row + 2304 * t] = __float2bfloat16_rn(total);
+
+    float dot_r[RowsPerCta];
+#pragma unroll
+    for (int r = 0; r < RowsPerCta; ++r)
+        dot_r[r] = sum_warp(dot[r]);
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < RowsPerCta; ++r)
+            paths[slot][r] = a * dot_r[r];
+    }
+    __syncthreads();
+    if (tid < RowsPerCta) {
+        float s = 0;
+#pragma unroll
+        for (int s2 = 0; s2 < 8; ++s2)
+            s += paths[s2][tid];
+        out[blockIdx.x * RowsPerCta + tid + 2304 * t] = __float2bfloat16_rn(s);
+    }
 }
 
 Quant quant(const Weight& w) {
@@ -124,29 +352,23 @@ void moe_launch(const Tensor& x, const Inkling2MoeWeights& w, Tensor& out, float
     router_kernel<<<dim3(16, t), 256, 0, s>>>(input, static_cast<const BF*>(w.router.qdata), probs,
                                               t);
     CUDA_CHECK(cudaGetLastError());
-    route_kernel<<<t, 1, 0, s>>>(probs, static_cast<const float*>(w.exp_probs_bias.qdata), ids,
-                                 alpha);
+    route_kernel<<<t, 32, 0, s>>>(probs, static_cast<const float*>(w.exp_probs_bias.qdata), ids,
+                                  alpha);
     CUDA_CHECK(cudaGetLastError());
     if (w.routed_gate_up.qtype == QType::Q3G128_F16S) {
-        gate_up_kernel<true>
-            <<<dim3(144, t * 8), 256, 0, s>>>(input, quant(w.routed_gate_up), ids, act);
-        down_kernel<true><<<dim3(288, t), 256, 0, s>>>(quant(w.routed_down), ids, alpha, act,
-                                                       static_cast<BF*>(out.data));
+        gate_up_kernel<true><<<dim3(1152, t), 256, 0, s>>>(input, quant(w.routed_gate_up), ids, act);
+        down_kernel<true, 4><<<dim3(576, t), 256, 0, s>>>(quant(w.routed_down), ids, alpha, act,
+                                                           static_cast<BF*>(out.data));
     } else {
-        gate_up_kernel<false>
-            <<<dim3(144, t * 8), 256, 0, s>>>(input, quant(w.routed_gate_up), ids, act);
-        down_kernel<false><<<dim3(288, t), 256, 0, s>>>(quant(w.routed_down), ids, alpha, act,
-                                                        static_cast<BF*>(out.data));
+        gate_up_kernel<false><<<dim3(1152, t), 256, 0, s>>>(input, quant(w.routed_gate_up), ids, act);
+        down_kernel<false, 4><<<dim3(576, t), 256, 0, s>>>(quant(w.routed_down), ids, alpha, act,
+                                                            static_cast<BF*>(out.data));
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 __device__ __forceinline__ int moe_swz128(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
-}
-
-__device__ __forceinline__ float moe_situ(float g, float u) {
-    return (4.0f * tanhf(g * 0.25f) / (1.0f + expf(-g))) * (25.0f * tanhf(u * 0.04f));
 }
 
 __global__ __launch_bounds__(256, 2) void inkling2_moe_router_mma_kernel(

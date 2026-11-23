@@ -7,6 +7,7 @@
 
 namespace ninfer::targets::inkling2_mini::detail {
 inline constexpr std::size_t kPhysicalLayers = 24;
+inline constexpr std::size_t kMtpLayers      = 3;
 
 inline constexpr bool is_full_attention_layer(std::size_t i) noexcept { return i % 6 == 5; }
 
@@ -43,6 +44,36 @@ struct LayerPlan {
     artifact::ObjectHandle loop_ctrl_gain_forget;
 };
 
+struct MtpLayerPlan {
+    artifact::ObjectHandle dflare_norm;
+    artifact::ObjectHandle input_norm;
+    artifact::ObjectHandle post_attention_norm;
+    artifact::ObjectHandle q_norm;
+    artifact::ObjectHandle k_norm;
+    artifact::ObjectHandle k_norm_ctx;
+    artifact::ObjectHandle q;
+    artifact::ObjectHandle k;
+    artifact::ObjectHandle v;
+    artifact::ObjectHandle k_ctx;
+    artifact::ObjectHandle v_ctx;
+    artifact::ObjectHandle output;
+    artifact::ObjectHandle gate_up;
+    artifact::ObjectHandle down;
+};
+
+struct MtpPlan {
+    artifact::ObjectHandle fuse_weight;
+    artifact::ObjectHandle mask_embed;
+    artifact::ObjectHandle final_norm;
+    std::array<MtpLayerPlan, kMtpLayers> layers;
+    artifact::ObjectHandle markov_dflare_norm;
+    artifact::ObjectHandle markov_w1;
+    artifact::ObjectHandle markov_rnn_proj_weight;
+    artifact::ObjectHandle markov_rnn_proj_bias;
+    artifact::ObjectHandle markov_hidden_out_weight;
+    artifact::ObjectHandle markov_hidden_out_bias;
+};
+
 struct BindingPlan {
     FrontendResourcePlan frontend;
     artifact::ObjectHandle token_embedding;
@@ -51,6 +82,8 @@ struct BindingPlan {
     artifact::ObjectHandle output_res_query;
     artifact::ObjectHandle final_norm;
     artifact::ObjectHandle output_head;
+    bool has_mtp = false;
+    MtpPlan mtp;
 };
 
 struct ArtifactLoadPlan {
@@ -90,6 +123,36 @@ struct LayerWeights {
     Tensor loop_ctrl_gain_forget;
 };
 
+struct MtpLayerWeights {
+    Tensor dflare_norm;
+    Tensor input_norm;
+    Tensor post_attention_norm;
+    Tensor q_norm;
+    Tensor k_norm;
+    Tensor k_norm_ctx;
+    Weight q;
+    Weight k;
+    Weight v;
+    Weight k_ctx;
+    Weight v_ctx;
+    Weight output;
+    Weight gate_up;
+    Weight down;
+};
+
+struct MtpWeights {
+    Tensor fuse_weight;
+    Tensor mask_embed;
+    Tensor final_norm;
+    std::array<MtpLayerWeights, kMtpLayers> layers;
+    Tensor markov_dflare_norm;
+    Tensor markov_w1;
+    Tensor markov_rnn_proj_weight;
+    Tensor markov_rnn_proj_bias;
+    Tensor markov_hidden_out_weight;
+    Tensor markov_hidden_out_bias;
+};
+
 struct RuntimeModelView {
     const DeviceArena* weights_arena = nullptr;
     Weight token_embedding;
@@ -98,9 +161,11 @@ struct RuntimeModelView {
     Tensor output_res_query;
     Tensor final_norm;
     Weight output_head;
+    bool has_mtp = false;
+    MtpWeights mtp;
 };
 
-[[nodiscard]] ArtifactLoadPlan bind_artifact(artifact::Binder& binder);
+[[nodiscard]] ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp = false);
 [[nodiscard]] RuntimeModelView materialize_model(artifact::MaterializedArtifact& materialized,
                                                  const BindingPlan& plan);
 } // namespace ninfer::targets::inkling2_mini::detail

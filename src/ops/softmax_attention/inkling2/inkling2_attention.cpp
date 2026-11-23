@@ -69,7 +69,9 @@ void inkling2_swa_attention(const Tensor& q, const Tensor& k, const Tensor& v, c
 std::size_t inkling2_full_attention_workspace_capacity_bytes(KvCacheStorage storage,
                                                              std::uint32_t keys, std::int32_t lo,
                                                              std::int32_t hi) {
-    if ((storage != KvCacheStorage::BFloat16 && storage != KvCacheStorage::Int8Group64) ||
+    if ((storage != KvCacheStorage::BFloat16 && storage != KvCacheStorage::Int8Group64 &&
+         storage != KvCacheStorage::RK4V4E8 &&
+         storage != KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) ||
         keys == 0 || keys > static_cast<unsigned>(std::numeric_limits<int>::max()) || lo <= 0 ||
         hi < lo)
         throw std::invalid_argument("inkling2_full_attention: workspace envelope");
@@ -99,9 +101,14 @@ void inkling2_full_attention(const Tensor& q, const Tensor& gate, const Tensor& 
     if (cache.storage == KvCacheStorage::BFloat16) {
         plane(cache.k_pages, DType::BF16, 128, 8, pages);
         plane(cache.v_pages, DType::FP16, 128, 8, pages);
-    } else {
+    } else if (cache.storage == KvCacheStorage::Int8Group64) {
         plane(cache.k_pages, DType::I8, 128, 8, pages);
         plane(cache.v_pages, DType::I8, 128, 8, pages);
+        plane(cache.k_scale_pages, DType::FP16, 2, 8, pages);
+        plane(cache.v_scale_pages, DType::FP16, 2, 8, pages);
+    } else {
+        plane(cache.k_pages, DType::U8, 64, 8, pages);
+        plane(cache.v_pages, DType::U8, 64, 8, pages);
         plane(cache.k_scale_pages, DType::FP16, 2, 8, pages);
         plane(cache.v_scale_pages, DType::FP16, 2, 8, pages);
     }
@@ -109,5 +116,63 @@ void inkling2_full_attention(const Tensor& q, const Tensor& gate, const Tensor& 
     float* scratch_ptr =
         bytes > 0 ? static_cast<float*>(workspace.alloc_bytes(bytes).data) : nullptr;
     inkling2_detail::full_launch(q, gate, rel, pos, cache, keys, scratch_ptr, out, stream);
+}
+
+void inkling2_dspark_swa_attention(const Tensor& q, const Tensor& block_k, const Tensor& block_v,
+                                   std::uint32_t context_keys,
+                                   const CyclicKVCacheLayerView& cache, std::int32_t lane,
+                                   Tensor& out, cudaStream_t stream) {
+    const int t = q.ne[2];
+    if (t <= 0 || t > 8)
+        throw std::invalid_argument("inkling2_dspark_swa_attention: T must be in [1, 8]");
+    shape(q, DType::BF16, 128, 24, t);
+    shape(out, DType::BF16, 128, 24, t);
+    shape(block_k, DType::BF16, 128, 8, t);
+    shape(block_v, DType::BF16, 128, 8, t);
+    if (cache.capacity != 1024 || cache.padded_capacity < 1024 || cache.head_dim != 128 ||
+        cache.num_kv_heads != 8 || lane < 0 || lane >= cache.lane_capacity)
+        throw std::invalid_argument("inkling2_dspark_swa_attention: cache geometry");
+    shape(cache.k, DType::BF16, 128, cache.padded_capacity, 8, cache.lane_capacity);
+    shape(cache.v, DType::FP16, 128, cache.padded_capacity, 8, cache.lane_capacity);
+    inkling2_detail::dspark_swa_launch(q, block_k, block_v, context_keys, cache, lane, out, stream);
+}
+
+void inkling2_dspark_full_attention(const Tensor& q, const Tensor& block_k, const Tensor& block_v,
+                                    const PagedKVLayerView& cache, std::uint32_t context_keys,
+                                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+    const int t = q.ne[2];
+    if (t <= 0 || t > 8)
+        throw std::invalid_argument("inkling2_dspark_full_attention: T must be in [1, 8]");
+    shape(q, DType::BF16, 128, 24, t);
+    shape(out, DType::BF16, 128, 24, t);
+    shape(block_k, DType::BF16, 128, 8, t);
+    shape(block_v, DType::BF16, 128, 8, t);
+    if (cache.head_dim != 128 || cache.num_kv_heads != 8)
+        throw std::invalid_argument("inkling2_dspark_full_attention: cache geometry");
+    if (context_keys > 0) {
+        shape(cache.block_table, DType::I32, cache.block_table.ne[0]);
+        if ((context_keys + 63) / 64 > static_cast<unsigned>(cache.block_table.ne[0]))
+            throw std::invalid_argument("inkling2_dspark_full_attention: table envelope");
+        const int pages = cache.k_pages.ne[3];
+        if (cache.storage == KvCacheStorage::BFloat16) {
+            plane(cache.k_pages, DType::BF16, 128, 8, pages);
+            plane(cache.v_pages, DType::FP16, 128, 8, pages);
+        } else if (cache.storage == KvCacheStorage::Int8Group64) {
+            plane(cache.k_pages, DType::I8, 128, 8, pages);
+            plane(cache.v_pages, DType::I8, 128, 8, pages);
+            plane(cache.k_scale_pages, DType::FP16, 2, 8, pages);
+            plane(cache.v_scale_pages, DType::FP16, 2, 8, pages);
+        } else {
+            plane(cache.k_pages, DType::U8, 64, 8, pages);
+            plane(cache.v_pages, DType::U8, 64, 8, pages);
+            plane(cache.k_scale_pages, DType::FP16, 2, 8, pages);
+            plane(cache.v_scale_pages, DType::FP16, 2, 8, pages);
+        }
+    }
+    const auto keys_env = std::max<std::uint32_t>(1, context_keys);
+    const auto bytes    = inkling2_full_attention_workspace_capacity_bytes(cache.storage, keys_env, t, t);
+    auto scope          = workspace.scope();
+    float* scratch_ptr  = context_keys > 0 ? static_cast<float*>(workspace.alloc_bytes(bytes).data) : nullptr;
+    inkling2_detail::dspark_full_launch(q, block_k, block_v, cache, context_keys, scratch_ptr, out, stream);
 }
 } // namespace ninfer::ops

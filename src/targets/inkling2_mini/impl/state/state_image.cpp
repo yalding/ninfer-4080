@@ -33,21 +33,30 @@ std::uint32_t state_slot_count(const EngineOptions& options) {
 
 StateLayout plan_state(const EngineOptions& options, std::uint32_t kv_tokens) {
     if (options.kv_cache != KvCacheStorage::BFloat16 &&
-        options.kv_cache != KvCacheStorage::Int8Group64)
-        throw std::invalid_argument("Inkling-2 supports --kv-dtype bf16 or int8");
+        options.kv_cache != KvCacheStorage::Int8Group64 &&
+        options.kv_cache != KvCacheStorage::RK4V4E8 &&
+        options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueGroup64)
+        throw std::invalid_argument("Inkling-2 supports --kv-dtype bf16, int8, or rk4v4-e8");
     if (!kv_tokens || !options.max_context || options.max_context > 131072)
         throw std::invalid_argument("Inkling-2 context must be in [1,131072]");
-    const auto slots   = state_slot_count(options);
-    const auto storage = paged_kv_storage_layout(options.kv_cache, 128);
+    const auto slots       = state_slot_count(options);
+    const auto storage     = paged_kv_storage_layout(options.kv_cache, 128);
+    const bool has_dspark  = options.speculative.backend != SpeculativeBackend::None;
+    const int full_layers  = has_dspark ? 9 : 8;
+    const int swa_layers   = has_dspark ? 42 : 40;
     DeviceKVPagePoolSpec spec;
     // One private partial page per state slot avoids capacity loss when a shared endpoint forks.
     spec.page_group_count = (kv_tokens + 63) / 64 + slots;
-    for (int layer = 0; layer < 8; ++layer) {
-        spec.geometry.planes.push_back({storage.key.data_dtype, 128, 8, 256});
-        spec.geometry.planes.push_back({storage.value.data_dtype, 128, 8, 256});
+    for (int layer = 0; layer < full_layers; ++layer) {
+        spec.geometry.planes.push_back(
+            {storage.key.data_dtype, storage.key.data_leading_extent, 8, 256});
+        spec.geometry.planes.push_back(
+            {storage.value.data_dtype, storage.value.data_leading_extent, 8, 256});
         if (storage.key.has_scale()) {
-            spec.geometry.planes.push_back({DType::FP16, 2, 8, 256});
-            spec.geometry.planes.push_back({DType::FP16, 2, 8, 256});
+            spec.geometry.planes.push_back(
+                {storage.key.scale_dtype, storage.key.scale_leading_extent, 8, 256});
+            spec.geometry.planes.push_back(
+                {storage.value.scale_dtype, storage.value.scale_leading_extent, 8, 256});
         }
     }
     LayoutBuilder builder;
@@ -55,7 +64,8 @@ StateLayout plan_state(const EngineOptions& options, std::uint32_t kv_tokens) {
     out.pages  = plan_device_kv_page_pool(builder, spec);
     out.tables = plan_kv_execution_tables(
         builder, {(options.max_context + 63) / 64, static_cast<int>(slots)});
-    out.cyclic      = plan_cyclic_kv_cache(builder, 40, 1024, 8, 128, static_cast<int>(slots));
+    out.cyclic =
+        plan_cyclic_kv_cache(builder, swa_layers, 1024, 8, 128, static_cast<int>(slots));
     out.convolution = builder.add_tensor(DType::BF16, {kConvElements, 48, static_cast<int>(slots)},
                                          256, "Inkling convolution states");
     out.bytes       = builder.finish(256);
@@ -63,7 +73,9 @@ StateLayout plan_state(const EngineOptions& options, std::uint32_t kv_tokens) {
 }
 
 StateImage::StateImage(const EngineOptions& options, std::uint32_t tokens)
-    : layout_(plan_state(options, tokens)), backing_(layout_.bytes),
+    : has_dspark_(options.speculative.backend != SpeculativeBackend::None),
+      full_layers_(has_dspark_ ? 9 : 8), swa_layers_(has_dspark_ ? 42 : 40),
+      layout_(plan_state(options, tokens)), backing_(layout_.bytes),
       pages_({backing_.p, backing_.bytes}, layout_.pages),
       tables_({backing_.p, backing_.bytes}, layout_.tables, pages_),
       cyclic_({backing_.p, backing_.bytes}, layout_.cyclic),
@@ -90,7 +102,8 @@ void StateImage::reset(std::uint32_t slot, cudaStream_t stream) {
     auto& state = slots_.at(slot);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     state.pages.clear();
-    state.depth = 0;
+    state.depth        = 0;
+    state.dspark_depth = 0;
     auto* conv  = static_cast<std::byte*>(convolution_.data) + convolution_.nb[2] * slot;
     CUDA_CHECK(cudaMemsetAsync(conv, 0, kConvElements * 48ULL * 2, stream));
     // Old ring cells are not visible at frontier zero; causal reads establish their validity.
@@ -112,6 +125,7 @@ void StateImage::copy(std::uint32_t source, std::uint32_t destination, cudaStrea
     const auto begin = Clock::now();
     dst.pages        = src.pages;
     dst.depth        = src.depth;
+    dst.dspark_depth = src.dspark_depth;
     const auto bytes = std::size_t(kConvElements) * 48 * 2;
     CUDA_CHECK(cudaMemcpyAsync(
         static_cast<std::byte*>(convolution_.data) + convolution_.nb[2] * destination,
@@ -169,11 +183,17 @@ Tensor StateImage::convolution(std::uint32_t slot, int visit, int component) con
     return Tensor(ptr, DType::BF16, {kChannels[component], 3});
 }
 
+Tensor StateImage::slot_convolution(std::uint32_t slot) const {
+    if (slot >= slots_.size()) throw std::out_of_range("Inkling convolution slot index");
+    return Tensor(static_cast<std::byte*>(convolution_.data) + slot * convolution_.nb[2],
+                  DType::BF16, {kConvElements, 48});
+}
+
 CyclicKVCacheLayerView StateImage::swa(int layer) const { return cyclic_.layer_view(layer); }
 
 PagedKVLayerView StateImage::full(std::uint32_t slot, int layer) const {
-    if (layer < 0 || layer >= 8) throw std::out_of_range("Inkling full attention layer");
-    const auto n    = storage_ == KvCacheStorage::Int8Group64 ? 4 : 2;
+    if (layer < 0 || layer >= full_layers_) throw std::out_of_range("Inkling full attention layer");
+    const auto n    = kv_storage_is_int8_family(storage_) ? 4 : 2;
     const auto base = layer * n;
     PagedKVLayerView view;
     view.k_pages = pages_.plane(base);
@@ -187,6 +207,32 @@ PagedKVLayerView StateImage::full(std::uint32_t slot, int layer) const {
     view.num_kv_heads = 8;
     view.storage      = storage_;
     return view;
+}
+
+CyclicKVCacheLayerView StateImage::dspark_swa(int layer) const {
+    if (!has_dspark_ || layer < 0 || layer >= 2)
+        throw std::out_of_range("Inkling DSpark SWA layer");
+    return cyclic_.layer_view(40 + layer);
+}
+
+PagedKVLayerView StateImage::dspark_full(std::uint32_t slot) const {
+    if (!has_dspark_) throw std::out_of_range("Inkling DSpark full layer unavailable");
+    return full(slot, 8);
+}
+
+std::uint32_t StateImage::dspark_depth(std::uint32_t slot) const {
+    return slots_.at(slot).dspark_depth;
+}
+
+void StateImage::commit_dspark_append(std::uint32_t slot, std::uint32_t depth) {
+    slots_.at(slot).dspark_depth = depth;
+}
+
+std::size_t StateImage::dflash_kv_bytes() const noexcept {
+    if (!has_dspark_) return 0;
+    const std::size_t paged = layout_.pages.payload_bytes() / static_cast<std::size_t>(full_layers_);
+    const std::size_t swa   = 2ULL * 2 * 128 * 1024 * 8 * 2 * slots_.size();
+    return paged + swa;
 }
 
 std::uint32_t StateImage::depth(std::uint32_t slot) const { return slots_.at(slot).depth; }
@@ -250,7 +296,7 @@ std::shared_ptr<HostStateImage> StateImage::snapshot_to_host(std::uint32_t slot,
     if (!allocation) throw std::runtime_error("Inkling host KV capacity exhausted");
     const auto conv_bytes = std::size_t(kConvElements) * 48 * 2;
     const auto ring_bytes = std::size_t(128) * 1024 * 8 * 2;
-    auto image            = std::make_shared<HostStateImage>(conv_bytes + 40 * 2 * ring_bytes);
+    auto image            = std::make_shared<HostStateImage>(conv_bytes + static_cast<std::size_t>(swa_layers_) * 2 * ring_bytes);
     image->pages          = std::move(*allocation);
     image->depth          = state.depth;
     auto* fixed           = static_cast<std::byte*>(image->fixed.data());
@@ -259,7 +305,7 @@ std::shared_ptr<HostStateImage> StateImage::snapshot_to_host(std::uint32_t slot,
         fixed, static_cast<std::byte*>(convolution_.data) + slot * convolution_.nb[2], conv_bytes,
         cudaMemcpyDeviceToHost, stream));
     std::size_t offset = conv_bytes;
-    for (int layer = 0; layer < 40; ++layer) {
+    for (int layer = 0; layer < swa_layers_; ++layer) {
         const auto ring = cyclic_.layer_view(layer);
         for (const auto* plane : {&ring.k, &ring.v}) {
             CUDA_CHECK(cudaMemcpyAsync(fixed + offset,
@@ -318,7 +364,7 @@ void StateImage::restore_from_host(std::uint32_t slot, const HostStateImage& ima
         cudaMemcpyAsync(static_cast<std::byte*>(convolution_.data) + slot * convolution_.nb[2],
                         fixed, conv_bytes, cudaMemcpyHostToDevice, stream));
     std::size_t offset = conv_bytes;
-    for (int layer = 0; layer < 40; ++layer) {
+    for (int layer = 0; layer < swa_layers_; ++layer) {
         const auto ring = cyclic_.layer_view(layer);
         for (const auto* plane : {&ring.k, &ring.v}) {
             CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(plane->data) + slot * plane->nb[3],

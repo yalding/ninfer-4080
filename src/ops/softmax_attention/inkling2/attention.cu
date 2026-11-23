@@ -4,12 +4,15 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/kv_cache/int8_g64_codec.cuh"
 #include "core/device.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 namespace ninfer::ops::inkling2_detail {
 using BF = __nv_bfloat16;
+
+enum class KvMode { BF16, I8, RK4 };
 
 struct Plane {
     const char* p;
@@ -31,42 +34,83 @@ struct Cache {
     int lane;
 };
 
-// Barrier-free warp-parallel FlashDecoding for single-token / small-T decode.
-// Each lane owns four channels (32 * 4 = 128 = D) and each warp strides the key
-// range with its own register online-softmax state, so the key loop has no
-// barriers. A single end-of-CTA merge combines the warp partials (and the
-// zero-valued sink when no split reduction follows).
-template <bool Swa, bool I8, int NumWarps>
+// Barrier-free warp-parallel GQA-grouped (3:1) FlashDecoding for single-token / small-T decode.
+// Each CTA owns one KV head `kh in [0..7]` and up to `Tq` query tokens, loading each K and V
+// vector once per warp and updating all 3 GQA query heads (and `Tq` tokens) in registers.
+template <bool Swa, KvMode Mode, int NumWarps, int Tq>
 __global__ __launch_bounds__(NumWarps * 32)
     void attention_decode_kernel(const BF* __restrict__ q, const BF* __restrict__ ck,
                                  const BF* __restrict__ cv, const BF* __restrict__ gate,
                                  const float* __restrict__ rel, const int* __restrict__ pos,
-                                 Cache cache, int nsplits, int partition, float* __restrict__ parts,
-                                 BF* __restrict__ output) {
+                                 Cache cache, int tokens, int nsplits, int partition,
+                                 float* __restrict__ parts, BF* __restrict__ output) {
     constexpr int D = 128;
     constexpr float Scale = 0.08838834764831844f;
 
-    const int h = blockIdx.x % 24, t = blockIdx.x / 24, split = Swa ? 0 : blockIdx.y;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int d0   = lane * 4, kh = h / 3;
-    const int qp   = pos[t], first = pos[0];
-    const int lo   = Swa ? max(0, qp - 1023) : split * partition;
-    const int hi   = Swa ? qp + 1 : min(qp + 1, lo + partition);
+    const int kh    = blockIdx.x & 7;
+    const int t0    = (blockIdx.x >> 3) * Tq;
+    const int split = Swa ? 0 : blockIdx.y;
+    const int warp  = threadIdx.x >> 5;
+    const int lane  = threadIdx.x & 31;
+    const int d0    = lane * 4;
+    const int first = pos[0];
 
-    const float* rel_row = rel + 1025 * (h + 24 * t);
-    const float far_rel   = rel_row[1024];
+    int qp[Tq];
+    float far_rel[Tq][3];
+    const float* rel_row[Tq][3];
+    float qf[Tq][3][4];
+    float acc[Tq][3][4];
+    float den[Tq][3];
+    float maximum[Tq][3];
 
-    const uint2 qb = load_vec<uint2>(q + d0 + 128 * (h + 24 * t));
-    const auto* q2  = reinterpret_cast<const __nv_bfloat162*>(&qb);
-    const float2 qa = __bfloat1622float2(q2[0]);
-    const float2 qbb = __bfloat1622float2(q2[1]);
-    const float qf[4] = {qa.x, qa.y, qbb.x, qbb.y};
+#pragma unroll
+    for (int qt = 0; qt < Tq; ++qt) {
+        const int t = t0 + qt;
+        const bool valid_t = t < tokens;
+        qp[qt] = valid_t ? pos[t] : pos[tokens - 1];
+#pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            const int h = 3 * kh + g;
+            if (valid_t) {
+                rel_row[qt][g] = rel + static_cast<std::int64_t>(1025) * (h + 24 * t);
+                far_rel[qt][g] = rel_row[qt][g][1024];
+                const BF* q_ptr = q + static_cast<std::int64_t>(128) * (h + 24 * t);
+                if constexpr (Mode == KvMode::RK4) {
+                    qf[qt][g][0] = __bfloat162float(q_ptr[lane]);
+                    qf[qt][g][1] = __bfloat162float(q_ptr[lane + 32]);
+                    qf[qt][g][2] = __bfloat162float(q_ptr[64 + lane]);
+                    qf[qt][g][3] = __bfloat162float(q_ptr[64 + lane + 32]);
+                    kv_cache_hadamard64(qf[qt][g][0], qf[qt][g][1], 0xffffffffu);
+                    kv_cache_hadamard64(qf[qt][g][2], qf[qt][g][3], 0xffffffffu);
+                } else {
+                    const uint2 qb   = load_vec<uint2>(q_ptr + d0);
+                    const auto* q2   = reinterpret_cast<const __nv_bfloat162*>(&qb);
+                    const float2 qa  = __bfloat1622float2(q2[0]);
+                    const float2 qbb = __bfloat1622float2(q2[1]);
+                    qf[qt][g][0] = qa.x;
+                    qf[qt][g][1] = qa.y;
+                    qf[qt][g][2] = qbb.x;
+                    qf[qt][g][3] = qbb.y;
+                }
+            } else {
+                rel_row[qt][g] = nullptr;
+                far_rel[qt][g] = 0.0f;
+                qf[qt][g][0] = qf[qt][g][1] = qf[qt][g][2] = qf[qt][g][3] = 0.0f;
+            }
+            acc[qt][g][0] = acc[qt][g][1] = acc[qt][g][2] = acc[qt][g][3] = 0.0f;
+            den[qt][g]     = 0.0f;
+            maximum[qt][g] = -CUDART_INF_F;
+        }
+    }
 
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float den = 0.0f, maximum = -CUDART_INF_F;
+    const int last_t  = min(t0 + Tq - 1, tokens - 1);
+    const int qp_min  = qp[0];
+    const int qp_max  = pos[last_t];
+    const int lo      = Swa ? max(0, qp_min - 1023) : split * partition;
+    const int hi      = Swa ? (qp_max + 1) : min(qp_max + 1, lo + partition);
 
     for (int key = lo + warp; key < hi; key += NumWarps) {
-        float dot = 0.0f;
+        float k[4];
         float v[4];
         if constexpr (Swa) {
             if (key >= first) {
@@ -75,7 +119,10 @@ __global__ __launch_bounds__(NumWarps * 32)
                 const auto* k2 = reinterpret_cast<const __nv_bfloat162*>(&kb);
                 const float2 k0 = __bfloat1622float2(k2[0]);
                 const float2 k1 = __bfloat1622float2(k2[1]);
-                dot = fmaf(qf[3], k1.y, fmaf(qf[2], k1.x, fmaf(qf[1], k0.y, qf[0] * k0.x)));
+                k[0] = k0.x;
+                k[1] = k0.y;
+                k[2] = k1.x;
+                k[3] = k1.y;
                 const uint2 vb = load_vec<uint2>(cv + d0 + off);
                 const auto* v2 = reinterpret_cast<const __nv_bfloat162*>(&vb);
                 const float2 v0 = __bfloat1622float2(v2[0]);
@@ -90,7 +137,10 @@ __global__ __launch_bounds__(NumWarps * 32)
                 const auto* k2 = reinterpret_cast<const __nv_bfloat162*>(&kb);
                 const float2 k0 = __bfloat1622float2(k2[0]);
                 const float2 k1 = __bfloat1622float2(k2[1]);
-                dot = fmaf(qf[3], k1.y, fmaf(qf[2], k1.x, fmaf(qf[1], k0.y, qf[0] * k0.x)));
+                k[0] = k0.x;
+                k[1] = k0.y;
+                k[2] = k1.x;
+                k[3] = k1.y;
                 const uint2 vb = load_vec<uint2>(cache.v.at(cache.lane, kh, slot) + 2 * d0);
                 const auto* v2 = reinterpret_cast<const __half2*>(&vb);
                 const float2 v0 = __half22float2(v2[0]);
@@ -102,15 +152,41 @@ __global__ __launch_bounds__(NumWarps * 32)
             }
         } else {
             const int page = cache.table[key >> 6], off = key & 63;
-            if constexpr (I8) {
-                const int32_t ki  = *reinterpret_cast<const int32_t*>(cache.k.at(page, kh, off) + d0);
-                const auto* k8    = reinterpret_cast<const signed char*>(&ki);
-                const float ksc   = __half2float(
+            if constexpr (Mode == KvMode::RK4) {
+                const std::uint8_t* kp =
+                    reinterpret_cast<const std::uint8_t*>(cache.k.at(page, kh, off));
+                const std::uint8_t* vp =
+                    reinterpret_cast<const std::uint8_t*>(cache.v.at(page, kh, off));
+                const __half* ks = reinterpret_cast<const __half*>(cache.ks.at(page, kh, off));
+                const __half* vs = reinterpret_cast<const __half*>(cache.vs.at(page, kh, off));
+                const float ksc0 = __half2float(ks[0]), ksc1 = __half2float(ks[1]);
+                const float vsc0 = __half2float(vs[0]), vsc1 = __half2float(vs[1]);
+                const int byte0  = lane >> 1;
+                const int hi_nib = lane & 1;
+                auto unpack      = [hi_nib](std::uint8_t b) -> float {
+                    const unsigned nib = hi_nib ? (b >> 4) : (b & 0x0fu);
+                    return static_cast<float>(static_cast<int>(nib ^ 8u) - 8);
+                };
+                k[0] = unpack(kp[byte0]) * ksc0;
+                k[1] = unpack(kp[byte0 + 16]) * ksc0;
+                k[2] = unpack(kp[byte0 + 32]) * ksc1;
+                k[3] = unpack(kp[byte0 + 48]) * ksc1;
+                v[0] = unpack(vp[byte0]) * vsc0;
+                v[1] = unpack(vp[byte0 + 16]) * vsc0;
+                v[2] = unpack(vp[byte0 + 32]) * vsc1;
+                v[3] = unpack(vp[byte0 + 48]) * vsc1;
+            } else if constexpr (Mode == KvMode::I8) {
+                const int32_t ki = *reinterpret_cast<const int32_t*>(cache.k.at(page, kh, off) + d0);
+                const auto* k8   = reinterpret_cast<const signed char*>(&ki);
+                const float ksc  = __half2float(
                     reinterpret_cast<const __half*>(cache.ks.at(page, kh, off))[lane >> 4]);
-                dot = fmaf(qf[3], k8[3], fmaf(qf[2], k8[2], fmaf(qf[1], k8[1], qf[0] * k8[0]))) * ksc;
-                const int32_t vi  = *reinterpret_cast<const int32_t*>(cache.v.at(page, kh, off) + d0);
-                const auto* v8    = reinterpret_cast<const signed char*>(&vi);
-                const float vsc   = __half2float(
+                k[0] = k8[0] * ksc;
+                k[1] = k8[1] * ksc;
+                k[2] = k8[2] * ksc;
+                k[3] = k8[3] * ksc;
+                const int32_t vi = *reinterpret_cast<const int32_t*>(cache.v.at(page, kh, off) + d0);
+                const auto* v8   = reinterpret_cast<const signed char*>(&vi);
+                const float vsc  = __half2float(
                     reinterpret_cast<const __half*>(cache.vs.at(page, kh, off))[lane >> 4]);
                 v[0] = v8[0] * vsc;
                 v[1] = v8[1] * vsc;
@@ -121,7 +197,10 @@ __global__ __launch_bounds__(NumWarps * 32)
                 const auto* k2 = reinterpret_cast<const __nv_bfloat162*>(&kb);
                 const float2 k0 = __bfloat1622float2(k2[0]);
                 const float2 k1 = __bfloat1622float2(k2[1]);
-                dot = fmaf(qf[3], k1.y, fmaf(qf[2], k1.x, fmaf(qf[1], k0.y, qf[0] * k0.x)));
+                k[0] = k0.x;
+                k[1] = k0.y;
+                k[2] = k1.x;
+                k[3] = k1.y;
                 const uint2 vb = load_vec<uint2>(cache.v.at(page, kh, off) + 2 * d0);
                 const auto* v2 = reinterpret_cast<const __half2*>(&vb);
                 const float2 v0 = __half22float2(v2[0]);
@@ -134,52 +213,104 @@ __global__ __launch_bounds__(NumWarps * 32)
         }
 
 #pragma unroll
-        for (int m = 16; m; m >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, m);
-        const int dist = qp - key;
-        const float score = fmaf(dot, Scale, (!Swa && dist >= 1024) ? far_rel : rel_row[min(dist, 1024)]);
-        const float next    = fmaxf(maximum, score);
-        const float rescale = maximum == -CUDART_INF_F ? 0.0f : expf(maximum - next);
-        const float p       = expf(score - next);
-        den = fmaf(den, rescale, p);
+        for (int qt = 0; qt < Tq; ++qt) {
+            if (t0 + qt < tokens && key <= qp[qt] && (!Swa || key >= qp[qt] - 1023)) {
+                const int dist = qp[qt] - key;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) acc[i] = fmaf(acc[i], rescale, p * v[i]);
-        maximum = next;
+                for (int g = 0; g < 3; ++g) {
+                    float dot = fmaf(qf[qt][g][3], k[3],
+                                     fmaf(qf[qt][g][2], k[2],
+                                          fmaf(qf[qt][g][1], k[1], qf[qt][g][0] * k[0])));
+#pragma unroll
+                    for (int m = 16; m; m >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, m);
+                    const float bias =
+                        (!Swa && dist >= 1024) ? far_rel[qt][g] : rel_row[qt][g][min(dist, 1024)];
+                    const float score   = fmaf(dot, Scale, bias);
+                    const float next    = fmaxf(maximum[qt][g], score);
+                    const float rescale = maximum[qt][g] == -CUDART_INF_F ? 0.0f : expf(maximum[qt][g] - next);
+                    const float p       = expf(score - next);
+                    den[qt][g]          = fmaf(den[qt][g], rescale, p);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        acc[qt][g][i] = fmaf(acc[qt][g][i], rescale, p * v[i]);
+                    maximum[qt][g] = next;
+                }
+            }
+        }
     }
 
     __shared__ float s_max[NumWarps];
     __shared__ float s_den[NumWarps];
     __shared__ float s_acc[NumWarps][D];
 
-    s_max[warp] = maximum;
-    s_den[warp] = den;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) s_acc[warp][d0 + i] = acc[i];
-    __syncthreads();
-    if (threadIdx.x >= D) return;
-
-    const int d = threadIdx.x;
-    float m = -CUDART_INF_F;
+    for (int qt = 0; qt < Tq; ++qt) {
+        const int t = t0 + qt;
+        if (t >= tokens) break;
 #pragma unroll
-    for (int w = 0; w < NumWarps; ++w) m = fmaxf(m, s_max[w]);
-    const bool sink = Swa || nsplits == 1;
-    if (sink) m = fmaxf(0.0f, m);
-    float acc_total = 0.0f, den_total = 0.0f;
+        for (int g = 0; g < 3; ++g) {
+            const int h = 3 * kh + g;
+            s_max[warp] = maximum[qt][g];
+            s_den[warp] = den[qt][g];
+            if constexpr (Mode == KvMode::RK4) {
+                s_acc[warp][lane]      = acc[qt][g][0];
+                s_acc[warp][lane + 32] = acc[qt][g][1];
+                s_acc[warp][64 + lane] = acc[qt][g][2];
+                s_acc[warp][96 + lane] = acc[qt][g][3];
+            } else {
 #pragma unroll
-    for (int w = 0; w < NumWarps; ++w) {
-        const float scale = s_max[w] == -CUDART_INF_F ? 0.0f : expf(s_max[w] - m);
-        acc_total = fmaf(scale, s_acc[w][d], acc_total);
-        den_total = fmaf(scale, s_den[w], den_total);
-    }
-    if (sink) {
-        den_total += expf(-m);
-        const float g = __bfloat162float(gate[3072 + d + 128 * h + 6528 * t]);
-        output[d + 128 * (h + 24 * t)] = __float2bfloat16_rn(acc_total / den_total / (1.0f + expf(-g)));
-    } else {
-        const std::int64_t base = (std::int64_t(t) * 24 * nsplits + h * nsplits + split) * 130;
-        parts[base + d] = acc_total;
-        if (d == 0) {
-            parts[base + 128] = m;
-            parts[base + 129] = den_total;
+                for (int i = 0; i < 4; ++i) s_acc[warp][d0 + i] = acc[qt][g][i];
+            }
+            __syncthreads();
+            float m         = -CUDART_INF_F;
+            float acc_total = 0.0f, den_total = 0.0f;
+            if (threadIdx.x < D) {
+                const int d = threadIdx.x;
+#pragma unroll
+                for (int w = 0; w < NumWarps; ++w) m = fmaxf(m, s_max[w]);
+                const bool sink = Swa || nsplits == 1;
+                if (sink) m = fmaxf(0.0f, m);
+#pragma unroll
+                for (int w = 0; w < NumWarps; ++w) {
+                    const float scale = s_max[w] == -CUDART_INF_F ? 0.0f : expf(s_max[w] - m);
+                    acc_total         = fmaf(scale, s_acc[w][d], acc_total);
+                    den_total         = fmaf(scale, s_den[w], den_total);
+                }
+                if constexpr (Mode == KvMode::RK4) s_acc[0][d] = acc_total;
+            }
+            if constexpr (Mode == KvMode::RK4) {
+                __syncthreads();
+                if (warp < 2) {
+                    const int grp_base = warp * 64;
+                    float x0           = s_acc[0][grp_base + lane];
+                    float x1           = s_acc[0][grp_base + 32 + lane];
+                    kv_cache_hadamard64(x0, x1, 0xffffffffu);
+                    s_acc[0][grp_base + lane]      = x0;
+                    s_acc[0][grp_base + 32 + lane] = x1;
+                }
+                __syncthreads();
+                if (threadIdx.x < D) acc_total = s_acc[0][threadIdx.x];
+            }
+            if (threadIdx.x < D) {
+                const int d     = threadIdx.x;
+                const bool sink = Swa || nsplits == 1;
+                if (sink) {
+                    den_total += expf(-m);
+                    const float gv = __bfloat162float(
+                        gate[3072 + d + 128 * h + static_cast<std::int64_t>(6528) * t]);
+                    output[d + 128 * (h + static_cast<std::int64_t>(24) * t)] =
+                        __float2bfloat16_rn(acc_total / den_total / (1.0f + expf(-gv)));
+                } else {
+                    const std::int64_t base =
+                        (std::int64_t(t) * 24 * nsplits + h * nsplits + split) * 130;
+                    parts[base + d] = acc_total;
+                    if (d == 0) {
+                        parts[base + 128] = m;
+                        parts[base + 129] = den_total;
+                    }
+                }
+            }
+            __syncthreads();
         }
     }
 }
@@ -209,7 +340,7 @@ __device__ __forceinline__ unsigned inkling2_swz_addr(unsigned lane_base, unsign
     return lane_base + ((ck | as) ^ r);
 }
 
-template <bool Swa, bool I8>
+template <bool Swa, KvMode Mode>
 __device__ __forceinline__ void inkling2_stage_kv(BF* k_s, __half* v_s, Cache cache, int kv_head,
                                                   int k0, int base_pos, int max_query_abs,
                                                   int physical_page, const BF* ck, const BF* cv,
@@ -240,9 +371,42 @@ __device__ __forceinline__ void inkling2_stage_kv(BF* k_s, __half* v_s, Cache ca
                 const int4 vb = load_vec<int4>(cv + off);
                 store_vec(pv, bf16x8_bits_to_f16x8_bits(vb));
             }
-        } else if constexpr (!I8) {
+        } else if constexpr (Mode == KvMode::BF16) {
             cp_async<16, ninfer::ops::Cache::cg>(pk, cache.k.at(physical_page, kv_head, key_l) + d * 2);
             cp_async<16, ninfer::ops::Cache::cg>(pv, cache.v.at(physical_page, kv_head, key_l) + d * 2);
+        } else if constexpr (Mode == KvMode::RK4) {
+            const std::uint32_t rk = *reinterpret_cast<const std::uint32_t*>(
+                cache.k.at(physical_page, kv_head, key_l) + (d >> 1));
+            const std::uint32_t rv = *reinterpret_cast<const std::uint32_t*>(
+                cache.v.at(physical_page, kv_head, key_l) + (d >> 1));
+            const float ksc = __half2float(
+                reinterpret_cast<const __half*>(cache.ks.at(physical_page, kv_head, key_l))[d >> 6]);
+            const float vsc = __half2float(
+                reinterpret_cast<const __half*>(cache.vs.at(physical_page, kv_head, key_l))[d >> 6]);
+            float kf[8], vf[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int kn = static_cast<int>((rk >> (4 * i)) & 0xfu);
+                const int vn = static_cast<int>((rv >> (4 * i)) & 0xfu);
+                kf[i]        = static_cast<float>((kn ^ 8) - 8) * ksc;
+                vf[i]        = static_cast<float>((vn ^ 8) - 8) * vsc;
+            }
+            const __nv_bfloat162 kb0 = __floats2bfloat162_rn(kf[0], kf[1]);
+            const __nv_bfloat162 kb1 = __floats2bfloat162_rn(kf[2], kf[3]);
+            const __nv_bfloat162 kb2 = __floats2bfloat162_rn(kf[4], kf[5]);
+            const __nv_bfloat162 kb3 = __floats2bfloat162_rn(kf[6], kf[7]);
+            store_vec(pk, make_uint4(*reinterpret_cast<const unsigned*>(&kb0),
+                                     *reinterpret_cast<const unsigned*>(&kb1),
+                                     *reinterpret_cast<const unsigned*>(&kb2),
+                                     *reinterpret_cast<const unsigned*>(&kb3)));
+            const __half2 vh0 = __floats2half2_rn(vf[0], vf[1]);
+            const __half2 vh1 = __floats2half2_rn(vf[2], vf[3]);
+            const __half2 vh2 = __floats2half2_rn(vf[4], vf[5]);
+            const __half2 vh3 = __floats2half2_rn(vf[6], vf[7]);
+            store_vec(pv, make_uint4(*reinterpret_cast<const unsigned*>(&vh0),
+                                     *reinterpret_cast<const unsigned*>(&vh1),
+                                     *reinterpret_cast<const unsigned*>(&vh2),
+                                     *reinterpret_cast<const unsigned*>(&vh3)));
         } else {
             const int2 rk = load_vec<int2>(cache.k.at(physical_page, kv_head, key_l) + d);
             const int2 rv = load_vec<int2>(cache.v.at(physical_page, kv_head, key_l) + d);
@@ -272,7 +436,7 @@ __device__ __forceinline__ void inkling2_stage_kv(BF* k_s, __half* v_s, Cache ca
     }
 }
 
-template <bool Swa, bool I8>
+template <bool Swa, KvMode Mode>
 __launch_bounds__(128, 1) __global__
     void inkling2_prompt_kernel(const BF* __restrict__ q, const BF* __restrict__ ck,
                                 const BF* __restrict__ cv, const BF* __restrict__ gate,
@@ -346,6 +510,24 @@ __launch_bounds__(128, 1) __global__
         }
     }
     cp_commit();
+    if constexpr (Mode == KvMode::RK4) {
+        cp_wait<0>();
+        __syncthreads();
+        for (int row = warp; row < Br; row += 4) {
+            for (int grp = 0; grp < 2; ++grp) {
+                const int c0 = grp * 64 + lane;
+                const int c1 = c0 + 32;
+                BF* p0       = &q_s[row * D + inkling2_swz128(row, c0)];
+                BF* p1       = &q_s[row * D + inkling2_swz128(row, c1)];
+                float x0     = __bfloat162float(*p0);
+                float x1     = __bfloat162float(*p1);
+                kv_cache_hadamard64(x0, x1, FullMask);
+                *p0 = __float2bfloat16_rn(x0);
+                *p1 = __float2bfloat16_rn(x1);
+            }
+        }
+        __syncthreads();
+    }
 
     const int qrow0 = q0 + warp_row0 + gid;
     const int qrow1 = q0 + warp_row0 + gid + 8;
@@ -359,6 +541,7 @@ __launch_bounds__(128, 1) __global__
     const float far_rel1 = rel_row1 ? rel_row1[1024] : 0.0f;
 
     float acc[PVNt][4];
+
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
 #pragma unroll
@@ -374,8 +557,8 @@ __launch_bounds__(128, 1) __global__
     for (int kb = kb_lo; kb <= kb_hi; ++kb) {
         const int k0 = kb * Bc;
         const int physical_page = Swa ? 0 : cache.table[kb];
-        inkling2_stage_kv<Swa, I8>(k_s, v_s, cache, kv_head, k0, base_pos, max_query_abs,
-                                   physical_page, ck, cv, tid);
+        inkling2_stage_kv<Swa, Mode>(k_s, v_s, cache, kv_head, k0, base_pos, max_query_abs,
+                                     physical_page, ck, cv, tid);
         cp_commit();
         cp_wait<0>();
         __syncthreads();
@@ -534,6 +717,44 @@ __launch_bounds__(128, 1) __global__
     const float inv_l0 = z0 / (l0 * z0 + exp2_approx(-m_final0 * Log2E));
     const float inv_l1 = z1 / (l1 * z1 + exp2_approx(-m_final1 * Log2E));
 
+    if constexpr (Mode == KvMode::RK4) {
+        float* warp_out = (warp < 2) ? (reinterpret_cast<float*>(k_s) + warp * 16 * D)
+                                     : (reinterpret_cast<float*>(v_s) + (warp - 2) * 16 * D);
+#pragma unroll
+        for (int n = 0; n < PVNt; ++n) {
+            const int d0 = n * 8 + 2 * lid;
+            if (qrow0 < tokens) {
+                warp_out[gid * D + d0]     = acc[n][0] * inv_l0;
+                warp_out[gid * D + d0 + 1] = acc[n][1] * inv_l0;
+            }
+            if (qrow1 < tokens) {
+                warp_out[(gid + 8) * D + d0]     = acc[n][2] * inv_l1;
+                warp_out[(gid + 8) * D + d0 + 1] = acc[n][3] * inv_l1;
+            }
+        }
+        __syncwarp();
+        for (int r = 0; r < 16; ++r) {
+            const int qrow = q0 + warp_row0 + r;
+            if (qrow >= tokens) break;
+            for (int grp = 0; grp < 2; ++grp) {
+                const int d0 = grp * 64 + lane;
+                const int d1 = d0 + 32;
+                float x0     = warp_out[r * D + d0];
+                float x1     = warp_out[r * D + d1];
+                kv_cache_hadamard64(x0, x1, FullMask);
+                const float g0 = __bfloat162float(
+                    gate[3072 + d0 + 128 * q_head + static_cast<std::int64_t>(6528) * qrow]);
+                const float g1 = __bfloat162float(
+                    gate[3072 + d1 + 128 * q_head + static_cast<std::int64_t>(6528) * qrow]);
+                out[d0 + 128 * (q_head + static_cast<std::int64_t>(24) * qrow)] =
+                    __float2bfloat16_rn(x0 / (1.0f + expf(-g0)));
+                out[d1 + 128 * (q_head + static_cast<std::int64_t>(24) * qrow)] =
+                    __float2bfloat16_rn(x1 / (1.0f + expf(-g1)));
+            }
+        }
+        return;
+    }
+
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
         const int d0 = n * 8 + 2 * lid;
@@ -567,17 +788,24 @@ void swa_launch(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor&
     const int tokens = q.ne[2];
     if (tokens >= 16) {
         dim3 grid((tokens + 63) / 64, 24);
-        inkling2_prompt_kernel<true, false><<<grid, 128, 0, s>>>(
+        inkling2_prompt_kernel<true, KvMode::BF16><<<grid, 128, 0, s>>>(
             static_cast<const BF*>(q.data), static_cast<const BF*>(k.data),
             static_cast<const BF*>(v.data), static_cast<const BF*>(gate.data),
             static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache, tokens,
             static_cast<BF*>(out.data));
-    } else {
-        attention_decode_kernel<true, false, 8><<<dim3(tokens * 24), 8 * 32, 0, s>>>(
+    } else if (tokens == 1) {
+        attention_decode_kernel<true, KvMode::BF16, 8, 1><<<dim3(8), 8 * 32, 0, s>>>(
             static_cast<const BF*>(q.data), static_cast<const BF*>(k.data),
             static_cast<const BF*>(v.data), static_cast<const BF*>(gate.data),
-            static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache, 1, 0,
-            nullptr, static_cast<BF*>(out.data));
+            static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache, tokens,
+            1, 0, nullptr, static_cast<BF*>(out.data));
+    } else {
+        attention_decode_kernel<true, KvMode::BF16, 8, 2>
+            <<<dim3(((tokens + 1) / 2) * 8), 8 * 32, 0, s>>>(
+                static_cast<const BF*>(q.data), static_cast<const BF*>(k.data),
+                static_cast<const BF*>(v.data), static_cast<const BF*>(gate.data),
+                static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache,
+                tokens, 1, 0, nullptr, static_cast<BF*>(out.data));
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -593,42 +821,376 @@ void full_launch(const Tensor& q, const Tensor& gate, const Tensor& rel, const T
                 static_cast<const int*>(c.block_table.data),
                 0,
                 0};
+    const auto dispatch_mode = [&](auto fn) {
+        if (c.storage == KvCacheStorage::Int8Group64) {
+            fn.template operator()<KvMode::I8>();
+        } else if (c.storage == KvCacheStorage::RK4V4E8 ||
+                   c.storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) {
+            fn.template operator()<KvMode::RK4>();
+        } else {
+            fn.template operator()<KvMode::BF16>();
+        }
+    };
     if (tokens >= 16) {
         dim3 grid((tokens + 63) / 64, 24);
-        if (c.storage == KvCacheStorage::Int8Group64) {
-            inkling2_prompt_kernel<false, true><<<grid, 128, 0, s>>>(
+        dispatch_mode([&]<KvMode Mode>() {
+            inkling2_prompt_kernel<false, Mode><<<grid, 128, 0, s>>>(
                 static_cast<const BF*>(q.data), nullptr, nullptr, static_cast<const BF*>(gate.data),
                 static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache,
                 tokens, static_cast<BF*>(out.data));
-        } else {
-            inkling2_prompt_kernel<false, false><<<grid, 128, 0, s>>>(
-                static_cast<const BF*>(q.data), nullptr, nullptr, static_cast<const BF*>(gate.data),
-                static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache,
-                tokens, static_cast<BF*>(out.data));
-        }
+        });
         CUDA_CHECK(cudaGetLastError());
         return;
     }
     int ns = splits(keys, tokens), partition = (keys + ns - 1) / ns;
-    dim3 grid(tokens * 24, ns);
     // With one split the kernel applies the zero-valued sink directly and writes
     // the final result to `out`; with several splits it writes per-split partials
     // to `scratch` and reduce_kernel produces the final result.
     BF* out_arg = ns == 1 ? static_cast<BF*>(out.data) : nullptr;
-    if (c.storage == KvCacheStorage::Int8Group64)
-        attention_decode_kernel<false, true, 4><<<grid, 4 * 32, 0, s>>>(
-            static_cast<const BF*>(q.data), nullptr, nullptr, static_cast<const BF*>(gate.data),
-            static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache, ns,
-            partition, scratch, out_arg);
-    else
-        attention_decode_kernel<false, false, 4><<<grid, 4 * 32, 0, s>>>(
-            static_cast<const BF*>(q.data), nullptr, nullptr, static_cast<const BF*>(gate.data),
-            static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache, ns,
-            partition, scratch, out_arg);
+    if (tokens == 1) {
+        dim3 grid(8, ns);
+        dispatch_mode([&]<KvMode Mode>() {
+            attention_decode_kernel<false, Mode, 4, 1><<<grid, 4 * 32, 0, s>>>(
+                static_cast<const BF*>(q.data), nullptr, nullptr,
+                static_cast<const BF*>(gate.data), static_cast<const float*>(rel.data),
+                static_cast<const int*>(pos.data), cache, tokens, ns, partition, scratch, out_arg);
+        });
+    } else {
+        dim3 grid(((tokens + 1) / 2) * 8, ns);
+        dispatch_mode([&]<KvMode Mode>() {
+            attention_decode_kernel<false, Mode, 4, 2><<<grid, 4 * 32, 0, s>>>(
+                static_cast<const BF*>(q.data), nullptr, nullptr,
+                static_cast<const BF*>(gate.data), static_cast<const float*>(rel.data),
+                static_cast<const int*>(pos.data), cache, tokens, ns, partition, scratch, out_arg);
+        });
+    }
     CUDA_CHECK(cudaGetLastError());
     if (ns > 1) {
         reduce_kernel<<<tokens * 24, 128, 0, s>>>(scratch, static_cast<const BF*>(gate.data), ns,
                                                   static_cast<BF*>(out.data));
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+template <bool Swa, KvMode Mode, int NumWarps, int Tq>
+__global__ __launch_bounds__(NumWarps * 32)
+    void dspark_attention_kernel(const BF* __restrict__ q, const BF* __restrict__ ck,
+                                 const BF* __restrict__ cv, Cache cache, int context_keys,
+                                 int tokens, int nsplits, int partition, float* __restrict__ parts,
+                                 BF* __restrict__ output) {
+    constexpr int D       = 128;
+    constexpr float Scale = 0.08838834764831844f;
+
+    const int kh    = blockIdx.x & 7;
+    const int t0    = (blockIdx.x >> 3) * Tq;
+    const int split = Swa ? 0 : blockIdx.y;
+    const int warp  = threadIdx.x >> 5;
+    const int lane  = threadIdx.x & 31;
+    const int d0    = lane * 4;
+
+    float qf[Tq][3][4];
+    float acc[Tq][3][4];
+    float den[Tq][3];
+    float maximum[Tq][3];
+
+#pragma unroll
+    for (int qt = 0; qt < Tq; ++qt) {
+        const int t        = t0 + qt;
+        const bool valid_t = t < tokens;
+#pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            const int h = 3 * kh + g;
+            if (valid_t) {
+                const BF* q_ptr = q + static_cast<std::int64_t>(128) * (h + 24 * t);
+                if constexpr (Mode == KvMode::RK4) {
+                    qf[qt][g][0] = __bfloat162float(q_ptr[lane]);
+                    qf[qt][g][1] = __bfloat162float(q_ptr[lane + 32]);
+                    qf[qt][g][2] = __bfloat162float(q_ptr[64 + lane]);
+                    qf[qt][g][3] = __bfloat162float(q_ptr[64 + lane + 32]);
+                    kv_cache_hadamard64(qf[qt][g][0], qf[qt][g][1], 0xffffffffu);
+                    kv_cache_hadamard64(qf[qt][g][2], qf[qt][g][3], 0xffffffffu);
+                } else {
+                    const uint2 qb   = load_vec<uint2>(q_ptr + d0);
+                    const auto* q2   = reinterpret_cast<const __nv_bfloat162*>(&qb);
+                    const float2 qa  = __bfloat1622float2(q2[0]);
+                    const float2 qbb = __bfloat1622float2(q2[1]);
+                    qf[qt][g][0]     = qa.x;
+                    qf[qt][g][1]     = qa.y;
+                    qf[qt][g][2]     = qbb.x;
+                    qf[qt][g][3]     = qbb.y;
+                }
+            } else {
+                qf[qt][g][0] = qf[qt][g][1] = qf[qt][g][2] = qf[qt][g][3] = 0.0f;
+            }
+            acc[qt][g][0] = acc[qt][g][1] = acc[qt][g][2] = acc[qt][g][3] = 0.0f;
+            den[qt][g]     = 0.0f;
+            maximum[qt][g] = -CUDART_INF_F;
+        }
+    }
+
+    const int lo = Swa ? max(0, context_keys + t0 - 1023) : split * partition;
+    const int hi = Swa ? (context_keys + tokens)
+                       : (split + 1 == nsplits ? (context_keys + tokens)
+                                               : min(context_keys, lo + partition));
+
+    for (int key = lo + warp; key < hi; key += NumWarps) {
+        float k[4], v[4];
+        if (key >= context_keys) {
+            const int off = 128 * (kh + 8 * (key - context_keys));
+            if constexpr (Mode == KvMode::RK4) {
+                k[0] = __bfloat162float(ck[off + lane]);
+                k[1] = __bfloat162float(ck[off + lane + 32]);
+                k[2] = __bfloat162float(ck[off + 64 + lane]);
+                k[3] = __bfloat162float(ck[off + 64 + lane + 32]);
+                v[0] = __bfloat162float(cv[off + lane]);
+                v[1] = __bfloat162float(cv[off + lane + 32]);
+                v[2] = __bfloat162float(cv[off + 64 + lane]);
+                v[3] = __bfloat162float(cv[off + 64 + lane + 32]);
+                kv_cache_hadamard64(k[0], k[1], 0xffffffffu);
+                kv_cache_hadamard64(k[2], k[3], 0xffffffffu);
+                kv_cache_hadamard64(v[0], v[1], 0xffffffffu);
+                kv_cache_hadamard64(v[2], v[3], 0xffffffffu);
+            } else {
+                const uint2 kb = load_vec<uint2>(ck + d0 + off);
+                const auto* k2 = reinterpret_cast<const __nv_bfloat162*>(&kb);
+                const float2 k0 = __bfloat1622float2(k2[0]), k1 = __bfloat1622float2(k2[1]);
+                k[0] = k0.x; k[1] = k0.y; k[2] = k1.x; k[3] = k1.y;
+                const uint2 vb = load_vec<uint2>(cv + d0 + off);
+                const auto* v2 = reinterpret_cast<const __nv_bfloat162*>(&vb);
+                const float2 v0 = __bfloat1622float2(v2[0]), v1 = __bfloat1622float2(v2[1]);
+                v[0] = v0.x; v[1] = v0.y; v[2] = v1.x; v[3] = v1.y;
+            }
+        } else if constexpr (Swa) {
+            const int slot = key & 1023;
+            const uint2 kb = load_vec<uint2>(cache.k.at(cache.lane, kh, slot) + 2 * d0);
+            const auto* k2 = reinterpret_cast<const __nv_bfloat162*>(&kb);
+            const float2 k0 = __bfloat1622float2(k2[0]), k1 = __bfloat1622float2(k2[1]);
+            k[0] = k0.x; k[1] = k0.y; k[2] = k1.x; k[3] = k1.y;
+            const uint2 vb = load_vec<uint2>(cache.v.at(cache.lane, kh, slot) + 2 * d0);
+            const auto* v2 = reinterpret_cast<const __half2*>(&vb);
+            const float2 v0 = __half22float2(v2[0]), v1 = __half22float2(v2[1]);
+            v[0] = v0.x; v[1] = v0.y; v[2] = v1.x; v[3] = v1.y;
+        } else {
+            const int page = cache.table[key >> 6], off = key & 63;
+            if constexpr (Mode == KvMode::RK4) {
+                const std::uint8_t* kp =
+                    reinterpret_cast<const std::uint8_t*>(cache.k.at(page, kh, off));
+                const std::uint8_t* vp =
+                    reinterpret_cast<const std::uint8_t*>(cache.v.at(page, kh, off));
+                const __half* ks = reinterpret_cast<const __half*>(cache.ks.at(page, kh, off));
+                const __half* vs = reinterpret_cast<const __half*>(cache.vs.at(page, kh, off));
+                const float ksc0 = __half2float(ks[0]), ksc1 = __half2float(ks[1]);
+                const float vsc0 = __half2float(vs[0]), vsc1 = __half2float(vs[1]);
+                const int byte0 = lane >> 1, hi_nib = lane & 1;
+                auto unpack = [hi_nib](std::uint8_t b) -> float {
+                    const unsigned nib = hi_nib ? (b >> 4) : (b & 0x0fu);
+                    return static_cast<float>(static_cast<int>(nib ^ 8u) - 8);
+                };
+                k[0] = unpack(kp[byte0]) * ksc0;
+                k[1] = unpack(kp[byte0 + 16]) * ksc0;
+                k[2] = unpack(kp[byte0 + 32]) * ksc1;
+                k[3] = unpack(kp[byte0 + 48]) * ksc1;
+                v[0] = unpack(vp[byte0]) * vsc0;
+                v[1] = unpack(vp[byte0 + 16]) * vsc0;
+                v[2] = unpack(vp[byte0 + 32]) * vsc1;
+                v[3] = unpack(vp[byte0 + 48]) * vsc1;
+            } else if constexpr (Mode == KvMode::I8) {
+                const int32_t ki = *reinterpret_cast<const int32_t*>(cache.k.at(page, kh, off) + d0);
+                const auto* k8   = reinterpret_cast<const signed char*>(&ki);
+                const float ksc  = __half2float(
+                    reinterpret_cast<const __half*>(cache.ks.at(page, kh, off))[lane >> 4]);
+                k[0] = k8[0] * ksc; k[1] = k8[1] * ksc; k[2] = k8[2] * ksc; k[3] = k8[3] * ksc;
+                const int32_t vi = *reinterpret_cast<const int32_t*>(cache.v.at(page, kh, off) + d0);
+                const auto* v8   = reinterpret_cast<const signed char*>(&vi);
+                const float vsc  = __half2float(
+                    reinterpret_cast<const __half*>(cache.vs.at(page, kh, off))[lane >> 4]);
+                v[0] = v8[0] * vsc; v[1] = v8[1] * vsc; v[2] = v8[2] * vsc; v[3] = v8[3] * vsc;
+            } else {
+                const uint2 kb = load_vec<uint2>(cache.k.at(page, kh, off) + 2 * d0);
+                const auto* k2 = reinterpret_cast<const __nv_bfloat162*>(&kb);
+                const float2 k0 = __bfloat1622float2(k2[0]), k1 = __bfloat1622float2(k2[1]);
+                k[0] = k0.x; k[1] = k0.y; k[2] = k1.x; k[3] = k1.y;
+                const uint2 vb = load_vec<uint2>(cache.v.at(page, kh, off) + 2 * d0);
+                const auto* v2 = reinterpret_cast<const __half2*>(&vb);
+                const float2 v0 = __half22float2(v2[0]), v1 = __half22float2(v2[1]);
+                v[0] = v0.x; v[1] = v0.y; v[2] = v1.x; v[3] = v1.y;
+            }
+        }
+
+#pragma unroll
+        for (int qt = 0; qt < Tq; ++qt) {
+            const int t = t0 + qt;
+            if (t < tokens && (!Swa || key >= context_keys + t - 1023)) {
+#pragma unroll
+                for (int g = 0; g < 3; ++g) {
+                    float dot = fmaf(qf[qt][g][3], k[3],
+                                     fmaf(qf[qt][g][2], k[2],
+                                          fmaf(qf[qt][g][1], k[1], qf[qt][g][0] * k[0])));
+#pragma unroll
+                    for (int m = 16; m; m >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, m);
+                    const float score   = dot * Scale;
+                    const float next    = fmaxf(maximum[qt][g], score);
+                    const float rescale = maximum[qt][g] == -CUDART_INF_F ? 0.0f : expf(maximum[qt][g] - next);
+                    const float p       = expf(score - next);
+                    den[qt][g]          = fmaf(den[qt][g], rescale, p);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        acc[qt][g][i] = fmaf(acc[qt][g][i], rescale, p * v[i]);
+                    maximum[qt][g] = next;
+                }
+            }
+        }
+    }
+
+    __shared__ float s_max[NumWarps];
+    __shared__ float s_den[NumWarps];
+    __shared__ float s_acc[NumWarps][D];
+
+#pragma unroll
+    for (int qt = 0; qt < Tq; ++qt) {
+        const int t = t0 + qt;
+        if (t >= tokens) break;
+#pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            const int h = 3 * kh + g;
+            s_max[warp] = maximum[qt][g];
+            s_den[warp] = den[qt][g];
+            if constexpr (Mode == KvMode::RK4) {
+                s_acc[warp][lane]      = acc[qt][g][0];
+                s_acc[warp][lane + 32] = acc[qt][g][1];
+                s_acc[warp][64 + lane] = acc[qt][g][2];
+                s_acc[warp][96 + lane] = acc[qt][g][3];
+            } else {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) s_acc[warp][d0 + i] = acc[qt][g][i];
+            }
+            __syncthreads();
+            float m         = -CUDART_INF_F;
+            float acc_total = 0.0f, den_total = 0.0f;
+            if (threadIdx.x < D) {
+                const int d = threadIdx.x;
+#pragma unroll
+                for (int w = 0; w < NumWarps; ++w) m = fmaxf(m, s_max[w]);
+#pragma unroll
+                for (int w = 0; w < NumWarps; ++w) {
+                    const float scale = s_max[w] == -CUDART_INF_F ? 0.0f : expf(s_max[w] - m);
+                    acc_total         = fmaf(scale, s_acc[w][d], acc_total);
+                    den_total         = fmaf(scale, s_den[w], den_total);
+                }
+                if constexpr (Mode == KvMode::RK4) s_acc[0][d] = acc_total;
+            }
+            if constexpr (Mode == KvMode::RK4) {
+                __syncthreads();
+                if (warp < 2) {
+                    const int grp_base = warp * 64;
+                    float x0           = s_acc[0][grp_base + lane];
+                    float x1           = s_acc[0][grp_base + 32 + lane];
+                    kv_cache_hadamard64(x0, x1, 0xffffffffu);
+                    s_acc[0][grp_base + lane]      = x0;
+                    s_acc[0][grp_base + 32 + lane] = x1;
+                }
+                __syncthreads();
+                if (threadIdx.x < D) acc_total = s_acc[0][threadIdx.x];
+            }
+            if (threadIdx.x < D) {
+                const int d = threadIdx.x;
+                if (Swa || nsplits == 1) {
+                    output[d + 128 * (h + static_cast<std::int64_t>(24) * t)] =
+                        __float2bfloat16_rn(acc_total / den_total);
+                } else {
+                    const std::int64_t base =
+                        (std::int64_t(t) * 24 * nsplits + h * nsplits + split) * 130;
+                    parts[base + d] = acc_total;
+                    if (d == 0) {
+                        parts[base + 128] = m;
+                        parts[base + 129] = den_total;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+__global__ void dspark_reduce_kernel(const float* parts, int nsplits, BF* out) {
+    int h = blockIdx.x % 24, t = blockIdx.x / 24, d = threadIdx.x;
+    float m   = -CUDART_INF_F;
+    auto base = (std::int64_t(t) * 24 + h) * nsplits * 130;
+    for (int s = 0; s < nsplits; ++s) m = fmaxf(m, parts[base + s * 130 + 128]);
+    float acc = 0.0f, den = 0.0f;
+    for (int s = 0; s < nsplits; ++s) {
+        float maximum = parts[base + s * 130 + 128];
+        float scale   = maximum == -CUDART_INF_F ? 0.0f : expf(maximum - m);
+        acc           = fmaf(scale, parts[base + s * 130 + d], acc);
+        den           = fmaf(scale, parts[base + s * 130 + 129], den);
+    }
+    out[d + 128 * (h + 24 * t)] = __float2bfloat16_rn(acc / den);
+}
+
+void dspark_swa_launch(const Tensor& q, const Tensor& block_k, const Tensor& block_v,
+                       unsigned context_keys, const CyclicKVCacheLayerView& c, int lane,
+                       Tensor& out, cudaStream_t s) {
+    Cache cache{plane(c.k), plane(c.v), {}, {}, nullptr, 1024, lane};
+    const int tokens = q.ne[2];
+    if (tokens == 1) {
+        dspark_attention_kernel<true, KvMode::BF16, 8, 1><<<dim3(8), 8 * 32, 0, s>>>(
+            static_cast<const BF*>(q.data), static_cast<const BF*>(block_k.data),
+            static_cast<const BF*>(block_v.data), cache, static_cast<int>(context_keys), tokens, 1,
+            0, nullptr, static_cast<BF*>(out.data));
+    } else {
+        dspark_attention_kernel<true, KvMode::BF16, 8, 2>
+            <<<dim3(((tokens + 1) / 2) * 8), 8 * 32, 0, s>>>(
+                static_cast<const BF*>(q.data), static_cast<const BF*>(block_k.data),
+                static_cast<const BF*>(block_v.data), cache, static_cast<int>(context_keys),
+                tokens, 1, 0, nullptr, static_cast<BF*>(out.data));
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void dspark_full_launch(const Tensor& q, const Tensor& block_k, const Tensor& block_v,
+                        const PagedKVLayerView& c, unsigned context_keys, float* scratch,
+                        Tensor& out, cudaStream_t s) {
+    const int tokens = q.ne[2];
+    Cache cache{context_keys > 0 ? plane(c.k_pages) : Plane{},
+                context_keys > 0 ? plane(c.v_pages) : Plane{},
+                context_keys > 0 ? plane(c.k_scale_pages) : Plane{},
+                context_keys > 0 ? plane(c.v_scale_pages) : Plane{},
+                context_keys > 0 ? static_cast<const int*>(c.block_table.data) : nullptr,
+                0,
+                0};
+    const int ns        = context_keys > 0 ? static_cast<int>(splits(context_keys, tokens)) : 1;
+    const int partition = context_keys > 0 ? (static_cast<int>(context_keys) + ns - 1) / ns : 0;
+    BF* out_arg         = ns == 1 ? static_cast<BF*>(out.data) : nullptr;
+    const auto dispatch_mode = [&](auto fn) {
+        if (c.storage == KvCacheStorage::Int8Group64) {
+            fn.template operator()<KvMode::I8>();
+        } else if (c.storage == KvCacheStorage::RK4V4E8 ||
+                   c.storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) {
+            fn.template operator()<KvMode::RK4>();
+        } else {
+            fn.template operator()<KvMode::BF16>();
+        }
+    };
+    if (tokens == 1) {
+        dim3 grid(8, ns);
+        dispatch_mode([&]<KvMode Mode>() {
+            dspark_attention_kernel<false, Mode, 4, 1><<<grid, 4 * 32, 0, s>>>(
+                static_cast<const BF*>(q.data), static_cast<const BF*>(block_k.data),
+                static_cast<const BF*>(block_v.data), cache, static_cast<int>(context_keys),
+                tokens, ns, partition, scratch, out_arg);
+        });
+    } else {
+        dim3 grid(((tokens + 1) / 2) * 8, ns);
+        dispatch_mode([&]<KvMode Mode>() {
+            dspark_attention_kernel<false, Mode, 4, 2><<<grid, 4 * 32, 0, s>>>(
+                static_cast<const BF*>(q.data), static_cast<const BF*>(block_k.data),
+                static_cast<const BF*>(block_v.data), cache, static_cast<int>(context_keys),
+                tokens, ns, partition, scratch, out_arg);
+        });
+    }
+    CUDA_CHECK(cudaGetLastError());
+    if (ns > 1) {
+        dspark_reduce_kernel<<<tokens * 24, 128, 0, s>>>(scratch, ns, static_cast<BF*>(out.data));
         CUDA_CHECK(cudaGetLastError());
     }
 }

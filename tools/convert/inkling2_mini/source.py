@@ -448,3 +448,104 @@ def load_non_expert_tensor(spec: inventory.TensorSpec, reader: Inkling2SourceRea
         return t.to(torch.float32).contiguous()
 
     raise ValueError(f"unhandled non-expert tensor {name}")
+
+
+DEFAULT_WORKSPACE_MTP = Path(r"D:\Users\yaldi\gits\ninfer-4080\models\mtp.safetensors")
+
+
+def resolve_mtp_path(
+    model_dir: str | Path,
+    mtp_path: str | Path | None = None,
+    *,
+    allow_missing: bool = False,
+) -> Path | None:
+    if mtp_path is not None:
+        resolved = Path(mtp_path)
+        if not resolved.is_file():
+            raise FileNotFoundError(f"MTP safetensors file not found: {resolved}")
+        return resolved
+    for candidate in (DEFAULT_WORKSPACE_MTP, Path(model_dir) / "mtp.safetensors"):
+        if candidate.is_file():
+            return candidate
+    if allow_missing:
+        return None
+    raise FileNotFoundError(
+        f"mtp.safetensors not found in {DEFAULT_WORKSPACE_MTP} or {Path(model_dir) / 'mtp.safetensors'}"
+    )
+
+
+class MtpSourceReader:
+    """Safetensors reader for DSpark mtp.safetensors."""
+
+    def __init__(self, mtp_path: str | Path) -> None:
+        self.mtp_path = Path(mtp_path)
+        self._context = safe_open(str(self.mtp_path), framework="pt", device="cpu")
+        self._handle = self._context.__enter__()
+
+    def get(self, name: str) -> torch.Tensor:
+        return self._handle.get_tensor(name)
+
+    def close(self) -> None:
+        if self._context is not None:
+            self._context.__exit__(None, None, None)
+            self._context = None
+            self._handle = None
+
+    def __enter__(self) -> "MtpSourceReader":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+
+def load_mtp_tensor(spec: inventory.TensorSpec, reader: MtpSourceReader) -> torch.Tensor:
+    name = spec.name
+    if name == "mtp/fuse_weight":
+        return reader.get("fuse_weight").to(torch.float32).contiguous()
+    if name == "mtp/mask_embed":
+        return reader.get("mask_embed").to(torch.bfloat16).contiguous()
+    if name == "mtp/final_norm":
+        return reader.get("norm.weight").to(torch.bfloat16).contiguous()
+    if name == "mtp/markov/dflare_norm":
+        return reader.get("markov_head.dflare_norm.weight").to(torch.bfloat16).contiguous()
+    if name == "mtp/markov/w1":
+        return reader.get("markov_head.markov_w1.weight").to(torch.bfloat16).contiguous()
+    if name == "mtp/markov/rnn_proj_weight":
+        return reader.get("markov_head.rnn_proj.weight").to(torch.bfloat16).contiguous()
+    if name == "mtp/markov/rnn_proj_bias":
+        return reader.get("markov_head.rnn_proj.bias").to(torch.float32).contiguous()
+    if name == "mtp/markov/hidden_out_weight":
+        return reader.get("markov_head.hidden_out.weight").to(torch.bfloat16).contiguous()
+    if name == "mtp/markov/hidden_out_bias":
+        return reader.get("markov_head.hidden_out.bias").to(torch.float32).contiguous()
+
+    parts = name.split("/")
+    if len(parts) < 4 or parts[0] != "mtp" or parts[1] != "layers":
+        raise ValueError(f"unexpected MTP tensor name: {name}")
+    layer = int(parts[2])
+    suffix = "/".join(parts[3:])
+    hp = f"layers.{layer}."
+    mapping = {
+        "dflare_norm": ("dflare_norm.weight", torch.bfloat16),
+        "input_norm": ("input_layernorm.weight", torch.bfloat16),
+        "post_attention_norm": ("post_attention_layernorm.weight", torch.bfloat16),
+        "attention/q_norm": ("self_attn.q_norm.weight", torch.bfloat16),
+        "attention/k_norm": ("self_attn.k_norm.weight", torch.bfloat16),
+        "attention/k_norm_ctx": ("self_attn.k_norm_ctx.weight", torch.bfloat16),
+        "attention/q": ("self_attn.q_proj.weight", None),
+        "attention/k": ("self_attn.k_proj.weight", None),
+        "attention/v": ("self_attn.v_proj.weight", None),
+        "attention/k_ctx": ("self_attn.k_proj_ctx.weight", None),
+        "attention/v_ctx": ("self_attn.v_proj_ctx.weight", None),
+        "attention/output": ("self_attn.o_proj.weight", None),
+        "mlp/down": ("mlp.down_proj.weight", None),
+    }
+    if suffix == "mlp/gate_up":
+        gate = reader.get(hp + "mlp.gate_proj.weight")
+        up = reader.get(hp + "mlp.up_proj.weight")
+        return torch.cat((gate, up), dim=0).contiguous()
+    if suffix in mapping:
+        key, dtype = mapping[suffix]
+        t = reader.get(hp + key)
+        return t.to(dtype).contiguous() if dtype is not None else t
+    raise ValueError(f"unhandled MTP tensor {name}")

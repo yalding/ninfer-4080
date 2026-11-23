@@ -102,6 +102,7 @@ public:
         runtime::BeginSummary begin;
         std::uint32_t progress = 0, entitlement = 0;
         GenerationTimings timings;
+        SpeculativeStats speculative;
         bool shared = false;
         std::vector<std::uint32_t> captures, shared_captures;
         PreparedContextCache cache;
@@ -711,6 +712,13 @@ Program::progress_context_transaction(runtime::CancellationFlagView cancel) {
         seq.slot = std::find(impl_->slots.begin(), impl_->slots.end(), 0) - impl_->slots.begin();
         impl_->executor.reset(seq.slot);
     }
+    if (impl_->options.speculative.backend != SpeculativeBackend::None) {
+        seq.speculative.backend       = impl_->options.speculative.backend;
+        seq.speculative.enabled       = true;
+        seq.speculative.draft_window  = impl_->options.speculative.draft_tokens;
+        seq.speculative.verify_window = impl_->options.speculative.draft_tokens + 1U;
+        seq.speculative.accepted_per_position.assign(impl_->options.speculative.draft_tokens, 0);
+    }
     impl_->slots.at(seq.slot) = seq.id;
     auto id                   = seq.id;
     impl_->sequences.emplace(id, std::move(seq));
@@ -803,16 +811,48 @@ PendingBatch Program::decode(std::span<const SequenceHandle> handles,
         auto depth = impl_->executor.slot_depth(seq.slot);
         if (depth >= seq.ledger.size())
             throw std::logic_error("Inkling-2 decode has no committed input");
-        auto input    = std::span(seq.ledger).subspan(depth);
-        Tensor logits = impl_->executor.forward(input, depth, seq.slot);
-        ++impl_->revision;
+        auto input = std::span(seq.ledger).subspan(depth);
         pending.rows[i] = handles[i];
-        pending.counts.push_back(1);
-        timing.begin_wait();
-        pending.values.push_back(impl_->executor.sample(logits, seq.options.sampling,
-                                                        seq.generated.size(), seq.generated));
-        timing.end_wait();
-        timing.resume_submit();
+        const bool use_dspark = impl_->options.speculative.backend != SpeculativeBackend::None &&
+                                input.size() == 1 && budgets[i].generated_tokens_remaining > 1 &&
+                                depth + 2 <= impl_->options.max_context;
+        if (use_dspark) {
+            const auto k = std::min<std::uint32_t>({impl_->options.speculative.draft_tokens,
+                                                    budgets[i].generated_tokens_remaining - 1,
+                                                    impl_->options.max_context - depth - 1});
+            auto drafts = impl_->executor.draft_dspark(seq.slot, input[0], k);
+            std::vector<TokenId> verify_ids;
+            verify_ids.reserve(drafts.size() + 1);
+            verify_ids.push_back(input[0]);
+            verify_ids.insert(verify_ids.end(), drafts.begin(), drafts.end());
+            timing.begin_wait();
+            auto licensed = impl_->executor.verify_dspark(
+                seq.slot, verify_ids, depth, seq.options.sampling,
+                static_cast<std::uint32_t>(seq.generated.size()), seq.generated);
+            timing.end_wait();
+            timing.resume_submit();
+            ++impl_->revision;
+            pending.counts.push_back(static_cast<std::uint32_t>(licensed.size()));
+            pending.values.insert(pending.values.end(), licensed.begin(), licensed.end());
+            ++seq.speculative.rounds;
+            seq.speculative.drafted_tokens += k;
+            const auto accepted_drafts = static_cast<std::uint32_t>(licensed.size() - 1);
+            seq.speculative.accepted_tokens += accepted_drafts;
+            for (std::uint32_t j = 0;
+                 j < accepted_drafts && j < seq.speculative.accepted_per_position.size(); ++j)
+                ++seq.speculative.accepted_per_position[j];
+        } else {
+            Tensor logits = impl_->executor.forward(input, depth, seq.slot);
+            ++impl_->revision;
+            pending.counts.push_back(1);
+            timing.begin_wait();
+            pending.values.push_back(impl_->executor.sample(logits, seq.options.sampling,
+                                                            seq.generated.size(), seq.generated));
+            timing.end_wait();
+            timing.resume_submit();
+            if (impl_->options.speculative.backend != SpeculativeBackend::None)
+                ++seq.speculative.fallback_steps;
+        }
     }
     impl_->observe_external();
     pending.timing = timing.finish();
@@ -828,10 +868,12 @@ CommitResult Program::commit(PendingBatch&& pending,
     if (!impl_->pending || pending.transaction != impl_->pending ||
         decisions.size() != pending.row_count())
         throw std::logic_error("Inkling-2 invalid pending commit");
-    if (pending.values.size() != decisions.size())
+    std::size_t expected_values = 0;
+    for (std::size_t i = 0; i < decisions.size(); ++i) expected_values += pending.counts[i];
+    if (pending.values.size() != expected_values)
         throw std::logic_error("Inkling-2 pending values truncated");
     for (std::size_t i = 0; i < decisions.size(); ++i) {
-        if (decisions[i].accepted_tokens > 1 || pending.counts[i] != 1)
+        if (decisions[i].accepted_tokens > pending.counts[i])
             throw std::logic_error("Inkling-2 commit exceeds pending row");
         (void)impl_->get(pending.rows[i]);
         for (std::size_t j = 0; j < i; ++j)
@@ -840,24 +882,29 @@ CommitResult Program::commit(PendingBatch&& pending,
     }
     CommitResult out;
     out.row_count = decisions.size();
+    std::size_t value_offset = 0;
     for (std::size_t i = 0; i < decisions.size(); ++i) {
         const auto& d = decisions[i];
         auto& s       = impl_->get(pending.rows[i]);
-        if (d.accepted_tokens > 1)
-            throw std::logic_error("Inkling-2 commit accepts at most one token");
-        out.rows[i].timings = s.timings;
+        out.rows[i].timings     = s.timings;
+        out.rows[i].speculative = s.speculative;
         if (d.cancelled) {
             impl_->erase(s.id);
             out.rows[i].disposition = runtime::CommitDisposition::CancelledReleased;
+            value_offset += pending.counts[i];
             continue;
         }
         if (d.accepted_tokens) {
             if (s.generated.empty() && std::find(s.shared_captures.begin(), s.shared_captures.end(),
                                                  s.progress) != s.shared_captures.end())
                 out.captures[i] = CaptureOffer{s.id};
-            s.ledger.push_back(pending.values[i]);
-            s.generated.push_back(pending.values[i]);
+            for (std::uint32_t j = 0; j < d.accepted_tokens; ++j) {
+                const auto tok = pending.values[value_offset + j];
+                s.ledger.push_back(tok);
+                s.generated.push_back(tok);
+            }
         }
+        value_offset += pending.counts[i];
         out.rows[i].disposition = d.terminal ? runtime::CommitDisposition::Finishable
                                              : runtime::CommitDisposition::Active;
     }
@@ -878,9 +925,10 @@ DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept {
 FinishResult Program::finish(SequenceHandle handle) noexcept {
     FinishResult out;
     try {
-        auto& seq   = impl_->get(handle);
-        out.status  = runtime::ConsumeStatus::Consumed;
-        out.timings = seq.timings;
+        auto& seq       = impl_->get(handle);
+        out.status      = runtime::ConsumeStatus::Consumed;
+        out.timings     = seq.timings;
+        out.speculative = seq.speculative;
         if (seq.publish) {
             seq.active = false;
             seq.ledger.resize(impl_->executor.slot_depth(seq.slot));
@@ -905,8 +953,9 @@ FinishResult Program::finish(SequenceHandle handle) noexcept {
 AbortResult Program::abort(SequenceHandle handle) noexcept {
     AbortResult out;
     try {
-        auto& s     = impl_->get(handle);
-        out.timings = s.timings;
+        auto& s         = impl_->get(handle);
+        out.timings     = s.timings;
+        out.speculative = s.speculative;
         impl_->erase(handle.id);
         out.status = runtime::ConsumeStatus::Consumed;
     } catch (...) {}

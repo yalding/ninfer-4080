@@ -29,7 +29,7 @@ std::size_t small_t_workspace_bytes(int hi) {
 std::size_t prefill_workspace_bytes(int hi) {
     const int t = std::min(hi, inkling2_detail::kInkling2MoeSliceMax);
     const int route_tiles = (t + 7) / 8;
-    const int max_jobs = (t * 8) / inkling2_detail::kInkling2MoeExpertBN + 128;
+    const int max_jobs = (t * 8) / inkling2_detail::kInkling2MoeSmallExpertBN + 128;
     return aligned(std::size_t(t) * 128 * sizeof(float)) +
            aligned(std::size_t(t) * 8 * sizeof(int)) +
            aligned(std::size_t(t) * 8 * sizeof(float)) +
@@ -89,7 +89,7 @@ void inkling2_moe(const Tensor& x, const Inkling2MoeWeights& w, Tensor& out,
 
     const int slice_max = std::min(t, inkling2_detail::kInkling2MoeSliceMax);
     const int route_tiles = (slice_max + 7) / 8;
-    const int max_jobs = (slice_max * 8) / inkling2_detail::kInkling2MoeExpertBN + 128;
+    const int max_jobs = (slice_max * 8) / inkling2_detail::kInkling2MoeSmallExpertBN + 128;
     inkling2_detail::Inkling2MoePrefillWorkspace ws{};
     ws.router_probs =
         static_cast<float*>(workspace.alloc_bytes(std::size_t(slice_max) * 128 * sizeof(float)).data);

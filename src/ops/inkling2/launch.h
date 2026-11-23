@@ -17,4 +17,13 @@ void inkling2_control_launch(const Tensor&, const Tensor&, const Tensor&, const 
 void inkling2_clip_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                          const Tensor&, bool, Tensor&, Tensor&, Tensor&, Tensor&, cudaStream_t);
 void inkling2_softcap_launch(const Tensor&, float, int, Tensor&, cudaStream_t);
+void inkling2_dspark_feature_mix_launch(const Tensor&, const Tensor&, Inkling2Branches, Tensor&,
+                                        cudaStream_t);
+void inkling2_dspark_rmsnorm_rope_launch(const Tensor&, const Tensor&, const Tensor&, Tensor&,
+                                         Tensor&, float, cudaStream_t);
+void inkling2_dspark_rnn_step_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                     const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                     Tensor&, Tensor&, void*, float*, cudaStream_t);
+void inkling2_dspark_commit_conv_launch(const Tensor&, const Tensor&, Tensor&, int, int,
+                                        cudaStream_t);
 } // namespace ninfer::ops::detail

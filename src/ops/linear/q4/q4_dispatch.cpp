@@ -101,6 +101,7 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         case 1024:
         case 3072:
         case 6528:
+        case 18432:
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
             if (t <= 7) { return launch_q4_simt_r8_c4; }
             if (t <= 16) { return launch_q4_simt_r8_c8; }
@@ -117,6 +118,7 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     case 3072:
+    case 9216:
         if (n == 2304) {
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
             if (t <= 7) { return launch_q4_simt_r8_c4; }

@@ -252,6 +252,131 @@ int softcap(DeviceContext& dev, int t, bool padded, bool alias, bool graph) {
     return verify_reduction("inkling2 softcap slice", from_device_bf16(out.data, expected.size()), expected, kBF)
         + result.verify_guards("softcap guards");
 }
+
+int dspark_feature_mix_test(DeviceContext& dev, int t, bool graph) {
+    auto feat = values(2304 * t * 4, 91, 1.0f);
+    auto fuse = values(16, 92, 1.0f, false);
+    auto nw   = values(2304 * 4, 93, 1.0f);
+    auto df   = to_device_bf16(feat), dfuse = to_device(fuse), dnw = to_device_bf16(nw);
+    GuardedDeviceBuffer result(2304 * t * 4 * 2);
+    Tensor tf(df.p, DType::BF16, {2304, t, 4}), tfw(dfuse.p, DType::FP32, {4, 4});
+    Tensor out(result.data(), DType::BF16, {2304, t, 4});
+    std::vector<Tensor> norms;
+    for (int r = 0; r < 4; ++r)
+        norms.emplace_back(static_cast<std::uint16_t*>(dnw.p) + r * 2304, DType::BF16,
+                           std::initializer_list<int>{2304});
+    std::vector<double> expected(2304 * t * 4);
+    for (int r = 0; r < 4; ++r) {
+        double p[4]{}, mx = -INFINITY, sum = 0;
+        for (int j = 0; j < 4; ++j) mx = std::max(mx, double(fuse[r * 4 + j]));
+        for (int j = 0; j < 4; ++j) { p[j] = std::exp(fuse[r * 4 + j] - mx); sum += p[j]; }
+        for (int j = 0; j < 4; ++j) p[j] /= sum;
+        for (int tok = 0; tok < t; ++tok) {
+            double ss = 0;
+            for (int d = 0; d < 2304; ++d) {
+                double v = 0;
+                for (int j = 0; j < 4; ++j) v += p[j] * feat[(j * t + tok) * 2304 + d];
+                expected[(r * t + tok) * 2304 + d] = v;
+                ss += v * v;
+            }
+            const double inv = 1.0 / std::sqrt(ss / 2304.0 + 1e-6);
+            for (int d = 0; d < 2304; ++d)
+                expected[(r * t + tok) * 2304 + d] *= inv * nw[r * 2304 + d];
+        }
+    }
+    graph_run(dev, [&] { ops::inkling2_dspark_feature_mix(tf, tfw, norms, out, dev.stream); }, graph);
+    return check("dspark feature_mix", result, expected);
+}
+
+int dspark_rmsnorm_rope_test(DeviceContext& dev, int t, bool graph) {
+    auto q = values(128 * 24 * t, 94, 0.5f), k = values(128 * 8 * t, 95, 0.5f);
+    auto qn = values(128, 96, 1.0f), kn = values(128, 97, 1.0f);
+    std::vector<int> pos(t);
+    for (int i = 0; i < t; ++i) pos[i] = 1020 + i;
+    auto dq = to_device_bf16(q), dk = to_device_bf16(k);
+    auto dqn = to_device_bf16(qn), dkn = to_device_bf16(kn), dp = to_device(pos);
+    Tensor tq(dq.p, DType::BF16, {128, 24, t}), tk(dk.p, DType::BF16, {128, 8, t});
+    Tensor tqn(dqn.p, DType::BF16, {128}), tkn(dkn.p, DType::BF16, {128}), tp(dp.p, DType::I32, {t});
+    auto oracle = [&](std::vector<float>& buf, const std::vector<float>& nw, int heads) {
+        std::vector<double> out(buf.size());
+        for (int tok = 0; tok < t; ++tok)
+            for (int h = 0; h < heads; ++h) {
+                const int base = (tok * heads + h) * 128;
+                double ss = 0;
+                for (int d = 0; d < 128; ++d) ss += double(buf[base + d]) * buf[base + d];
+                const double inv = 1.0 / std::sqrt(ss / 128.0 + 1e-6);
+                for (int i = 0; i < 64; ++i) {
+                    const double a = pos[tok] * std::pow(1e6, -2.0 * i / 128.0);
+                    const double c = std::cos(a), s = std::sin(a);
+                    const double n0 = buf[base + i] * inv * nw[i];
+                    const double n1 = buf[base + i + 64] * inv * nw[i + 64];
+                    out[base + i]      = n0 * c - n1 * s;
+                    out[base + i + 64] = n1 * c + n0 * s;
+                }
+            }
+        return out;
+    };
+    const auto rq = oracle(q, qn, 24), rk = oracle(k, kn, 8);
+    graph_run(dev, [&] { ops::inkling2_dspark_rmsnorm_rope(tp, tqn, tkn, tq, tk, 1e6f, dev.stream); }, graph);
+    int fail = verify_reduction("dspark rope q", from_device_bf16(dq.p, rq.size()), rq, kBF);
+    fail += verify_reduction("dspark rope k", from_device_bf16(dk.p, rk.size()), rk, kBF);
+    return fail;
+}
+
+int dspark_rnn_step_test(DeviceContext& dev, bool graph) {
+    constexpr int V = 201024;
+    auto w1 = values(256 * 64, 98, 0.25f);
+    std::vector<float> full_w1(std::size_t(V) * 256, 0.0f);
+    std::copy(w1.begin(), w1.end(), full_w1.begin() + 42 * 256);
+    auto rw = values(768 * 5120, 99, 0.02f), rb = values(768, 100, 0.1f, false);
+    auto hw = values(2304 * 256, 101, 0.05f), hb = values(2304, 102, 0.1f, false);
+    auto hin = values(2304, 103, 0.5f), ch = values(2304, 104, 0.5f);
+    auto st = values(256, 105, 0.5f, false);
+    std::vector<int> tok{42};
+    auto dt = to_device(tok), dw1 = to_device_bf16(full_w1);
+    auto drw = to_device_bf16(rw), drb = to_device(rb);
+    auto dhw = to_device_bf16(hw), dhb = to_device(hb);
+    auto dhin = to_device_bf16(hin), dch = to_device_bf16(ch), dst = to_device(st);
+    GuardedDeviceBuffer hout(2304 * 2);
+    Tensor tt(dt.p, DType::I32, {1}), tw1(dw1.p, DType::BF16, {256, V});
+    Tensor trw(drw.p, DType::BF16, {5120, 768}), trb(drb.p, DType::FP32, {768});
+    Tensor thw(dhw.p, DType::BF16, {256, 2304}), thb(dhb.p, DType::FP32, {2304});
+    Tensor thin(dhin.p, DType::BF16, {2304}), tch(dch.p, DType::BF16, {2304});
+    Tensor tst(dst.p, DType::FP32, {256}), thout(hout.data(), DType::BF16, {2304});
+
+    std::vector<double> x5120(5120);
+    for (int i = 0; i < 256; ++i) x5120[i] = f32_to_bf16(st[i]) ? bf16_to_f32(f32_to_bf16(st[i])) : 0.0;
+    for (int i = 0; i < 256; ++i) x5120[256 + i] = full_w1[42 * 256 + i];
+    for (int i = 0; i < 2304; ++i) x5120[512 + i] = hin[i];
+    for (int i = 0; i < 2304; ++i) x5120[2816 + i] = ch[i];
+    double guz[768]{};
+    for (int r = 0; r < 768; ++r) {
+        double acc = rb[r];
+        for (int k = 0; k < 5120; ++k) acc += rw[r * 5120 + k] * x5120[k];
+        guz[r] = acc;
+    }
+    std::vector<double> exp_st(256), m(256), exp_h(2304);
+    for (int i = 0; i < 256; ++i) {
+        const double ut = std::tanh(guz[256 + i]);
+        const double gs = 1.0 / (1.0 + std::exp(-guz[i]));
+        exp_st[i]       = ut + gs * (st[i] - ut);
+        m[i]            = std::tanh(guz[512 + i]);
+    }
+    for (int r = 0; r < 2304; ++r) {
+        double acc = hb[r] + hin[r];
+        for (int k = 0; k < 256; ++k) acc += hw[r * 256 + k] * m[k];
+        exp_h[r] = acc;
+    }
+    WorkspaceArena ws(ops::inkling2_dspark_rnn_step_workspace_bytes());
+    graph_run(dev, [&] {
+        ops::inkling2_dspark_rnn_step(tt, tw1, trw, trb, thw, thb, thin, tch, tst, thout, ws, dev.stream);
+    }, graph);
+    int fail = check("dspark rnn h_out", hout, exp_h);
+    auto got_st = from_device<float>(dst.p, 256);
+    fail += verify_reduction("dspark rnn state", std::vector<double>(got_st.begin(), got_st.end()), exp_st, kFP);
+    if (ws.used() != 0) ++fail;
+    return fail;
+}
 } // namespace
 
 int main() {
@@ -259,9 +384,9 @@ int main() {
         if (cuda_unavailable()) return 77;
         DeviceContext device;
         int failures = 0;
-        for (int t : {1, 3, 15, 16, 17, 64, 129}) for (int n : {1, 24, 32, 64})
+        for (int t : {1, 3, 8, 15, 16, 17, 64, 129}) for (int n : {1, 24, 32, 64})
             for (bool fp32 : {false, true}) failures += projection(device, t, n, fp32, t != 1);
-        for (int t : {1, 2, 3, 17, 1024}) for (int c : {1024, 2304})
+        for (int t : {1, 2, 3, 8, 15, 17, 1024}) for (int c : {1024, 2304})
             for (bool alias : {false, true}) {
                 failures += convolution(device, c, t, 0, alias, true, t != 3);
                 if (c == 1024) for (int dt : {1, 2}) failures += convolution(device, c, t, dt, alias, false, true);
@@ -269,7 +394,7 @@ int main() {
         for (int m : {1, 2, 5, 8}) for (int r : {1, 3, 4}) for (bool norm : {false, true})
             failures += mixing(device, 3, m, r, norm, true);
         failures += mixing(device, 1, 5, 4, true, false, 0);
-        for (int t : {3, 15, 16, 17, 64, 129})
+        for (int t : {3, 8, 15, 16, 17, 64, 129})
             for (int c : {1, 3}) for (bool norm : {false, true}) for (bool alias : {false, true})
                 failures += control(device, t, c, norm, true, alias);
         for (int t : {1, 2, 15, 16, 64})
@@ -281,6 +406,10 @@ int main() {
         failures += clipping(device, 1, false, false, false);
         for (bool padded : {false, true}) failures += softcap(device, 3, padded, false, true);
         failures += softcap(device, 1, true, true, false);
+        failures += dspark_feature_mix_test(device, 1, false);
+        failures += dspark_feature_mix_test(device, 8, true);
+        failures += dspark_rmsnorm_rope_test(device, 8, true);
+        failures += dspark_rnn_step_test(device, false);
         std::cout << (failures ? "FAIL" : "PASS") << " Inkling2 fused ops (" << failures << " failures)\n";
         return failures ? 1 : 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

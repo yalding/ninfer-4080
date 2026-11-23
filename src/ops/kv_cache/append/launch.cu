@@ -109,7 +109,13 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
                 launch_fill.template operator()<false, false, false, false, false, false>();
             }
         } else {
-            launch_fill.template operator()<false, false, false, false, false, false>();
+            if (mode.e8_lattice) {
+                launch_fill.template operator()<true, true, true, true, true, false>();
+            } else if (mode.packed_k) {
+                launch_fill.template operator()<true, true, true, true, false, false>();
+            } else {
+                launch_fill.template operator()<false, false, false, false, false, false>();
+            }
         }
         CUDA_CHECK(cudaGetLastError());
         return;

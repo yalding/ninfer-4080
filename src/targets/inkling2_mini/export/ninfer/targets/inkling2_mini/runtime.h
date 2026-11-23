@@ -300,7 +300,9 @@ struct PendingBatch {
 
     std::span<const std::int32_t> row_counts() const noexcept { return counts; }
 
-    std::uint32_t row_stride() const noexcept { return 1; }
+    std::uint32_t row_stride() const noexcept {
+        return counts.empty() ? 1U : static_cast<std::uint32_t>(values.size() / counts.size());
+    }
 
     runtime::ExecutionTiming execution_timing() const noexcept { return timing; }
 };

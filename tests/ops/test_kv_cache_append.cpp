@@ -1566,6 +1566,202 @@ int full_append_d128_case(KvCacheStorage storage, int tokens, bool graph_replay 
     return failures;
 }
 
+void hadamard64_host(float* x) {
+    for (int step = 1; step < 64; step <<= 1) {
+        for (int i = 0; i < 64; i += 2 * step) {
+            for (int j = 0; j < step; ++j) {
+                const float a = x[i + j];
+                const float b = x[i + j + step];
+                x[i + j]        = a + b;
+                x[i + j + step] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < 64; ++i) x[i] *= 0.125f;
+}
+
+void e8_project_8d_host(float* x) {
+    float d8[8]{}, c1[8]{};
+    int sum_f = 0, worst_d8 = 0;
+    float max_err_d8 = -1.0f;
+    for (int i = 0; i < 8; ++i) {
+        const float f = std::nearbyint(x[i]);
+        d8[i]         = f;
+        sum_f += static_cast<int>(f);
+        const float err = std::abs(x[i] - f);
+        if (err > max_err_d8) {
+            max_err_d8 = err;
+            worst_d8   = i;
+        }
+    }
+    if ((sum_f & 1) != 0) d8[worst_d8] += (x[worst_d8] >= d8[worst_d8]) ? 1.0f : -1.0f;
+
+    int sum_s = 0, worst_s = 0;
+    float max_err_s = -1.0f;
+    for (int i = 0; i < 8; ++i) {
+        const float xs = x[i] - 0.5f;
+        const float f  = std::nearbyint(xs);
+        c1[i]          = f + 0.5f;
+        sum_s += static_cast<int>(f);
+        const float err = std::abs(xs - f);
+        if (err > max_err_s) {
+            max_err_s = err;
+            worst_s   = i;
+        }
+    }
+    if ((sum_s & 1) != 0) c1[worst_s] += ((x[worst_s] - 0.5f) >= (c1[worst_s] - 0.5f)) ? 1.0f : -1.0f;
+
+    float dist0 = 0.0f, dist1 = 0.0f;
+    for (int i = 0; i < 8; ++i) {
+        const float e0 = x[i] - d8[i];
+        const float e1 = x[i] - c1[i];
+        dist0 += e0 * e0;
+        dist1 += e1 * e1;
+    }
+    for (int i = 0; i < 8; ++i) x[i] = (dist0 <= dist1) ? d8[i] : c1[i];
+}
+
+int full_append_d128_rk4_case(int tokens, bool graph_replay = false) {
+    constexpr int d_head         = kHeadDim;
+    constexpr int kv_heads       = kKVHeads;
+    constexpr int i8_group       = 64;
+    constexpr int i8_groups      = d_head / i8_group;
+    constexpr int packed_head    = d_head / 2;
+    const int first_position     = tokens >= 128 ? 61 : 63;
+    const int logical_pages      = (first_position + tokens + kPage - 1) / kPage;
+    const int physical_pages     = 2 * logical_pages + 1;
+    std::vector<std::int32_t> mapping(static_cast<std::size_t>(logical_pages));
+    for (int page = 0; page < logical_pages; ++page) mapping[static_cast<std::size_t>(page)] = 2 * page + 1;
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
+    for (int token = 0; token < tokens; ++token) positions[static_cast<std::size_t>(token)] = first_position + token;
+
+    const std::size_t input_count = static_cast<std::size_t>(d_head) * kv_heads * tokens;
+    const auto plane_count        = [=](int leading_extent) {
+        return static_cast<std::size_t>(leading_extent) * kPage * kv_heads * physical_pages;
+    };
+    std::vector<float> host_k(input_count), host_v(input_count);
+    fill_uniform(host_k, 0x15791u + static_cast<std::uint32_t>(tokens), -0.75f, 0.75f);
+    fill_uniform(host_v, 0x26802u + static_cast<std::uint32_t>(tokens), -1.25f, 1.25f);
+    round_to_bf16(host_k);
+    round_to_bf16(host_v);
+    std::vector<std::uint16_t> input_k(input_count), input_v(input_count);
+    for (std::size_t i = 0; i < input_count; ++i) {
+        input_k[i] = f32_to_bf16(host_k[i]);
+        input_v[i] = f32_to_bf16(host_v[i]);
+    }
+    DeviceBuffer d_k = to_device(input_k), d_v = to_device(input_v);
+    DeviceBuffer d_positions = to_device(positions), d_mapping = to_device(mapping);
+    Tensor k(d_k.p, DType::BF16, {d_head, kv_heads, tokens});
+    Tensor v(d_v.p, DType::BF16, {d_head, kv_heads, tokens});
+    Tensor position_tensor(d_positions.p, DType::I32, {tokens});
+
+    const std::size_t code_count = plane_count(packed_head);
+    const std::size_t scl_count  = plane_count(i8_groups);
+    GuardedDeviceBuffer cache_k(code_count), cache_v(code_count);
+    GuardedDeviceBuffer scale_k(scl_count * 2), scale_v(scl_count * 2);
+    std::vector<std::uint8_t> expected_k(code_count, 0x55), expected_v(code_count, 0xaa);
+    auto expected_scale_k = patterned_bits(scl_count, 0x01234567U);
+    auto expected_scale_v = patterned_bits(scl_count, 0x89abcdefU);
+    cache_k.copy_from_host(expected_k.data(), expected_k.size());
+    cache_v.copy_from_host(expected_v.data(), expected_v.size());
+    scale_k.copy_from_host(expected_scale_k.data(), expected_scale_k.size() * 2);
+    scale_v.copy_from_host(expected_scale_v.data(), expected_scale_v.size() * 2);
+
+    PagedKVLayerView cache{
+        .k_pages       = Tensor(cache_k.data(), DType::U8, {packed_head, kPage, kv_heads, physical_pages}),
+        .v_pages       = Tensor(cache_v.data(), DType::U8, {packed_head, kPage, kv_heads, physical_pages}),
+        .k_scale_pages = Tensor(scale_k.data(), DType::FP16, {i8_groups, kPage, kv_heads, physical_pages}),
+        .v_scale_pages = Tensor(scale_v.data(), DType::FP16, {i8_groups, kPage, kv_heads, physical_pages}),
+        .block_table   = Tensor(d_mapping.p, DType::I32, {logical_pages}),
+        .head_dim      = d_head,
+        .num_kv_heads  = kv_heads,
+        .storage       = KvCacheStorage::RK4V4E8,
+    };
+
+    for (int token = 0; token < tokens; ++token) {
+        const int position = positions[static_cast<std::size_t>(token)];
+        const int page     = mapping[static_cast<std::size_t>(position / kPage)];
+        for (int head = 0; head < kv_heads; ++head) {
+            for (int group = 0; group < i8_groups; ++group) {
+                const std::size_t base = static_cast<std::size_t>(group * i8_group) +
+                                         static_cast<std::size_t>(d_head) *
+                                             (head + static_cast<std::size_t>(kv_heads) * token);
+                std::array<float, 64> rk{}, rv{};
+                for (int i = 0; i < 64; ++i) {
+                    rk[i] = host_k[base + i];
+                    rv[i] = host_v[base + i];
+                }
+                hadamard64_host(rk.data());
+                hadamard64_host(rv.data());
+                float ka = 0.0f, va = 0.0f;
+                for (int i = 0; i < 64; ++i) {
+                    ka = std::max(ka, std::abs(rk[i]));
+                    va = std::max(va, std::abs(rv[i]));
+                }
+                const std::uint16_t ks_bits = f32_to_f16_bits(ka / 7.0f);
+                const std::uint16_t vs_bits = f32_to_f16_bits(va / 7.0f);
+                const float ks = f16_bits_to_f32(ks_bits), vs = f16_bits_to_f32(vs_bits);
+                const float kinv = ks > 0.0f ? 1.0f / ks : 0.0f;
+                const float vinv = vs > 0.0f ? 1.0f / vs : 0.0f;
+                for (int i = 0; i < 64; ++i) rk[i] *= kinv;
+                for (int half = 0; half < 2; ++half) {
+                    for (int seg = 0; seg < 32; seg += 8) {
+                        e8_project_8d_host(&rk[half * 32 + seg]);
+                    }
+                }
+                for (int i = 0; i < 64; i += 2) {
+                    const int c0k = std::max(-8, std::min(7, static_cast<int>(std::nearbyint(rk[i]))));
+                    const int c1k = std::max(-8, std::min(7, static_cast<int>(std::nearbyint(rk[i + 1]))));
+                    const int c0v = vs == 0.0f ? 0 : std::max(-7, std::min(7, round_even_to_i32(rv[i] * vinv)));
+                    const int c1v = vs == 0.0f ? 0 : std::max(-7, std::min(7, round_even_to_i32(rv[i + 1] * vinv)));
+                    const std::size_t idx = full_cache_index(
+                        packed_head, (group * 64 + i) / 2, head, position, page, kv_heads);
+                    expected_k[idx] = static_cast<std::uint8_t>((c0k & 0xf) | ((c1k & 0xf) << 4));
+                    expected_v[idx] = static_cast<std::uint8_t>((c0v & 0xf) | ((c1v & 0xf) << 4));
+                }
+                expected_scale_k[full_cache_index(i8_groups, group, head, position, page, kv_heads)] = ks_bits;
+                expected_scale_v[full_cache_index(i8_groups, group, head, position, page, kv_heads)] = vs_bits;
+            }
+        }
+    }
+
+    if (!graph_replay) {
+        ops::kv_cache_append(k, v, position_tensor, cache, nullptr);
+        cuda_synchronize();
+    } else {
+        cudaStream_t stream        = nullptr;
+        cudaGraph_t graph          = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        cuda_check(cudaStreamCreate(&stream), "create d128 rk4 stream");
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "begin d128 rk4 capture");
+        ops::kv_cache_append(k, v, position_tensor, cache, stream);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "end d128 rk4 capture");
+        cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "inst d128 rk4 graph");
+        cuda_check(cudaGraphLaunch(executable, stream), "launch d128 rk4 graph");
+        cuda_check(cudaStreamSynchronize(stream), "sync d128 rk4 graph");
+        cudaGraphExecDestroy(executable);
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+    }
+
+    int failures = 0;
+    const std::string label = "kv_cache_append full d128 rk4v4-e8 T=" + std::to_string(tokens) +
+                              (graph_replay ? " graph" : "");
+    failures += verify_exact((label + " k scales").c_str(),
+                             from_device<std::uint16_t>(scale_k.data(), scl_count), expected_scale_k);
+    failures += verify_exact((label + " v scales").c_str(),
+                             from_device<std::uint16_t>(scale_v.data(), scl_count), expected_scale_v);
+    failures += verify_exact((label + " k codes").c_str(),
+                             from_device<std::uint8_t>(cache_k.data(), code_count), expected_k);
+    failures += verify_exact((label + " v codes").c_str(),
+                             from_device<std::uint8_t>(cache_v.data(), code_count), expected_v);
+    failures += cache_k.verify_guards((label + " k guards").c_str());
+    failures += cache_v.verify_guards((label + " v guards").c_str());
+    failures += scale_k.verify_guards((label + " ks guards").c_str());
+    failures += scale_v.verify_guards((label + " vs guards").c_str());
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1615,12 +1811,14 @@ int main(int argc, char** argv) {
     failures += full_append_case(2, KvCacheStorage::Nvfp4Group16, 129);
     failures += full_append_case(2, KvCacheStorage::Fp8KeyNvfp4Value, 129);
 #endif
-    for (const int t : {1, 3, 129}) {
+    for (const int t : {1, 3, 31, 32, 129}) {
         failures += full_append_d128_case(KvCacheStorage::BFloat16, t);
         failures += full_append_d128_case(KvCacheStorage::Int8Group64, t);
+        failures += full_append_d128_rk4_case(t);
     }
     failures += full_append_d128_case(KvCacheStorage::BFloat16, 3, true);
     failures += full_append_d128_case(KvCacheStorage::Int8Group64, 3, true);
+    failures += full_append_d128_rk4_case(8, true);
     failures += run_case(1, 0, 0, false, {0, 1, 2});
     failures += run_case(1, 1, 63, false, {2, 3, 4});
     failures += run_case(16, 7, 60, false, {5, 1, 4}, 5);

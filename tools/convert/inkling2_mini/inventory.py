@@ -46,6 +46,9 @@ SCONV_KERNEL = 4
 NUM_EXPERTS = 128
 TOP_K = 8
 MOE_INTERMEDIATE = 1152
+MTP_LAYERS = 3
+MTP_INTERMEDIATE = 9216
+MTP_MARKOV_RANK = 256
 
 FULL_ATTENTION_LAYERS = frozenset((5, 11, 17, 23))
 SWA_LAYERS = frozenset(i for i in range(PHYS_LAYERS) if i not in FULL_ATTENTION_LAYERS)
@@ -200,24 +203,80 @@ def _build_tensor_specs() -> tuple[TensorSpec, ...]:
     return tuple(specs)
 
 
+def _build_mtp_tensor_specs() -> tuple[TensorSpec, ...]:
+    specs: list[TensorSpec] = [
+        tensor_spec("mtp/fuse_weight", (4, 4), FP32),
+        tensor_spec("mtp/mask_embed", (HIDDEN_SIZE,), BF16),
+        tensor_spec("mtp/final_norm", (HIDDEN_SIZE,), BF16),
+    ]
+    for layer in range(MTP_LAYERS):
+        prefix = f"mtp/layers/{layer}/"
+        specs.extend(
+            (
+                tensor_spec(prefix + "dflare_norm", (HIDDEN_SIZE,), BF16),
+                tensor_spec(prefix + "input_norm", (HIDDEN_SIZE,), BF16),
+                tensor_spec(prefix + "post_attention_norm", (HIDDEN_SIZE,), BF16),
+                tensor_spec(prefix + "attention/q_norm", (HEAD_DIM,), BF16),
+                tensor_spec(prefix + "attention/k_norm", (HEAD_DIM,), BF16),
+                tensor_spec(prefix + "attention/k_norm_ctx", (HEAD_DIM,), BF16),
+                tensor_spec(prefix + "attention/q", (NUM_Q_HEADS * HEAD_DIM, HIDDEN_SIZE), Q4),
+                tensor_spec(prefix + "attention/k", (NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE), Q4),
+                tensor_spec(prefix + "attention/v", (NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE), Q4),
+                tensor_spec(prefix + "attention/k_ctx", (NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE), Q4),
+                tensor_spec(prefix + "attention/v_ctx", (NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE), Q4),
+                tensor_spec(prefix + "attention/output", (HIDDEN_SIZE, NUM_Q_HEADS * HEAD_DIM), Q4),
+                tensor_spec(prefix + "mlp/gate_up", (2 * MTP_INTERMEDIATE, HIDDEN_SIZE), Q4),
+                tensor_spec(prefix + "mlp/down", (HIDDEN_SIZE, MTP_INTERMEDIATE), Q4),
+            )
+        )
+    specs.extend(
+        (
+            tensor_spec("mtp/markov/dflare_norm", (HIDDEN_SIZE,), BF16),
+            tensor_spec("mtp/markov/w1", (VOCAB_SIZE, MTP_MARKOV_RANK), BF16),
+            tensor_spec("mtp/markov/rnn_proj_weight", (3 * MTP_MARKOV_RANK, HIDDEN_SIZE * 2 + MTP_MARKOV_RANK * 2), BF16),
+            tensor_spec("mtp/markov/rnn_proj_bias", (3 * MTP_MARKOV_RANK,), FP32),
+            tensor_spec("mtp/markov/hidden_out_weight", (HIDDEN_SIZE, MTP_MARKOV_RANK), BF16),
+            tensor_spec("mtp/markov/hidden_out_bias", (HIDDEN_SIZE,), FP32),
+        )
+    )
+    return tuple(specs)
+
+
 TENSOR_SPECS: tuple[TensorSpec, ...] = _build_tensor_specs()
+MTP_TENSOR_SPECS: tuple[TensorSpec, ...] = _build_mtp_tensor_specs()
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
-FORMAT_COUNTS = {
-    fmt: sum(1 for spec in TENSOR_SPECS if spec.format == fmt) for fmt in FORMAT_NAMES
-}
-LAYOUT_COUNTS = {
-    layout: sum(1 for spec in TENSOR_SPECS if spec.layout == layout) for layout in LAYOUT_NAMES
-}
+
+def tensor_specs(*, include_mtp: bool = False) -> tuple[TensorSpec, ...]:
+    return TENSOR_SPECS + MTP_TENSOR_SPECS if include_mtp else TENSOR_SPECS
 
 
-def total_tensor_payload_bytes() -> int:
-    return sum(encoded_size(spec.layout, spec.format, spec.shape) for spec in TENSOR_SPECS)
+def object_specs(*, include_mtp: bool = False) -> tuple[StoredObjectSpec, ...]:
+    return RESOURCE_SPECS + tensor_specs(include_mtp=include_mtp)
 
 
-def total_device_arena_bytes(alignment: int = 256) -> int:
+def format_counts(specs: tuple[TensorSpec, ...] = TENSOR_SPECS) -> dict[str, int]:
+    return {fmt: sum(1 for spec in specs if spec.format == fmt) for fmt in FORMAT_NAMES}
+
+
+def layout_counts(specs: tuple[TensorSpec, ...] = TENSOR_SPECS) -> dict[str, int]:
+    return {layout: sum(1 for spec in specs if spec.layout == layout) for layout in LAYOUT_NAMES}
+
+
+FORMAT_COUNTS = format_counts(TENSOR_SPECS)
+LAYOUT_COUNTS = layout_counts(TENSOR_SPECS)
+
+
+def total_tensor_payload_bytes(specs: tuple[TensorSpec, ...] = TENSOR_SPECS) -> int:
+    return sum(encoded_size(spec.layout, spec.format, spec.shape) for spec in specs)
+
+
+def total_device_arena_bytes(
+    alignment: int = 256,
+    specs: tuple[TensorSpec, ...] = TENSOR_SPECS,
+) -> int:
     cursor = 0
-    for spec in TENSOR_SPECS:
+    for spec in specs:
         cursor = align_up(cursor, alignment)
         cursor += encoded_size(spec.layout, spec.format, spec.shape)
     return cursor

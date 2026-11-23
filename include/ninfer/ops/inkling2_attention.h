@@ -70,4 +70,23 @@ void inkling2_full_attention(const Tensor& q, const Tensor& gate_qgr, const Tens
                              std::uint32_t max_visible_keys, WorkspaceArena& workspace, Tensor& out,
                              cudaStream_t stream);
 
+/**
+ * DSpark Sliding-Window GQA (`D=128, Hq=24, Hkv=8, W=1024`) over `[max(0, F+t-1023), F)` in
+ * `context` + non-causal `[F, F+T)` in `block_k`/`block_v` (`1 <= T <= 8`). Standard softmax
+ * without relative bias, zero-sink, or output gating.
+ */
+void inkling2_dspark_swa_attention(const Tensor& q, const Tensor& block_k, const Tensor& block_v,
+                                   std::uint32_t context_keys,
+                                   const CyclicKVCacheLayerView& context, std::int32_t lane,
+                                   Tensor& out, cudaStream_t stream);
+
+/**
+ * DSpark Full-Attention GQA (`D=128, Hq=24, Hkv=8`) over `[0, F)` in `cache` + non-causal
+ * `[F, F+T)` in `block_k`/`block_v` (`1 <= T <= 8`). Standard softmax without relative bias,
+ * zero-sink, or output gating.
+ */
+void inkling2_dspark_full_attention(const Tensor& q, const Tensor& block_k, const Tensor& block_v,
+                                    const PagedKVLayerView& cache, std::uint32_t context_keys,
+                                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops

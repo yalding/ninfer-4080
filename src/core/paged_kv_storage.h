@@ -103,6 +103,7 @@ struct PagedKVStorageLayout {
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
     case KvCacheStorage::RK4V4E8:
         if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::U8, 128, DType::FP16, 4}); }
+        if (head_dim == kD128KVCacheHeadDim) { return symmetric({DType::U8, 64, DType::FP16, 2}); }
         break;
     case KvCacheStorage::RK2V4E8:
         if (head_dim == kD256KVCacheHeadDim) {

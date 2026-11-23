@@ -55,7 +55,8 @@ void qualify(KvCacheStorage storage) {
     options.max_concurrency                      = 1;
     options.context_cache.device_state_slots     = 1;
     options.context_cache.host_state_slots       = 2;
-    options.context_cache.host_kv_capacity_bytes = 4ULL * 1024 * 1024;
+    options.context_cache.host_kv_capacity_bytes =
+        (storage == KvCacheStorage::RK4V4E8 ? 2ULL : 4ULL) * 1024 * 1024;
     options.kv_cache                             = storage;
     ik::StateImage state(options, 256);
     state.prepare_append(0, 0, 65, device.stream);
@@ -270,6 +271,7 @@ int main() {
     try {
         qualify(KvCacheStorage::BFloat16);
         qualify(KvCacheStorage::Int8Group64);
+        qualify(KvCacheStorage::RK4V4E8);
         EngineOptions options;
         options.max_context                      = 131072;
         options.kv_cache                         = KvCacheStorage::Int8Group64;
@@ -277,7 +279,11 @@ int main() {
         const auto layout                        = ik::plan_state(options, 131072);
         require(layout.bytes < 2500ULL * 1024 * 1024,
                 "128K state/KV allocation fits planned VRAM budget");
-        std::cout << "PASS: Inkling BF16/int8 KV page sharing/COW, device/host convolution and SWA "
+        options.kv_cache = KvCacheStorage::RK4V4E8;
+        const auto rk4_layout = ik::plan_state(options, 131072);
+        require(rk4_layout.bytes < 1450ULL * 1024 * 1024,
+                "128K RK4V4E8 state/KV allocation fits planned 128K VRAM budget");
+        std::cout << "PASS: Inkling BF16/int8/rk4v4-e8 KV page sharing/COW, device/host convolution and SWA "
                      "snapshots, reset and 128K budget\n";
         return 0;
     } catch (const std::exception& error) {

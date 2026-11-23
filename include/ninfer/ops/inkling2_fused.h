@@ -117,4 +117,50 @@ void inkling2_qkr_clip_v_norm(const Tensor& qgr, const Tensor& k_in, const Tenso
 void inkling2_softcap_slice(const Tensor& logits_in, float cap, std::int32_t valid_rows,
                             Tensor& logits_out, cudaStream_t stream);
 
+/**
+ * DSpark target feature mixing:
+ *   c_r(t) = RMSNorm(sum_{j=0..3} softmax(fuse_weight[r, :])[j] * features[:, t, j], dflare_norms[r])
+ * `features` and `out` are contiguous BF16 `[2304, T, 4]` (`T > 0`), `fuse_weight` is FP32 `[4, 4]`,
+ * and `dflare_norms` holds 4 contiguous BF16 `[2304]` tensors.
+ */
+void inkling2_dspark_feature_mix(const Tensor& features, const Tensor& fuse_weight,
+                                 std::span<const Tensor> dflare_norms, Tensor& out,
+                                 cudaStream_t stream);
+
+/**
+ * DSpark per-head RMSNorm (`eps = 1e-6`) + split-half 1-D RoPE (`theta = 1e6` by default).
+ * `positions` is I32 `[T]`, `q` is BF16 `[128, Hq, T]`, `k` is BF16 `[128, Hkv, T]` (or empty for
+ * single-tensor mode on `q`), `q_norm`/`k_norm` are BF16 `[128]`.
+ */
+void inkling2_dspark_rmsnorm_rope(const Tensor& positions, const Tensor& q_norm,
+                                  const Tensor& k_norm, Tensor& q, Tensor& k, float rope_theta,
+                                  cudaStream_t stream);
+
+/**
+ * Workspace capacity in bytes for `inkling2_dspark_rnn_step`.
+ */
+[[nodiscard]] std::size_t inkling2_dspark_rnn_step_workspace_bytes();
+
+/**
+ * DSpark fused Markov RNN-hidden step for a single draft step:
+ *   e = markov_w1[prev_token]
+ *   [g, u, z] = rnn_proj * [state; e; h_in; c_head] + rnn_proj_bias
+ *   state_next = tanh(u) + sigmoid(g) * (state - tanh(u))
+ *   m = tanh(z)
+ *   h_out = h_in + hidden_out * m + hidden_out_bias
+ */
+void inkling2_dspark_rnn_step(const Tensor& prev_token, const Tensor& markov_w1,
+                              const Tensor& rnn_proj_weight, const Tensor& rnn_proj_bias,
+                              const Tensor& hidden_out_weight, const Tensor& hidden_out_bias,
+                              const Tensor& h_in, const Tensor& c_head, Tensor& state,
+                              Tensor& h_out, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Restores and advances a slot's 48-visit 3-tap short-conv state `[6656*3, 48]` to `accepted`
+ * committed tokens (`1 <= accepted < width`) using `pre_state` and `conv_trace [6656*width, 48]`.
+ */
+void inkling2_dspark_commit_conv_state(const Tensor& pre_state, const Tensor& conv_trace,
+                                       Tensor& slot_conv_state, std::int32_t width,
+                                       std::int32_t accepted, cudaStream_t stream);
+
 } // namespace ninfer::ops

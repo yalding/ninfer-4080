@@ -161,4 +161,84 @@ void inkling2_softcap_slice(const Tensor& x, float cap, int valid, Tensor& out, 
     require(x.data != out.data || out.ne[0] == p, "in-place softcap needs equal strides");
     detail::inkling2_softcap_launch(x, cap, valid, out, s);
 }
+
+void inkling2_dspark_feature_mix(const Tensor& features, const Tensor& fuse_weight,
+                                 std::span<const Tensor> dflare_norms, Tensor& out,
+                                 cudaStream_t s) {
+    const int t = features.ne[1];
+    require(t > 0, "dspark feature_mix T must be positive");
+    shape(features, DType::BF16, {2304, t, 4});
+    shape(fuse_weight, DType::FP32, {4, 4});
+    shape(out, DType::BF16, {2304, t, 4});
+    require(dflare_norms.size() == 4, "dspark feature_mix requires 4 dflare_norms");
+    auto branches = norms(dflare_norms, 4);
+    disjoint(features, out);
+    disjoint(fuse_weight, out);
+    for (const auto& w : dflare_norms) disjoint(w, out);
+    detail::inkling2_dspark_feature_mix_launch(features, fuse_weight, branches, out, s);
+}
+
+void inkling2_dspark_rmsnorm_rope(const Tensor& positions, const Tensor& q_norm,
+                                  const Tensor& k_norm, Tensor& q, Tensor& k, float rope_theta,
+                                  cudaStream_t s) {
+    const int t  = q.ne[2];
+    const int hq = q.ne[1];
+    require(t > 0 && hq > 0 && rope_theta > 0.0f, "dspark rmsnorm_rope geometry");
+    shape(positions, DType::I32, {t});
+    shape(q_norm, DType::BF16, {128});
+    shape(q, DType::BF16, {128, hq, t});
+    disjoint(q, positions);
+    disjoint(q, q_norm);
+    if (k.data) {
+        const int hk = k.ne[1];
+        require(hk > 0, "dspark rmsnorm_rope k heads");
+        shape(k_norm, DType::BF16, {128});
+        shape(k, DType::BF16, {128, hk, t});
+        disjoint(q, k);
+        disjoint(k, positions);
+        disjoint(k, k_norm);
+    }
+    detail::inkling2_dspark_rmsnorm_rope_launch(positions, q_norm, k_norm, q, k, rope_theta, s);
+}
+
+std::size_t inkling2_dspark_rnn_step_workspace_bytes() {
+    return ((5120 * 2 + 255) & ~std::size_t(255)) + ((768 * sizeof(float) + 255) & ~std::size_t(255));
+}
+
+void inkling2_dspark_rnn_step(const Tensor& prev_token, const Tensor& markov_w1,
+                              const Tensor& rnn_proj_weight, const Tensor& rnn_proj_bias,
+                              const Tensor& hidden_out_weight, const Tensor& hidden_out_bias,
+                              const Tensor& h_in, const Tensor& c_head, Tensor& state,
+                              Tensor& h_out, WorkspaceArena& workspace, cudaStream_t s) {
+    shape(prev_token, DType::I32, {1});
+    shape(markov_w1, DType::BF16, {256, 201024});
+    shape(rnn_proj_weight, DType::BF16, {5120, 768});
+    shape(rnn_proj_bias, DType::FP32, {768});
+    shape(hidden_out_weight, DType::BF16, {256, 2304});
+    shape(hidden_out_bias, DType::FP32, {2304});
+    shape(h_in, DType::BF16, {2304});
+    shape(c_head, DType::BF16, {2304});
+    shape(state, DType::FP32, {256});
+    shape(h_out, DType::BF16, {2304});
+    disjoint(h_out, h_in);
+    disjoint(h_out, state);
+    auto scope = workspace.scope();
+    void* x_buf = workspace.alloc_bytes(5120 * 2).data;
+    auto* guz   = static_cast<float*>(workspace.alloc_bytes(768 * sizeof(float)).data);
+    detail::inkling2_dspark_rnn_step_launch(prev_token, markov_w1, rnn_proj_weight, rnn_proj_bias,
+                                            hidden_out_weight, hidden_out_bias, h_in, c_head, state,
+                                            h_out, x_buf, guz, s);
+}
+
+void inkling2_dspark_commit_conv_state(const Tensor& pre_state, const Tensor& conv_trace,
+                                       Tensor& slot_conv_state, std::int32_t width,
+                                       std::int32_t accepted, cudaStream_t s) {
+    require(width > 0 && accepted >= 1 && accepted <= width, "dspark commit conv range");
+    shape(pre_state, DType::BF16, {6656 * 3, 48});
+    shape(conv_trace, DType::BF16, {6656 * width, 48});
+    shape(slot_conv_state, DType::BF16, {6656 * 3, 48});
+    detail::inkling2_dspark_commit_conv_launch(pre_state, conv_trace, slot_conv_state, width,
+                                               accepted, s);
+}
+
 } // namespace ninfer::ops

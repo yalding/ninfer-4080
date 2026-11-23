@@ -77,40 +77,76 @@ int attention_oracle(const std::vector<float>& q,const std::vector<float>& gate,
     return verify_reduction(swa?"inkling2 SWA oracle":"inkling2 full oracle",actual,ref,
                             tokens>=16?attn_mma_criterion:bf16_criterion);
 }
-int full_case(DeviceContext& ctx,int count,int tokens,bool i8){
+void hadamard64_host(double* x){
+    for(int step=1;step<64;step<<=1)
+        for(int i=0;i<64;i+=2*step)
+            for(int j=0;j<step;++j){
+                double a=x[i+j],b=x[i+j+step];
+                x[i+j]=a+b;x[i+j+step]=a-b;
+            }
+    for(int i=0;i<64;++i)x[i]*=0.125;
+}
+int full_case(DeviceContext& ctx,int count,int tokens,KvCacheStorage storage){
     int pages=(count+63)/64,start=count-tokens;
+    const bool i8=(storage==KvCacheStorage::Int8Group64);
+    const bool rk4=(storage==KvCacheStorage::RK4V4E8);
     LogicalKV kv(count);
     auto q=pattern(std::size_t(3072)*tokens,8,0.5f),gate=pattern(std::size_t(6528)*tokens,9,2);
     auto rel=pattern(std::size_t(1025)*24*tokens,10,0.15f);
     std::vector<int> table(pages);for(int p=0;p<pages;++p)table[p]=pages-p-1;
     std::vector<int> positions(tokens);std::iota(positions.begin(),positions.end(),start);
     std::size_t n=std::size_t(pages)*64*1024;
-    std::vector<std::uint16_t> kb(i8?0:n),vb(i8?0:n),ks(i8?n/64:0),vs(ks.size());
-    std::vector<std::int8_t> kc(i8?n:0),vc(kc.size());
+    std::vector<std::uint16_t> kb((!i8&&!rk4)?n:0),vb((!i8&&!rk4)?n:0),ks((i8||rk4)?n/64:0),vs(ks.size());
+    std::vector<std::int8_t> kc(i8?n:0),vc(i8?n:0);
+    std::vector<std::uint8_t> ku(rk4?n/2:0),vu(rk4?n/2:0);
     for(int p=0;p<count;++p)for(int h=0;h<8;++h)for(int g=0;g<2;++g){
         auto dst=std::size_t(128)*(p%64+64*(h+8*table[p/64]));
         auto si=std::size_t(2)*(p%64+64*(h+8*table[p/64]))+g;
-        float km=0,vm=0;
-        for(int d=g*64;d<(g+1)*64;++d){auto src=d+128*(h+8*p);km=std::max(km,std::abs(kv.k[src]));vm=std::max(vm,std::abs(kv.v[src]));}
-        double kscale=i8?half_value(ks[si]=half_bits(km/127)):0;
-        double vscale=i8?half_value(vs[si]=half_bits(vm/127)):0;
-        for(int d=g*64;d<(g+1)*64;++d){auto src=d+128*(h+8*p);
-            if(i8){
-                kc[dst+d]=std::int8_t(std::clamp(int(std::nearbyint(kv.k[src]/kscale)),-127,127));
-                vc[dst+d]=std::int8_t(std::clamp(int(std::nearbyint(kv.v[src]/vscale)),-127,127));
-                kv.k[src]=float(kc[dst+d]*kscale);kv.v[src]=float(vc[dst+d]*vscale);
-            }else{kb[dst+d]=f32_to_bf16(kv.k[src]);vb[dst+d]=half_bits(kv.v[src]);kv.v[src]=float(half_value(vb[dst+d]));}
+        if(rk4){
+            std::array<double,64> rk{},rv{};
+            for(int d=0;d<64;++d){auto src=g*64+d+128*(h+8*p);rk[d]=kv.k[src];rv[d]=kv.v[src];}
+            hadamard64_host(rk.data());hadamard64_host(rv.data());
+            double km=0,vm=0;
+            for(int d=0;d<64;++d){km=std::max(km,std::abs(rk[d]));vm=std::max(vm,std::abs(rv[d]));}
+            double kscale=half_value(ks[si]=half_bits(float(km/7.0)));
+            double vscale=half_value(vs[si]=half_bits(float(vm/7.0)));
+            auto udst=std::size_t(64)*(p%64+64*(h+8*table[p/64]))+g*32;
+            for(int d=0;d<64;d+=2){
+                int c0k=std::clamp(int(std::nearbyint(rk[d]/kscale)),-8,7);
+                int c1k=std::clamp(int(std::nearbyint(rk[d+1]/kscale)),-8,7);
+                int c0v=std::clamp(int(std::nearbyint(rv[d]/vscale)),-7,7);
+                int c1v=std::clamp(int(std::nearbyint(rv[d+1]/vscale)),-7,7);
+                ku[udst+d/2]=std::uint8_t((c0k&0xf)|((c1k&0xf)<<4));
+                vu[udst+d/2]=std::uint8_t((c0v&0xf)|((c1v&0xf)<<4));
+                rk[d]=c0k*kscale;rk[d+1]=c1k*kscale;
+                rv[d]=c0v*vscale;rv[d+1]=c1v*vscale;
+            }
+            hadamard64_host(rk.data());hadamard64_host(rv.data());
+            for(int d=0;d<64;++d){auto src=g*64+d+128*(h+8*p);kv.k[src]=float(rk[d]);kv.v[src]=float(rv[d]);}
+        }else{
+            float km=0,vm=0;
+            for(int d=g*64;d<(g+1)*64;++d){auto src=d+128*(h+8*p);km=std::max(km,std::abs(kv.k[src]));vm=std::max(vm,std::abs(kv.v[src]));}
+            double kscale=i8?half_value(ks[si]=half_bits(km/127)):0;
+            double vscale=i8?half_value(vs[si]=half_bits(vm/127)):0;
+            for(int d=g*64;d<(g+1)*64;++d){auto src=d+128*(h+8*p);
+                if(i8){
+                    kc[dst+d]=std::int8_t(std::clamp(int(std::nearbyint(kv.k[src]/kscale)),-127,127));
+                    vc[dst+d]=std::int8_t(std::clamp(int(std::nearbyint(kv.v[src]/vscale)),-127,127));
+                    kv.k[src]=float(kc[dst+d]*kscale);kv.v[src]=float(vc[dst+d]*vscale);
+                }else{kb[dst+d]=f32_to_bf16(kv.k[src]);vb[dst+d]=half_bits(kv.v[src]);kv.v[src]=float(half_value(vb[dst+d]));}
+            }
         }
     }
-    DeviceBuffer dk=i8?to_device(kc):to_device(kb),dv=i8?to_device(vc):to_device(vb);
-    DeviceBuffer dks(i8?ks.size()*2:0),dvs(i8?vs.size()*2:0);
-    if(i8){dks.copy_from_host(ks.data(),ks.size()*2);dvs.copy_from_host(vs.data(),vs.size()*2);}
+    DeviceBuffer dk=rk4?to_device(ku):(i8?to_device(kc):to_device(kb));
+    DeviceBuffer dv=rk4?to_device(vu):(i8?to_device(vc):to_device(vb));
+    DeviceBuffer dks((i8||rk4)?ks.size()*2:0),dvs((i8||rk4)?vs.size()*2:0);
+    if(i8||rk4){dks.copy_from_host(ks.data(),ks.size()*2);dvs.copy_from_host(vs.data(),vs.size()*2);}
     auto dt=to_device(table),dp=to_device(positions),dq=to_device_bf16(q),dg=to_device_bf16(gate),dr=to_device(rel);
     PagedKVLayerView cache;cache.head_dim=128;cache.num_kv_heads=8;
-    cache.storage=i8?KvCacheStorage::Int8Group64:KvCacheStorage::BFloat16;
-    cache.k_pages=Tensor(dk.p,i8?DType::I8:DType::BF16,{128,64,8,pages});
-    cache.v_pages=Tensor(dv.p,i8?DType::I8:DType::FP16,{128,64,8,pages});
-    if(i8){cache.k_scale_pages=Tensor(dks.p,DType::FP16,{2,64,8,pages});cache.v_scale_pages=Tensor(dvs.p,DType::FP16,{2,64,8,pages});}
+    cache.storage=storage;
+    cache.k_pages=Tensor(dk.p,rk4?DType::U8:(i8?DType::I8:DType::BF16),{rk4?64:128,64,8,pages});
+    cache.v_pages=Tensor(dv.p,rk4?DType::U8:(i8?DType::I8:DType::FP16),{rk4?64:128,64,8,pages});
+    if(i8||rk4){cache.k_scale_pages=Tensor(dks.p,DType::FP16,{2,64,8,pages});cache.v_scale_pages=Tensor(dvs.p,DType::FP16,{2,64,8,pages});}
     cache.block_table=Tensor(dt.p,DType::I32,{pages});
     Tensor qt(dq.p,DType::BF16,{128,24,tokens}),gt(dg.p,DType::BF16,{6528,tokens});
     Tensor rt(dr.p,DType::FP32,{1025,24,tokens}),pt(dp.p,DType::I32,{tokens});
@@ -119,7 +155,7 @@ int full_case(DeviceContext& ctx,int count,int tokens,bool i8){
     captured(ctx,[&]{ops::inkling2_full_attention(qt,gt,rt,pt,cache,count,workspace,ot,ctx.stream);});
     int failures=attention_oracle(q,gate,rel,kv,start,tokens,false,from_device_bf16(out.data(),std::size_t(tokens)*3072));
     failures+=out.verify_guards("full guards");failures+=workspace.used()!=0;
-    std::cout<<"full keys="<<count<<" T="<<tokens<<" i8="<<i8<<" failures="<<failures<<'\n';return failures;
+    std::cout<<"full keys="<<count<<" T="<<tokens<<" mode="<<(rk4?"rk4":(i8?"i8":"bf16"))<<" failures="<<failures<<'\n';return failures;
 }
 int swa_case(DeviceContext& ctx,int start,int tokens){
     LogicalKV kv(start+tokens);
@@ -210,9 +246,95 @@ int moe_case(DeviceContext& ctx,bool q3,int tokens){
         }
     }
     int failures=verify_reduction("inkling2 MoE FP64",from_device_bf16(out.data(),ref.size()),ref,
-                                  tokens>=16?moe_mma_criterion:bf16_criterion);
+                                  tokens>=4?moe_mma_criterion:bf16_criterion);
     failures+=out.verify_guards("moe guards");failures+=workspace.used()!=0;
     std::cout<<"moe q3="<<q3<<" T="<<tokens<<" failures="<<failures<<'\n';return failures;
+}
+int dspark_attn_case(DeviceContext& ctx,int context_keys,int tokens,bool swa,KvCacheStorage storage){
+    LogicalKV kv(context_keys+tokens);
+    auto q=pattern(std::size_t(3072)*tokens,41,0.5f);
+    std::vector<float> bk(kv.k.begin()+std::size_t(context_keys)*1024,kv.k.end());
+    std::vector<float> bv(kv.v.begin()+std::size_t(context_keys)*1024,kv.v.end());
+    auto dq=to_device_bf16(q),dbk=to_device_bf16(bk),dbv=to_device_bf16(bv);
+    Tensor qt(dq.p,DType::BF16,{128,24,tokens}),bkt(dbk.p,DType::BF16,{128,8,tokens}),bvt(dbv.p,DType::BF16,{128,8,tokens});
+    GuardedDeviceBuffer out(std::size_t(tokens)*3072*2);Tensor ot(out.data(),DType::BF16,{128,24,tokens});
+    if(swa){
+        std::vector<std::uint16_t> kb(128*1024*8),vb(kb.size());
+        for(int p=std::max(0,context_keys-1024);p<context_keys;++p)for(int h=0;h<8;++h)for(int d=0;d<128;++d){
+            auto src=d+128*(h+8*p),dst=d+128*((p%1024)+1024*h);
+            kb[dst]=f32_to_bf16(kv.k[src]);vb[dst]=half_bits(kv.v[src]);kv.v[src]=float(half_value(vb[dst]));
+        }
+        auto dk=to_device(kb),dv=to_device(vb);
+        CyclicKVCacheLayerView cache;cache.capacity=cache.padded_capacity=1024;cache.head_dim=128;cache.num_kv_heads=8;cache.lane_capacity=1;
+        cache.k=Tensor(dk.p,DType::BF16,{128,1024,8,1});cache.v=Tensor(dv.p,DType::FP16,{128,1024,8,1});
+        captured(ctx,[&]{ops::inkling2_dspark_swa_attention(qt,bkt,bvt,context_keys,cache,0,ot,ctx.stream);});
+    }else{
+        int pages=std::max(1,(context_keys+63)/64);
+        const bool i8=(storage==KvCacheStorage::Int8Group64),rk4=(storage==KvCacheStorage::RK4V4E8);
+        std::vector<int> table(pages);for(int p=0;p<pages;++p)table[p]=pages-p-1;
+        std::size_t n=std::size_t(pages)*64*1024;
+        std::vector<std::uint16_t> kb((!i8&&!rk4)?n:0),vb((!i8&&!rk4)?n:0),ks((i8||rk4)?n/64:0),vs(ks.size());
+        std::vector<std::int8_t> kc(i8?n:0),vc(i8?n:0);
+        std::vector<std::uint8_t> ku(rk4?n/2:0),vu(rk4?n/2:0);
+        for(int p=0;p<context_keys;++p)for(int h=0;h<8;++h)for(int g=0;g<2;++g){
+            auto dst=std::size_t(128)*(p%64+64*(h+8*table[p/64]));
+            auto si=std::size_t(2)*(p%64+64*(h+8*table[p/64]))+g;
+            if(rk4){
+                std::array<double,64> rk{},rv{};
+                for(int d=0;d<64;++d){auto src=g*64+d+128*(h+8*p);rk[d]=kv.k[src];rv[d]=kv.v[src];}
+                hadamard64_host(rk.data());hadamard64_host(rv.data());
+                double km=0,vm=0;for(int d=0;d<64;++d){km=std::max(km,std::abs(rk[d]));vm=std::max(vm,std::abs(rv[d]));}
+                double kscale=half_value(ks[si]=half_bits(float(km/7.0))),vscale=half_value(vs[si]=half_bits(float(vm/7.0)));
+                auto udst=std::size_t(64)*(p%64+64*(h+8*table[p/64]))+g*32;
+                for(int d=0;d<64;d+=2){
+                    int c0k=std::clamp(int(std::nearbyint(rk[d]/kscale)),-8,7),c1k=std::clamp(int(std::nearbyint(rk[d+1]/kscale)),-8,7);
+                    int c0v=std::clamp(int(std::nearbyint(rv[d]/vscale)),-7,7),c1v=std::clamp(int(std::nearbyint(rv[d+1]/vscale)),-7,7);
+                    ku[udst+d/2]=std::uint8_t((c0k&0xf)|((c1k&0xf)<<4));vu[udst+d/2]=std::uint8_t((c0v&0xf)|((c1v&0xf)<<4));
+                    rk[d]=c0k*kscale;rk[d+1]=c1k*kscale;rv[d]=c0v*vscale;rv[d+1]=c1v*vscale;
+                }
+                hadamard64_host(rk.data());hadamard64_host(rv.data());
+                for(int d=0;d<64;++d){auto src=g*64+d+128*(h+8*p);kv.k[src]=float(rk[d]);kv.v[src]=float(rv[d]);}
+            }else{
+                float km=0,vm=0;
+                for(int d=g*64;d<(g+1)*64;++d){auto src=d+128*(h+8*p);km=std::max(km,std::abs(kv.k[src]));vm=std::max(vm,std::abs(kv.v[src]));}
+                double kscale=i8?half_value(ks[si]=half_bits(km/127)):0,vscale=i8?half_value(vs[si]=half_bits(vm/127)):0;
+                for(int d=g*64;d<(g+1)*64;++d){auto src=d+128*(h+8*p);
+                    if(i8){kc[dst+d]=std::int8_t(std::clamp(int(std::nearbyint(kv.k[src]/kscale)),-127,127));vc[dst+d]=std::int8_t(std::clamp(int(std::nearbyint(kv.v[src]/vscale)),-127,127));kv.k[src]=float(kc[dst+d]*kscale);kv.v[src]=float(vc[dst+d]*vscale);}
+                    else{kb[dst+d]=f32_to_bf16(kv.k[src]);vb[dst+d]=half_bits(kv.v[src]);kv.v[src]=float(half_value(vb[dst+d]));}
+                }
+            }
+        }
+        DeviceBuffer dk=rk4?to_device(ku):(i8?to_device(kc):to_device(kb)),dv=rk4?to_device(vu):(i8?to_device(vc):to_device(vb));
+        DeviceBuffer dks((i8||rk4)?ks.size()*2:0),dvs((i8||rk4)?vs.size()*2:0);
+        if(i8||rk4){dks.copy_from_host(ks.data(),ks.size()*2);dvs.copy_from_host(vs.data(),vs.size()*2);}
+        auto dt=to_device(table);
+        PagedKVLayerView cache;cache.head_dim=128;cache.num_kv_heads=8;cache.storage=storage;
+        cache.k_pages=Tensor(dk.p,rk4?DType::U8:(i8?DType::I8:DType::BF16),{rk4?64:128,64,8,pages});
+        cache.v_pages=Tensor(dv.p,rk4?DType::U8:(i8?DType::I8:DType::FP16),{rk4?64:128,64,8,pages});
+        if(i8||rk4){cache.k_scale_pages=Tensor(dks.p,DType::FP16,{2,64,8,pages});cache.v_scale_pages=Tensor(dvs.p,DType::FP16,{2,64,8,pages});}
+        cache.block_table=Tensor(dt.p,DType::I32,{pages});
+        WorkspaceArena ws(ops::inkling2_full_attention_workspace_capacity_bytes(storage,std::max(1,context_keys),tokens,tokens));
+        captured(ctx,[&]{ops::inkling2_dspark_full_attention(qt,bkt,bvt,cache,context_keys,ws,ot,ctx.stream);});
+    }
+    auto got=from_device_bf16(out.data(),std::size_t(tokens)*3072);
+    std::vector<double> ref,actual;
+    for(int t=0;t<tokens;++t){
+        int lo=swa?std::max(0,context_keys+t-1023):0;
+        for(int h=0;h<24;++h){
+            std::array<double,128> acc{};double maximum=-INFINITY,den=0;
+            for(int p=lo;p<context_keys+tokens;++p){
+                double dot=0;for(int d=0;d<128;++d)dot+=double(q[d+128*(h+24*t)])*kv.k[d+128*(h/3+8*p)];
+                double score=dot/std::sqrt(128.0);
+                double next=std::max(maximum,score),old=maximum==-INFINITY?0.0:std::exp(maximum-next),prob=std::exp(score-next);
+                den=den*old+prob;
+                for(int d=0;d<128;++d)acc[d]=acc[d]*old+prob*kv.v[d+128*(h/3+8*p)];
+                maximum=next;
+            }
+            for(int d=0;d<128;++d){ref.push_back(acc[d]/den);actual.push_back(got[d+128*(h+24*t)]);}
+        }
+    }
+    int failures=verify_reduction("dspark attn",actual,ref,bf16_criterion)+out.verify_guards("dspark guards");
+    std::cout<<"dspark swa="<<swa<<" ctx="<<context_keys<<" T="<<tokens<<" failures="<<failures<<'\n';return failures;
 }
 }
 int main(int argc,char** argv){
@@ -223,14 +345,23 @@ int main(int argc,char** argv){
             failures+=rel_case(ctx,1,false);failures+=rel_case(ctx,3,true);
         }
         if(sel=="all"||sel=="full"){
-            for(bool i8:{false,true})for(int count:{64,257,2049})for(int t:{1,15,16,17,64,257})if(t<=count)failures+=full_case(ctx,count,t,i8);
-            failures+=full_case(ctx,131072,1,true);
+            for(auto st:{KvCacheStorage::BFloat16,KvCacheStorage::Int8Group64,KvCacheStorage::RK4V4E8})
+                for(int count:{64,257,2049})for(int t:{1,8,15,16,17,64,257})if(t<=count)failures+=full_case(ctx,count,t,st);
+            failures+=full_case(ctx,131072,1,KvCacheStorage::Int8Group64);
+            failures+=full_case(ctx,131072,8,KvCacheStorage::Int8Group64);
+            failures+=full_case(ctx,131072,1,KvCacheStorage::RK4V4E8);
+            failures+=full_case(ctx,131072,8,KvCacheStorage::RK4V4E8);
         }
         if(sel=="all"||sel=="swa"){
-            for(int start:{0,513,1025,2049})for(int t:{1,15,16,17,64,129,1024})failures+=swa_case(ctx,start,t);
+            for(int start:{0,513,1025,2049})for(int t:{1,8,15,16,17,64,129,1024})failures+=swa_case(ctx,start,t);
         }
         if(sel=="all"||sel=="moe"){
-            for(bool q3:{false,true})for(int t:{1,3,15,16,17,64,65,256,1024})failures+=moe_case(ctx,q3,t);
+            for(bool q3:{false,true})for(int t:{1,3,4,8,15,16,17,64,65,256,1024})failures+=moe_case(ctx,q3,t);
+        }
+        if(sel=="all"||sel=="dspark"){
+            for(int ctx_k:{0,65,1025})failures+=dspark_attn_case(ctx,ctx_k,8,true,KvCacheStorage::BFloat16);
+            for(auto st:{KvCacheStorage::BFloat16,KvCacheStorage::Int8Group64,KvCacheStorage::RK4V4E8})
+                for(int ctx_k:{0,257})failures+=dspark_attn_case(ctx,ctx_k,8,false,st);
         }
         std::cout<<"inkling2 attention/MoE failures="<<failures<<'\n';return failures?1:0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

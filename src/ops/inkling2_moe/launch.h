@@ -2,8 +2,9 @@
 #include "ninfer/ops/inkling2_moe.h"
 
 namespace ninfer::ops::inkling2_detail {
-inline constexpr int kInkling2MoePrefillMinTokens = 16;
+inline constexpr int kInkling2MoePrefillMinTokens = 4;
 inline constexpr int kInkling2MoeSliceMax         = 1024;
+inline constexpr int kInkling2MoeSmallExpertBN    = 16;
 inline constexpr int kInkling2MoeExpertBN         = 32;
 
 struct Inkling2MoePrefillWorkspace {

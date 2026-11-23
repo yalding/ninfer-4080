@@ -20,8 +20,8 @@ if not exist "%NINFER_ARTIFACT%" (
 )
 echo Serving Inkling-2-Mini at http://%NINFER_BIND%:%NINFER_PORT%/v1
 if defined NINFER_API_KEY (
-  "%SERVER%" "%NINFER_ARTIFACT%" --host %NINFER_BIND% --port %NINFER_PORT% --api-key "%NINFER_API_KEY%" --max-context 131072 --kv-capacity 131072 --kv-dtype int8 --prefill-chunk 1024 --host-kv-mib 4096 --max-concurrency 1 --max-pending-requests 16 %*
+  "%SERVER%" "%NINFER_ARTIFACT%" --host %NINFER_BIND% --port %NINFER_PORT% --api-key "%NINFER_API_KEY%" --max-context 131072 --kv-capacity 131072 --kv-dtype rk4v4-e8 --prefill-chunk 1024 --host-kv-mib 4096 --max-concurrency 1 --max-pending-requests 16 %*
 ) else (
-  "%SERVER%" "%NINFER_ARTIFACT%" --host %NINFER_BIND% --port %NINFER_PORT% --max-context 131072 --kv-capacity 131072 --kv-dtype int8 --prefill-chunk 1024 --host-kv-mib 4096 --max-concurrency 1 --max-pending-requests 16 %*
+  "%SERVER%" "%NINFER_ARTIFACT%" --host %NINFER_BIND% --port %NINFER_PORT% --max-context 131072 --kv-capacity 131072 --kv-dtype rk4v4-e8 --prefill-chunk 1024 --host-kv-mib 4096 --max-concurrency 1 --max-pending-requests 16 %*
 )
 exit /b %ERRORLEVEL%

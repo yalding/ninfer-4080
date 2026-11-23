@@ -19,6 +19,13 @@ public:
     ~Executor();
     Tensor forward(std::span<const TokenId> ids, std::uint32_t start, std::uint32_t state_slot,
                    bool all_logits = false);
+    std::vector<TokenId> draft_dspark(std::uint32_t state_slot, TokenId anchor,
+                                      std::uint32_t draft_tokens);
+    std::vector<TokenId> verify_dspark(std::uint32_t state_slot, std::span<const TokenId> verify_ids,
+                                       std::uint32_t start,
+                                       const ResolvedSamplingParameters& sampling,
+                                       std::uint32_t logical_position,
+                                       std::span<const TokenId> generated_history);
     TokenId sample(const Tensor& logits, const ResolvedSamplingParameters& sampling,
                    std::uint32_t logical_position, std::span<const TokenId> generated_history);
     void reset(std::uint32_t slot);

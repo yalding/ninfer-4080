@@ -65,10 +65,19 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile) {
-    if (options.enable_vision || options.speculative.backend != SpeculativeBackend::None)
+    if (options.enable_vision)
+        throw std::invalid_argument("Inkling-2-Mini supports text-only execution");
+    if (options.speculative.backend != SpeculativeBackend::None &&
+        options.speculative.backend != SpeculativeBackend::DFlash &&
+        options.speculative.backend != SpeculativeBackend::Mtp)
         throw std::invalid_argument(
-            "Inkling-2-Mini Phase 1 supports text-only, unspeculative execution");
-    return LoadPlan(std::make_unique<LoadPlan::Impl>(detail::bind_artifact(binder), options));
+            "Inkling-2-Mini supports DSpark (dflash/mtp) speculative decoding");
+    if (options.speculative.backend != SpeculativeBackend::None &&
+        options.speculative.draft_tokens > 7)
+        throw std::invalid_argument("Inkling-2-Mini DSpark supports draft_tokens in [0..7]");
+    const bool load_mtp = options.speculative.backend != SpeculativeBackend::None;
+    return LoadPlan(
+        std::make_unique<LoadPlan::Impl>(detail::bind_artifact(binder, load_mtp), options));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -95,7 +104,14 @@ std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& mod
                                                           DeviceContext& device,
                                                           const StartupObserver&) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return std::make_unique<Program>(model.impl_->view, device, std::move(plan.options));
+    auto options = std::move(plan.options);
+    if (options.speculative.backend != SpeculativeBackend::None) {
+        if (!model.impl_->view.has_mtp)
+            throw std::invalid_argument(
+                "Inkling-2-Mini speculative decoding requires an artifact with mtp/ DSpark weights");
+        if (options.speculative.draft_tokens == 0) options.speculative.draft_tokens = 7;
+    }
+    return std::make_unique<Program>(model.impl_->view, device, std::move(options));
 }
 
 } // namespace ninfer::targets::inkling2_mini

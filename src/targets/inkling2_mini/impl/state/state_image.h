@@ -42,8 +42,15 @@ public:
                         cudaStream_t stream);
     void commit_append(std::uint32_t slot, std::uint32_t depth);
     Tensor convolution(std::uint32_t slot, int visit, int component) const;
+    Tensor slot_convolution(std::uint32_t slot) const;
     CyclicKVCacheLayerView swa(int layer) const;
     PagedKVLayerView full(std::uint32_t slot, int layer) const;
+    CyclicKVCacheLayerView dspark_swa(int layer) const;
+    PagedKVLayerView dspark_full(std::uint32_t slot) const;
+    std::uint32_t dspark_depth(std::uint32_t slot) const;
+    void commit_dspark_append(std::uint32_t slot, std::uint32_t depth);
+    bool has_dspark() const noexcept { return has_dspark_; }
+    std::size_t dflash_kv_bytes() const noexcept;
     std::uint32_t depth(std::uint32_t slot) const;
     std::uint32_t free_pages() const noexcept;
     std::uint32_t used_pages() const noexcept;
@@ -69,10 +76,14 @@ private:
     struct Slot {
         std::vector<std::shared_ptr<DeviceKVPageLease>> pages;
         KVExecutionRowLease row;
-        std::uint32_t depth = 0;
+        std::uint32_t depth        = 0;
+        std::uint32_t dspark_depth = 0;
     };
 
     void publish(std::uint32_t slot, cudaStream_t stream);
+    bool has_dspark_ = false;
+    int full_layers_ = 8;
+    int swa_layers_  = 40;
     StateLayout layout_;
     DeviceBuffer backing_;
     DeviceKVPagePool pages_;

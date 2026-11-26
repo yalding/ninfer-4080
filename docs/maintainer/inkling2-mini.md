@@ -2,7 +2,7 @@
 
 This reference records the `inkling2_mini` native target (`inkling2-mini / q3g128`,
 `inkling2_loop`) in NInfer: model semantics, artifact and converter contract, runtime and state
-ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–4 measurements.
+ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–5 measurements.
 
 ## 1. Model Identity and Architecture
 
@@ -36,7 +36,7 @@ ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–4 measurements
   - `text/token_embedding` (`[201024, 2304]`): `Q4G64_F16S` (`235 MiB`)
   - `text/output_head` (`[201024, 2304]`): `Q6G64_F16S` (`345 MiB`)
   - Norms, `sconv`, dynamic conv projections, sinks, relative biases, clips, routers, loop rank-64 tensors: `BF16` / `FP32` (`~49 MiB`)
-  - Optional DSpark `mtp/` tensors (`--mtp`, `51` stored tensors -> `591` total objects, `11,436,293,632` bytes total / `10.63 GiB` device weights): `fuse_weight` (`FP32` `[4, 4]`), `mask_embed` & `final_norm` (`BF16`), `3` draft layers (`Q4G64_F16S` `q`/`k`/`v`/`k_ctx`/`v_ctx`/`output`/`gate_up`/`down` + `BF16` norms), and Markov RNN head (`markov/dflare_norm`, `w1`, `rnn_proj_*`, `hidden_out_*`). Bound with `TensorPlacement::ValidateOnly` when speculative decoding is disabled.
+  - Optional DSpark `mtp/` tensors (`--mtp`, `53` stored tensors -> `593` total objects, `11,476,532,736` bytes total: `10.63 GiB` device weights with full proposal head, `10.66 GiB` when `mtp/draft_head` `Q4G64_F16S [32768, 2304]` + `mtp/draft_head_token_ids` `I32 [32768]` are active under `--lm-head-draft`): `fuse_weight` (`FP32` `[4, 4]`), `mask_embed` & `final_norm` (`BF16`), `3` draft layers (`Q4G64_F16S` `q`/`k`/`v`/`k_ctx`/`v_ctx`/`output`/`gate_up`/`down` + `BF16` norms), and Markov RNN head (`markov/dflare_norm`, `w1`, `rnn_proj_*`, `hidden_out_*`). Bound with `TensorPlacement::ValidateOnly` when speculative decoding is disabled.
   - Frontend resources: `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`
 
 ## 3. Runtime, StateImage, Prefix Reuse, and Frontend
@@ -55,11 +55,11 @@ ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–4 measurements
   - GPT-4o pre-tokenizer with `normalizer: null` and `ignore_merges: true`.
   - `ReasoningEffort` supports `None`, `Minimal` (`0.1`), `Low` (`0.2`), `Medium` (`0.7`), `High` (`0.9`), and `XHigh` (`0.99`).
 
-## 4. Verified Phase 1 Baseline (RTX 4060 Ti 16 GB, `sm_89`)
+## 4. Verified Optimization History (RTX 4060 Ti 16 GB, `sm_89`)
 
 Measured on NVIDIA GeForce RTX 4060 Ti 16 GB (`sm_89`, Windows WDDM, MSVC 14.44, CUDA 13.5 / driver 13.4, Ninja Release in `build-4060ti-ninja/`):
 
-### Correctness & Regression Gates
+### Phase 1 Baseline: Correctness, 128K Fit & Perplexity
 
 - **WP 1 converter & codec verifier:** `540` objects verified (`390` exact direct tensors, `50` sampled quantized objects, exact `MAXABS_F16_RECIP_RNE_V1` check); `tests.convert.inkling2_mini.test_verify` passed (`2` cases).
 - **WP 2 & WP 3 CUDA ops:** `ninfer_kv_cache_append_test`, `ninfer_linear_q4_a16_test`, `ninfer_linear_q6_a16_test`, `test_inkling2_fused`, and `test_inkling2_ops` all passed against independent FP64 host oracles (including `n_kv = 131,072` `Int8Group64` full-attention decode, `T = 1024` SWA ring safety, and CUDA Graph capture/replay).
@@ -158,8 +158,50 @@ Conditions: `--max-ctx 131072 --kv-dtype int8 -r 1 --warmup 0`, `bench/fixtures/
 - **OpenAI `/v1/chat/completions` & `/slots`:** `wp6-private` answered `4` then `7` (`26` cached tokens) with retained checkpoints visible in `/slots`.
 - **State transfer accounting:** `state_transfers.{d2d,d2h}.bytes` recorded exact multiples of `169,689,088` B (`169689088` for `count=1`, `339378176` for `count=2`, `509067264` for `count=3`).
 
+### Phase 5: Decode Recovery, Graphed Shortlist DSpark & Prefill A8/GQA-Grouped Kernels
+
+1. **Core decode recovery (WP 1):**
+   - Restored `control_down_small_t_kernel` to `dim3(16, t, c)` with `128` threads (`sum128` warp+SMEM reduction).
+   - Added split-KV `inkling2_swa_attention` (`swa_splits`: `4` for `> 256` keys, `2` for `129..256`, `1` for `<= 128`) with `T = 1` ring-append fusion (`append_to_ring`) and `34`-SM wave-aligned `splits()`.
+   - Vectorized `KvMode::RK4` loads (`__ldg` `uint32` + `__shfl_sync` + `__half22float2` scales), `exp2f((...) * Log2E)`, parallelized 3-head epilogue, and 6-pair `kv_cache_hadamard64`.
+   - Added coalesced 32-bit `Q3` small-`T` MoE loads (`__ldg` + `__shfl_sync` + `__funnelshift_r`) and `gate_up_kernel<true, 2>` (`dim3(576, t)`), keeping `act` in FP32 for `T < 4`.
+   - Added vectorized `T = 1` `sconv_single_vec4_kernel` and paired `inkling2_fused_sconv_kv` (cutting `24` SWA-layer launches/step).
+2. **Single-sync CUDA-graphed DSpark + `32,768`-row `Q4G64_F16S` shortlist `mtp/draft_head` + `--ngram chain` (WP 2):**
+   - Added `mtp/draft_head` (`Q4G64_F16S [32768, 2304]`) and `mtp/draft_head_token_ids` (`I32 [32768]`) in the converter (`--mtp`, `--base-artifact` repack) and `32768`-row dispatch in `q4_dispatch.cpp` (`--lm-head-draft` / `ProposalHead::Optimized`).
+   - Added CUDA-Graph-safe `context_keys_pos` overloads for `inkling2_dspark_{swa,full}_attention`, `draft_graphs`, `draft_dspark_body` (no softcap before argmax), `speculative_step_dspark` (single-sync graphed draft + verify, default `draft_tokens = 2`), and shared `NgramDraftPool` (`--ngram chain`).
+3. **Prefill `Q3-MoE A8` & `3:1` GQA-grouped `inkling2_prompt_kernel` (WP 3):**
+   - Added `inkling2_moe_grouped_a8_mma_kernel<GateUp, 32>` (`m16n8k32` `s8` Tensor Core MMA + `a8_g64_quantize`) for `Q3G128_F16S && T >= 64`.
+   - Grouped `inkling2_prompt_kernel` `3:1` by KV head (`dim3((tokens + 20) / 21, 8)`, `21` tokens × `3` GQA heads = `63` active rows in `q_s[64 * 128]`), eliminating `3×` redundant K/V staging and `RK4` dequantization.
+
+**12-Window `ninfer-perplexity` (`profiles/perplexity/inkling2-phase1/fixture.txt`, `--context 768 --stride 256`, `3,791` tokens):**
+
+| KV Dtype | Mean NLL | PPL | Score Rate |
+|---|---:|---:|---:|
+| `bf16` | `2.038121` | `7.676171` | `297.4 tok/s` |
+| `int8-g64` | `2.041130` | `7.699302` | `327.2 tok/s` |
+| `rk4v4-e8` | `2.042875` | `7.712754` *(-0.20% vs Phase 4 `7.728544`)* | `328.5 tok/s` |
+
+**128K `ninfer_bench` (`--max-ctx 131072 --kv-dtype rk4v4-e8 -r 2 --warmup 1`):**
+
+| Case | Phase 4 `MTP0` (PP / TG) | Phase 5 `MTP0` (PP / TG) | Phase 5 DSpark `K=2` Shortlist (PP / TG / `spec acc`) |
+|---|---:|---:|---:|
+| `tg128` (`d=0`) | `—` / `74.39 tok/s` | `—` / **`79.27 tok/s`** | `—` / `48.27 tok/s` (`5.73%`) |
+| `pp4096+tg128` | `1,811.58` / `58.27 tok/s` | **`1,894.52`** / **`71.32 tok/s`** | `1,882.31` / `46.39 tok/s` (`12.32%`) |
+| `pp32768+tg128` | `1,725.40` / `49.93 tok/s` | **`1,727.03`** / **`56.41 tok/s`** | `1,714.40` / `33.20 tok/s` (`16.06%`) |
+| `pp65536+tg128` | `1,562.01` / `41.71 tok/s` | **`1,570.56`** / **`49.43 tok/s`** | `—` |
+
+**512-Token Code Generation (`ninfer.exe`, C++20 SPSC prompt, `--greedy --max-new 512 --kv-dtype rk4v4-e8 --no-thinking`):**
+
+| Config | Decode Speed | Total Elapsed | Acceptance Rate | Mean Length | Accepted by Pos |
+|---|---:|---:|---:|---:|---|
+| `MTP0` (`K=0`) | `78.1 tok/s` | `8.9s` | `—` | `1.00 tok/step` | `—` |
+| **DSpark `K=2` (full head)** | **`79.9 tok/s`** | **`8.7s`** | **`54.1%`** | **`2.08 tok/round`** | `162, 103` (`245` rounds) |
+| DSpark `K=2` (`--lm-head-draft --ngram chain`) | `60.7 tok/s` | `10.7s` | `23.4%` | `1.47 tok/round` | `122, 42` (`346` rounds) |
+
+*Note on DSpark vs `MTP0`:* Because Sparse MoE verification (`W=3`) expands active experts from `8` to `~20–22` per visit across 48 visits, a graphed `K=2` round takes `~2.05×` an `MTP0` step. Consequently, **DSpark `K=2` (full head) beats `MTP0` when acceptance exceeds `~52%` (`> 2.05 tok/round`)** — e.g. code/structured generation (`79.9` vs `78.1 tok/s` at `54.1%`) — whereas `MTP0` (`79.27 tok/s`) remains much faster on dense prose (`5.7%–16.1%` acceptance). The current BPE-rank `[0..32709]` shortlist for `--lm-head-draft` drops acceptance from `54.1%` to `23.4%` because common tokens sit above ID `32710`, so leave `--lm-head-draft` off until shortlist calibration is added.
+
 ## 5. Follow-On Roadmap
 
-1. **Quality upgrade option:** Add imatrix/AWQ calibration or `Q4G64_F16S` `ffn/routed_down` if closing the `8.71` vs `8.16` PPL gap is prioritized over `128K` VRAM headroom.
-2. **Lightweight DSpark draft LM-head:** Add a pruned/shortlist `--lm-head-draft` for DSpark to eliminate the `K` full-vocab Q6 `[201024, 2304]` `output_head` calls per draft round.
+1. **Frequency-calibrated DSpark shortlist:** Calibrate `mtp/draft_head_token_ids` by token frequency on a code+text corpus (instead of raw BPE rank) so `--lm-head-draft` preserves full-head `54%+` acceptance.
+2. **Quality upgrade option:** Add imatrix/AWQ calibration or `Q4G64_F16S` `ffn/routed_down` if closing the `8.71` vs `8.16` PPL gap is prioritized over `128K` VRAM headroom.
 3. **Vision:** Port Inkling-2's 23-layer ViT (`dim=1024`, `patch=20`, `merge=2`, axial RoPE `theta=10000`).

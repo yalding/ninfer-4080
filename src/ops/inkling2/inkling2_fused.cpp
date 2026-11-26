@@ -77,6 +77,37 @@ void inkling2_fused_sconv(const Tensor& x, const Tensor& w, const Tensor& dynami
     detail::inkling2_sconv_launch(x, w, dynamic, state_in, state_out, residual, out, s);
 }
 
+void inkling2_fused_sconv_kv(const Tensor& kx, const Tensor& k_weight, const Tensor& k_dynamic,
+                             const Tensor& k_state_in, Tensor& k_state_out, Tensor& k_out,
+                             const Tensor& vx, const Tensor& v_weight, const Tensor& v_dynamic,
+                             const Tensor& v_state_in, Tensor& v_state_out, Tensor& v_out,
+                             cudaStream_t s) {
+    const int t = kx.ne[1];
+    auto check_branch = [&](const Tensor& x, const Tensor& w, const Tensor& dyn,
+                            const Tensor& st_in, const Tensor& st_out, const Tensor& out) {
+        shape(x, DType::BF16, {1024, t});
+        shape(out, DType::BF16, {1024, t});
+        shape(w, DType::FP32, {4, 1024});
+        shape(st_in, DType::BF16, {1024, 3});
+        shape(st_out, DType::BF16, {1024, 3});
+        identical_or_disjoint(st_in, st_out);
+        disjoint(x, out); disjoint(x, st_out); disjoint(out, st_in); disjoint(out, st_out);
+        disjoint(w, out); disjoint(w, st_out);
+        if (dyn.data) {
+            require(dyn.dtype == DType::FP32 || dyn.dtype == DType::BF16,
+                    "dynamic convolution geometry/dtype");
+            shape(dyn, dyn.dtype, {32, t});
+            disjoint(dyn, out); disjoint(dyn, st_out);
+        }
+    };
+    check_branch(kx, k_weight, k_dynamic, k_state_in, k_state_out, k_out);
+    check_branch(vx, v_weight, v_dynamic, v_state_in, v_state_out, v_out);
+    require(k_dynamic.data != nullptr == (v_dynamic.data != nullptr),
+            "paired sconv_kv dynamic taps mismatch");
+    detail::inkling2_sconv_kv_launch(kx, k_weight, k_dynamic, k_state_in, k_state_out, k_out, vx,
+                                     v_weight, v_dynamic, v_state_in, v_state_out, v_out, s);
+}
+
 void inkling2_attn_res_mix(std::span<const Tensor> states, const Tensor& q,
                            std::span<const Tensor> nw, Tensor& out, cudaStream_t s) {
     const int m = static_cast<int>(states.size()), r = q.ne[1], t = out.ne[1];

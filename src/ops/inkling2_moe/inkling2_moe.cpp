@@ -26,24 +26,31 @@ std::size_t small_t_workspace_bytes(int hi) {
            aligned(std::size_t(t) * 8 * 1152 * sizeof(float));
 }
 
-std::size_t prefill_workspace_bytes(int hi) {
+std::size_t prefill_workspace_bytes(QType q, int hi) {
     const int t = std::min(hi, inkling2_detail::kInkling2MoeSliceMax);
     const int route_tiles = (t + 7) / 8;
     const int max_jobs = (t * 8) / inkling2_detail::kInkling2MoeSmallExpertBN + 128;
-    return aligned(std::size_t(t) * 128 * sizeof(float)) +
-           aligned(std::size_t(t) * 8 * sizeof(int)) +
-           aligned(std::size_t(t) * 8 * sizeof(float)) +
-           aligned(std::size_t(t) * 8 * sizeof(int)) +
-           aligned(std::size_t(t) * 8 * sizeof(int)) +
-           aligned(std::size_t(t) * 8 * sizeof(int)) +
-           aligned(std::size_t(route_tiles) * 128 * sizeof(int)) +
-           aligned(std::size_t(route_tiles) * 128 * sizeof(int)) +
-           aligned(129 * sizeof(int)) +
-           aligned(std::size_t(max_jobs) * sizeof(int)) +
-           aligned(std::size_t(max_jobs) * sizeof(int)) +
-           aligned(2 * sizeof(int)) +
-           aligned(std::size_t(t) * 8 * 1152 * 2) +
-           aligned(std::size_t(t) * 8 * 2304 * 2);
+    std::size_t bytes = aligned(std::size_t(t) * 128 * sizeof(float)) +
+                        aligned(std::size_t(t) * 8 * sizeof(int)) +
+                        aligned(std::size_t(t) * 8 * sizeof(float)) +
+                        aligned(std::size_t(t) * 8 * sizeof(int)) +
+                        aligned(std::size_t(t) * 8 * sizeof(int)) +
+                        aligned(std::size_t(t) * 8 * sizeof(int)) +
+                        aligned(std::size_t(route_tiles) * 128 * sizeof(int)) +
+                        aligned(std::size_t(route_tiles) * 128 * sizeof(int)) +
+                        aligned(129 * sizeof(int)) +
+                        aligned(std::size_t(max_jobs) * sizeof(int)) +
+                        aligned(std::size_t(max_jobs) * sizeof(int)) +
+                        aligned(2 * sizeof(int)) +
+                        aligned(std::size_t(t) * 8 * 1152 * 2) +
+                        aligned(std::size_t(t) * 8 * 2304 * 2);
+    if (q == QType::Q3G128_F16S && hi >= 64) {
+        bytes += aligned(std::size_t(t) * 2304) +
+                 aligned(std::size_t(t) * (2304 / 64) * sizeof(float)) +
+                 aligned(std::size_t(t) * 8 * 1152) +
+                 aligned(std::size_t(t) * 8 * (1152 / 64) * sizeof(float));
+    }
+    return bytes;
 }
 } // namespace
 
@@ -54,7 +61,7 @@ std::size_t inkling2_moe_workspace_capacity_bytes(QType q, int lo, int hi) {
     if (lo < inkling2_detail::kInkling2MoePrefillMinTokens)
         peak = std::max(peak, small_t_workspace_bytes(hi));
     if (hi >= inkling2_detail::kInkling2MoePrefillMinTokens)
-        peak = std::max(peak, prefill_workspace_bytes(hi));
+        peak = std::max(peak, prefill_workspace_bytes(q, hi));
     return peak;
 }
 
@@ -115,6 +122,16 @@ void inkling2_moe(const Tensor& x, const Inkling2MoeWeights& w, Tensor& out,
     ws.route_job_count = static_cast<int*>(workspace.alloc_bytes(2 * sizeof(int)).data);
     ws.routed_activation = workspace.alloc_bytes(std::size_t(slice_max) * 8 * 1152 * 2).data;
     ws.grouped_output = workspace.alloc_bytes(std::size_t(slice_max) * 8 * 2304 * 2).data;
+    if (w.routed_gate_up.qtype == QType::Q3G128_F16S && t >= 64) {
+        ws.x_a8_q = static_cast<std::int8_t*>(
+            workspace.alloc_bytes(std::size_t(slice_max) * 2304).data);
+        ws.x_a8_scale = static_cast<float*>(
+            workspace.alloc_bytes(std::size_t(slice_max) * (2304 / 64) * sizeof(float)).data);
+        ws.act_a8_q = static_cast<std::int8_t*>(
+            workspace.alloc_bytes(std::size_t(slice_max) * 8 * 1152).data);
+        ws.act_a8_scale = static_cast<float*>(
+            workspace.alloc_bytes(std::size_t(slice_max) * 8 * (1152 / 64) * sizeof(float)).data);
+    }
 
     const auto* x_bytes = static_cast<const std::byte*>(x.data);
     auto* out_bytes = static_cast<std::byte*>(out.data);

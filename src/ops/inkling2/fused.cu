@@ -23,6 +23,14 @@ __device__ float sum256(float value, float* scratch) {
     __syncthreads();
     return result;
 }
+__device__ float sum128(float value, float* scratch) {
+    value = block_reduce_sum<128>(value, scratch);
+    if (threadIdx.x == 0) scratch[0] = value;
+    __syncthreads();
+    const float result = scratch[0];
+    __syncthreads();
+    return result;
+}
 __device__ __forceinline__ float dot_uint4_bf16(uint4 a, uint4 b) {
     const auto* pa = reinterpret_cast<const __nv_bfloat162*>(&a);
     const auto* pb = reinterpret_cast<const __nv_bfloat162*>(&b);
@@ -176,6 +184,128 @@ __global__ __launch_bounds__(256, 2) void proj_mma_kernel(const BF* __restrict__
     }
 }
 
+__global__ void sconv_single_vec4_kernel(const BF* __restrict__ x, const float* __restrict__ weight,
+                                         const void* __restrict__ taps, bool taps_fp32,
+                                         const BF* __restrict__ old, BF* __restrict__ state,
+                                         const BF* __restrict__ residual, BF* __restrict__ out,
+                                         int channels) {
+    const int c = (static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x)) * 4;
+    if (c >= channels) return;
+    const uint2 u0v = load_vec<uint2>(x + c);
+    const uint2 u1v = load_vec<uint2>(old + 2 * channels + c);
+    const uint2 u2v = load_vec<uint2>(old + channels + c);
+    const uint2 u3v = load_vec<uint2>(old + c);
+    const float4 w0 = load_vec<float4>(weight + 4 * c);
+    const float4 w1 = load_vec<float4>(weight + 4 * c + 4);
+    const float4 w2 = load_vec<float4>(weight + 4 * c + 8);
+    const float4 w3 = load_vec<float4>(weight + 4 * c + 12);
+    float dt0 = 0.0f, dt1 = 0.0f, dt2 = 0.0f, dt3 = 0.0f;
+    if (taps) {
+        const int base = 4 * (c / 128);
+        if (taps_fp32) {
+            const float4 tv = load_vec<float4>(static_cast<const float*>(taps) + base);
+            dt0 = tv.x; dt1 = tv.y; dt2 = tv.z; dt3 = tv.w;
+        } else {
+            const uint2 tv = load_vec<uint2>(static_cast<const BF*>(taps) + base);
+            const auto* tp = reinterpret_cast<const __nv_bfloat162*>(&tv);
+            const float2 t01 = __bfloat1622float2(tp[0]);
+            const float2 t23 = __bfloat1622float2(tp[1]);
+            dt0 = t01.x; dt1 = t01.y; dt2 = t23.x; dt3 = t23.y;
+        }
+    }
+    const float scale = taps ? (1.0f / 3.0f) : 0.44721359549995794f;
+    uint2 resv{};
+    if (residual) resv = load_vec<uint2>(residual + c);
+    const auto unpack2 = [](const uint2& v, int idx) -> float2 {
+        return __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&v)[idx]);
+    };
+    const float2 u0a = unpack2(u0v, 0), u0b = unpack2(u0v, 1);
+    const float2 u1a = unpack2(u1v, 0), u1b = unpack2(u1v, 1);
+    const float2 u2a = unpack2(u2v, 0), u2b = unpack2(u2v, 1);
+    const float2 u3a = unpack2(u3v, 0), u3b = unpack2(u3v, 1);
+    const float2 r0a = residual ? unpack2(resv, 0) : make_float2(0.0f, 0.0f);
+    const float2 r0b = residual ? unpack2(resv, 1) : make_float2(0.0f, 0.0f);
+    auto eval = [&](float x0, float x1, float x2, float x3, float4 w, float res) {
+        float val = x0 + w.x * x3 + w.y * x2 + w.z * x1 + w.w * x0;
+        if (taps) {
+            val = fmaf(dt0, x0, fmaf(dt1, x1, fmaf(dt2, x2, fmaf(dt3, x3, val))));
+        }
+        val *= scale;
+        if (residual) val += res;
+        return val;
+    };
+    const float y0 = eval(u0a.x, u1a.x, u2a.x, u3a.x, w0, r0a.x);
+    const float y1 = eval(u0a.y, u1a.y, u2a.y, u3a.y, w1, r0a.y);
+    const float y2 = eval(u0b.x, u1b.x, u2b.x, u3b.x, w2, r0b.x);
+    const float y3 = eval(u0b.y, u1b.y, u2b.y, u3b.y, w3, r0b.y);
+    const __nv_bfloat162 o0 = __floats2bfloat162_rn(y0, y1);
+    const __nv_bfloat162 o1 = __floats2bfloat162_rn(y2, y3);
+    store_vec(out + c, make_uint2(*reinterpret_cast<const unsigned*>(&o0),
+                                  *reinterpret_cast<const unsigned*>(&o1)));
+    store_vec(state + c, u2v);
+    store_vec(state + channels + c, u1v);
+    store_vec(state + 2 * channels + c, u0v);
+}
+
+__global__ void sconv_kv_single_vec4_kernel(
+    const BF* __restrict__ kx, const float* __restrict__ kw, const void* __restrict__ ktaps,
+    const BF* __restrict__ kold, BF* __restrict__ kstate, BF* __restrict__ kout,
+    const BF* __restrict__ vx, const float* __restrict__ vw, const void* __restrict__ vtaps,
+    const BF* __restrict__ vold, BF* __restrict__ vstate, BF* __restrict__ vout,
+    bool taps_fp32) {
+    const bool is_v = blockIdx.y != 0;
+    const int c     = threadIdx.x * 4;
+    const BF* x     = is_v ? vx : kx;
+    const float* w  = is_v ? vw : kw;
+    const void* taps = is_v ? vtaps : ktaps;
+    const BF* old   = is_v ? vold : kold;
+    BF* state       = is_v ? vstate : kstate;
+    BF* out         = is_v ? vout : kout;
+    const uint2 u0v = load_vec<uint2>(x + c);
+    const uint2 u1v = load_vec<uint2>(old + 2048 + c);
+    const uint2 u2v = load_vec<uint2>(old + 1024 + c);
+    const uint2 u3v = load_vec<uint2>(old + c);
+    const float4 w0 = load_vec<float4>(w + 4 * c);
+    const float4 w1 = load_vec<float4>(w + 4 * c + 4);
+    const float4 w2 = load_vec<float4>(w + 4 * c + 8);
+    const float4 w3 = load_vec<float4>(w + 4 * c + 12);
+    float dt0 = 0.0f, dt1 = 0.0f, dt2 = 0.0f, dt3 = 0.0f;
+    if (taps) {
+        const int base = 4 * (c / 128);
+        if (taps_fp32) {
+            const float4 tv = load_vec<float4>(static_cast<const float*>(taps) + base);
+            dt0 = tv.x; dt1 = tv.y; dt2 = tv.z; dt3 = tv.w;
+        } else {
+            const uint2 tv = load_vec<uint2>(static_cast<const BF*>(taps) + base);
+            const auto* tp = reinterpret_cast<const __nv_bfloat162*>(&tv);
+            const float2 t01 = __bfloat1622float2(tp[0]);
+            const float2 t23 = __bfloat1622float2(tp[1]);
+            dt0 = t01.x; dt1 = t01.y; dt2 = t23.x; dt3 = t23.y;
+        }
+    }
+    const float scale = taps ? (1.0f / 3.0f) : 0.44721359549995794f;
+    const auto unpack2 = [](const uint2& v, int idx) -> float2 {
+        return __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&v)[idx]);
+    };
+    const float2 u0a = unpack2(u0v, 0), u0b = unpack2(u0v, 1);
+    const float2 u1a = unpack2(u1v, 0), u1b = unpack2(u1v, 1);
+    const float2 u2a = unpack2(u2v, 0), u2b = unpack2(u2v, 1);
+    const float2 u3a = unpack2(u3v, 0), u3b = unpack2(u3v, 1);
+    auto eval = [&](float x0, float x1, float x2, float x3, float4 ww) {
+        float val = x0 + ww.x * x3 + ww.y * x2 + ww.z * x1 + ww.w * x0;
+        if (taps) val = fmaf(dt0, x0, fmaf(dt1, x1, fmaf(dt2, x2, fmaf(dt3, x3, val))));
+        return val * scale;
+    };
+    const __nv_bfloat162 o0 = __floats2bfloat162_rn(eval(u0a.x, u1a.x, u2a.x, u3a.x, w0),
+                                                   eval(u0a.y, u1a.y, u2a.y, u3a.y, w1));
+    const __nv_bfloat162 o1 = __floats2bfloat162_rn(eval(u0b.x, u1b.x, u2b.x, u3b.x, w2),
+                                                   eval(u0b.y, u1b.y, u2b.y, u3b.y, w3));
+    store_vec(out + c, make_uint2(*reinterpret_cast<const unsigned*>(&o0),
+                                  *reinterpret_cast<const unsigned*>(&o1)));
+    store_vec(state + c, u2v);
+    store_vec(state + 1024 + c, u1v);
+    store_vec(state + 2048 + c, u0v);
+}
 __device__ float conv_input(const BF* x, const BF* old, int c, int channels, int token) {
     return __bfloat162float(token >= 0 ? x[static_cast<std::int64_t>(token) * channels + c]
                                       : old[(token + 3) * channels + c]);
@@ -378,7 +508,7 @@ __global__ void control_down_small_t_kernel(const BF* __restrict__ cur, const BF
                                             int tokens, int cur_c) {
     __shared__ __align__(16) BF cur_s[2304];
     __shared__ __align__(16) BF msg_s[2304];
-    __shared__ float scratch[8];
+    __shared__ float scratch[4];
 
     const int tid    = static_cast<int>(threadIdx.x);
     const int tok    = static_cast<int>(blockIdx.y);
@@ -390,7 +520,7 @@ __global__ void control_down_small_t_kernel(const BF* __restrict__ cur, const BF
     const auto msg_base = (static_cast<std::int64_t>(ch) * tokens + tok) * 2304;
 
     float sx = 0.0f, sm = 0.0f;
-    for (int kv = tid; kv < 288; kv += 256) {
+    for (int kv = tid; kv < 288; kv += 128) {
         const uint4 vx = load_vec<uint4>(cur + cur_base + kv * 8);
         const uint4 vm = load_vec<uint4>(msg + msg_base + kv * 8);
         store_vec(&cur_s[kv * 8], vx);
@@ -407,27 +537,23 @@ __global__ void control_down_small_t_kernel(const BF* __restrict__ cur, const BF
             sm              = fmaf(fm.y, fm.y, sm);
         }
     }
-    const float ix = rsqrtf(sum256(sx, scratch) / 2304.0f + 1e-6f);
-    const float im = rsqrtf(sum256(sm, scratch) / 2304.0f + 1e-6f);
+    const float ix = rsqrtf(sum128(sx, scratch) / 2304.0f + 1e-6f);
+    const float im = rsqrtf(sum128(sm, scratch) / 2304.0f + 1e-6f);
 
-    const int r_base = static_cast<int>(blockIdx.x) * 32 + warp * 4;
+    const int r    = static_cast<int>(blockIdx.x) * 4 + warp;
+    const BF* dp   = down + static_cast<std::int64_t>(ch * 64 + r) * 4608;
+    float acc_cur  = 0.0f, acc_msg = 0.0f;
 #pragma unroll
-    for (int rr = 0; rr < 4; ++rr) {
-        const int r   = r_base + rr;
-        const BF* dp  = down + static_cast<std::int64_t>(ch * 64 + r) * 4608;
-        float acc_cur = 0.0f, acc_msg = 0.0f;
-#pragma unroll
-        for (int i = 0; i < 9; ++i) {
-            const int k = (i * 32 + lane) * 8;
-            acc_cur += dot_uint4_bf16(load_vec<uint4>(cur_s + k), load_vec<uint4>(dp + k));
-            acc_msg += dot_uint4_bf16(load_vec<uint4>(msg_s + k), load_vec<uint4>(dp + 2304 + k));
-        }
-        acc_cur = warp_sum(acc_cur);
-        acc_msg = warp_sum(acc_msg);
-        if (lane == 0) {
-            const auto idx  = static_cast<std::int64_t>(ch) * tokens + tok;
-            z[idx * 64 + r] = fmaf(acc_cur, ix, acc_msg * im);
-        }
+    for (int i = 0; i < 9; ++i) {
+        const int k = (i * 32 + lane) * 8;
+        acc_cur += dot_uint4_bf16(load_vec<uint4>(cur_s + k), load_vec<uint4>(dp + k));
+        acc_msg += dot_uint4_bf16(load_vec<uint4>(msg_s + k), load_vec<uint4>(dp + 2304 + k));
+    }
+    acc_cur = warp_sum(acc_cur);
+    acc_msg = warp_sum(acc_msg);
+    if (lane == 0) {
+        const auto idx  = static_cast<std::int64_t>(ch) * tokens + tok;
+        z[idx * 64 + r] = fmaf(acc_cur, ix, acc_msg * im);
     }
 }
 
@@ -1096,12 +1222,12 @@ void inkling2_sconv_launch(const Tensor& x, const Tensor& w, const Tensor& dynam
                           cudaStream_t s) {
     const int c = x.ne[0], t = x.ne[1];
     if (t == 1) {
-        const auto grid = (x.numel() + 255) / 256;
-        sconv_kernel<true><<<grid, 256, 0, s>>>(
+        const int vec4_threads = c / 4;
+        sconv_single_vec4_kernel<<<(vec4_threads + 255) / 256, 256, 0, s>>>(
             static_cast<const BF*>(x.data), static_cast<const float*>(w.data), dynamic.data,
             dynamic.dtype == DType::FP32, static_cast<const BF*>(old.data),
             static_cast<BF*>(state.data), static_cast<const BF*>(residual.data),
-            static_cast<BF*>(out.data), c, t);
+            static_cast<BF*>(out.data), c);
     } else if (t <= 15) {
         sconv_small_t_kernel<<<(c + 255) / 256, 256, 0, s>>>(
             static_cast<const BF*>(x.data), static_cast<const float*>(w.data), dynamic.data,
@@ -1120,6 +1246,25 @@ void inkling2_sconv_launch(const Tensor& x, const Tensor& w, const Tensor& dynam
             static_cast<BF*>(state.data), c, t);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+void inkling2_sconv_kv_launch(const Tensor& kx, const Tensor& kw, const Tensor& kdyn,
+                             const Tensor& kold, Tensor& kstate, Tensor& kout, const Tensor& vx,
+                             const Tensor& vw, const Tensor& vdyn, const Tensor& vold,
+                             Tensor& vstate, Tensor& vout, cudaStream_t s) {
+    const int t = kx.ne[1];
+    if (t == 1) {
+        sconv_kv_single_vec4_kernel<<<dim3(1, 2), 256, 0, s>>>(
+            static_cast<const BF*>(kx.data), static_cast<const float*>(kw.data), kdyn.data,
+            static_cast<const BF*>(kold.data), static_cast<BF*>(kstate.data),
+            static_cast<BF*>(kout.data), static_cast<const BF*>(vx.data),
+            static_cast<const float*>(vw.data), vdyn.data, static_cast<const BF*>(vold.data),
+            static_cast<BF*>(vstate.data), static_cast<BF*>(vout.data),
+            kdyn.dtype == DType::FP32);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    inkling2_sconv_launch(kx, kw, kdyn, kold, kstate, {}, kout, s);
+    inkling2_sconv_launch(vx, vw, vdyn, vold, vstate, {}, vout, s);
 }
 void inkling2_mix_launch(Inkling2Branches branches, const Tensor& q, Tensor& out, cudaStream_t s) {
     mix_kernel<<<static_cast<std::uint64_t>(out.ne[1]) * out.ne[2], 256, 0, s>>>(branches, static_cast<const float*>(q.data), static_cast<BF*>(out.data), out.ne[1]);
@@ -1142,7 +1287,7 @@ void inkling2_control_launch(const Tensor& cur, const Tensor& msg, const Tensor&
             static_cast<const BF*>(cur.data), static_cast<const BF*>(msg.data),
             static_cast<const BF*>(gf.data), z, y_fp32, static_cast<BF*>(out.data), t, cur_c);
     } else {
-        control_down_small_t_kernel<<<dim3(2, t, c), 256, 0, s>>>(
+        control_down_small_t_kernel<<<dim3(16, t, c), 128, 0, s>>>(
             static_cast<const BF*>(cur.data), static_cast<const BF*>(msg.data),
             static_cast<const BF*>(down.data), z, t, cur_c);
         control_out_small_t_kernel<<<dim3(72, t, c), 256, 0, s>>>(

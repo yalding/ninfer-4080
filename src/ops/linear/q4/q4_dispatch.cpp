@@ -102,6 +102,7 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         case 3072:
         case 6528:
         case 18432:
+        case 32768:
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
             if (t <= 7) { return launch_q4_simt_r8_c4; }
             if (t <= 16) { return launch_q4_simt_r8_c8; }

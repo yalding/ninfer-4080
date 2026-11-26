@@ -5,7 +5,7 @@
 namespace ninfer::targets::inkling2_mini::detail {
 using artifact::NumericFormat;
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp) {
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp, bool load_draft_head) {
     ArtifactLoadPlan out;
     auto& plan           = out.bindings;
     plan.has_mtp         = load_mtp;
@@ -156,6 +156,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp) {
                                                              NumericFormat::BF16, {2304, 256}, mtp_placement);
         mtp.markov_hidden_out_bias   = artifact::bind_tensor(binder, "mtp/markov/hidden_out_bias",
                                                              NumericFormat::FP32, {2304}, mtp_placement);
+        if (binder.has_object("mtp/draft_head")) {
+            const auto draft_placement = (load_mtp && load_draft_head)
+                                             ? artifact::TensorPlacement::Device
+                                             : artifact::TensorPlacement::ValidateOnly;
+            mtp.has_draft_head = load_mtp && load_draft_head;
+            mtp.draft_head = artifact::bind_tensor(
+                binder, "mtp/draft_head", NumericFormat::Q4G64_F16S, {32768, 2304}, draft_placement);
+            mtp.draft_head_token_ids = artifact::bind_tensor(
+                binder, "mtp/draft_head_token_ids", NumericFormat::I32, {32768}, draft_placement);
+        }
     }
     out.materialization = binder.finish();
     return out;
@@ -289,6 +299,14 @@ RuntimeModelView materialize_model(artifact::MaterializedArtifact& materialized,
         dst.markov_rnn_proj_bias     = artifact::materialized_tensor(materialized, src.markov_rnn_proj_bias, NumericFormat::FP32, {768});
         dst.markov_hidden_out_weight = artifact::materialized_tensor(materialized, src.markov_hidden_out_weight, NumericFormat::BF16, {256, 2304});
         dst.markov_hidden_out_bias   = artifact::materialized_tensor(materialized, src.markov_hidden_out_bias, NumericFormat::FP32, {2304});
+        dst.has_draft_head           = src.has_draft_head;
+        out.has_draft_head           = src.has_draft_head;
+        if (src.has_draft_head) {
+            dst.draft_head = artifact::materialized_weight(
+                materialized, src.draft_head, NumericFormat::Q4G64_F16S, 32768, 2304);
+            dst.draft_head_token_ids = artifact::materialized_tensor(
+                materialized, src.draft_head_token_ids, NumericFormat::I32, {32768});
+        }
     }
     return out;
 }

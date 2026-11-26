@@ -1,5 +1,6 @@
 #pragma once
 #include "ninfer/ops/inkling2_moe.h"
+#include <cstdint>
 
 namespace ninfer::ops::inkling2_detail {
 inline constexpr int kInkling2MoePrefillMinTokens = 4;
@@ -22,6 +23,10 @@ struct Inkling2MoePrefillWorkspace {
     int* route_job_count;
     void* routed_activation;
     void* grouped_output;
+    std::int8_t* x_a8_q;
+    float* x_a8_scale;
+    std::int8_t* act_a8_q;
+    float* act_a8_scale;
 };
 
 void moe_launch(const Tensor&, const Inkling2MoeWeights&, Tensor&, float*, int*, float*, float*,

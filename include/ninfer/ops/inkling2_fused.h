@@ -46,6 +46,16 @@ void inkling2_fused_sconv(const Tensor& x, const Tensor& static_weight,
                           const Tensor& residual_in, Tensor& out, cudaStream_t stream);
 
 /**
+ * Paired depthwise causal width-4 short convolution for K and V (`C = 1024`, `T > 0`) in a
+ * single kernel launch.
+ */
+void inkling2_fused_sconv_kv(const Tensor& kx, const Tensor& k_weight, const Tensor& k_dynamic,
+                             const Tensor& k_state_in, Tensor& k_state_out, Tensor& k_out,
+                             const Tensor& vx, const Tensor& v_weight, const Tensor& v_dynamic,
+                             const Tensor& v_state_in, Tensor& v_state_out, Tensor& v_out,
+                             cudaStream_t stream);
+
+/**
  * Inkling-2 Block Attention Residuals (AttnRes) mix + optional per-branch RMSNorm.
  *
  * `states` holds `M` (`1 <= M <= 8`) contiguous BF16 [2304, T] tensors (`T > 0`).

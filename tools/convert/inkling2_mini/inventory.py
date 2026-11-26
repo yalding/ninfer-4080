@@ -23,7 +23,7 @@ Q4 = "Q4G64_F16S"
 Q6 = "Q6G64_F16S"
 
 DIRECT_FORMATS = frozenset((BF16, FP32, I32))
-FORMAT_NAMES = (BF16, FP32, Q3, Q4, Q6)
+FORMAT_NAMES = (BF16, FP32, I32, Q3, Q4, Q6)
 LAYOUT_NAMES = (CONTIGUOUS_LAYOUT, ROW_SPLIT_LAYOUT)
 
 HIDDEN_SIZE = 2304
@@ -49,6 +49,7 @@ MOE_INTERMEDIATE = 1152
 MTP_LAYERS = 3
 MTP_INTERMEDIATE = 9216
 MTP_MARKOV_RANK = 256
+MTP_DRAFT_HEAD_ROWS = 32768
 
 FULL_ATTENTION_LAYERS = frozenset((5, 11, 17, 23))
 SWA_LAYERS = frozenset(i for i in range(PHYS_LAYERS) if i not in FULL_ATTENTION_LAYERS)
@@ -244,15 +245,28 @@ def _build_mtp_tensor_specs() -> tuple[TensorSpec, ...]:
 
 TENSOR_SPECS: tuple[TensorSpec, ...] = _build_tensor_specs()
 MTP_TENSOR_SPECS: tuple[TensorSpec, ...] = _build_mtp_tensor_specs()
+MTP_DRAFT_HEAD_SPECS: tuple[TensorSpec, ...] = (
+    tensor_spec("mtp/draft_head", (MTP_DRAFT_HEAD_ROWS, HIDDEN_SIZE), Q4),
+    tensor_spec("mtp/draft_head_token_ids", (MTP_DRAFT_HEAD_ROWS,), I32),
+)
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
 
-def tensor_specs(*, include_mtp: bool = False) -> tuple[TensorSpec, ...]:
-    return TENSOR_SPECS + MTP_TENSOR_SPECS if include_mtp else TENSOR_SPECS
+def tensor_specs(
+    *, include_mtp: bool = False, include_draft_head: bool = False
+) -> tuple[TensorSpec, ...]:
+    if not include_mtp:
+        return TENSOR_SPECS
+    extra = MTP_TENSOR_SPECS + (MTP_DRAFT_HEAD_SPECS if include_draft_head else ())
+    return TENSOR_SPECS + extra
 
 
-def object_specs(*, include_mtp: bool = False) -> tuple[StoredObjectSpec, ...]:
-    return RESOURCE_SPECS + tensor_specs(include_mtp=include_mtp)
+def object_specs(
+    *, include_mtp: bool = False, include_draft_head: bool = False
+) -> tuple[StoredObjectSpec, ...]:
+    return RESOURCE_SPECS + tensor_specs(
+        include_mtp=include_mtp, include_draft_head=include_draft_head
+    )
 
 
 def format_counts(specs: tuple[TensorSpec, ...] = TENSOR_SPECS) -> dict[str, int]:

@@ -26,6 +26,11 @@ public:
                                        const ResolvedSamplingParameters& sampling,
                                        std::uint32_t logical_position,
                                        std::span<const TokenId> generated_history);
+    std::vector<TokenId> speculative_step_dspark(std::uint32_t state_slot, TokenId anchor,
+                                                 std::uint32_t draft_tokens, std::uint32_t start,
+                                                 const ResolvedSamplingParameters& sampling,
+                                                 std::uint32_t logical_position,
+                                                 std::span<const TokenId> generated_history);
     TokenId sample(const Tensor& logits, const ResolvedSamplingParameters& sampling,
                    std::uint32_t logical_position, std::span<const TokenId> generated_history);
     void reset(std::uint32_t slot);

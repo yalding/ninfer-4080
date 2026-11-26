@@ -49,6 +49,18 @@ void inkling2_swa_attention(const Tensor& q, const Tensor& query_k, const Tensor
                             std::int32_t lane, Tensor& out, cudaStream_t stream);
 
 /**
+ * Split-KV Sliding-Window Attention overload using `workspace` and CUDA-Graph-safe
+ * `max_visible_keys` envelope. When `append_to_ring` is true and `T == 1`, also commits
+ * `query_k`/`query_v` into the cyclic KV ring cache at `positions[0] & 1023`.
+ */
+void inkling2_swa_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
+                            const Tensor& gate_qgr, const Tensor& rel_table,
+                            const Tensor& positions, const CyclicKVCacheLayerView& context,
+                            std::int32_t lane, std::uint32_t max_visible_keys,
+                            WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                            bool append_to_ring = false);
+
+/**
  * Returns caller-owned transient workspace capacity in bytes required by
  * `inkling2_full_attention` for `storage in {BFloat16, Int8Group64}`, visible key envelope, and
  * query token interval `[min_tokens, max_tokens]`.
@@ -81,6 +93,15 @@ void inkling2_dspark_swa_attention(const Tensor& q, const Tensor& block_k, const
                                    Tensor& out, cudaStream_t stream);
 
 /**
+ * CUDA-Graph-safe DSpark Sliding-Window GQA reading `context_keys = context_keys_pos[0]` on
+ * device.
+ */
+void inkling2_dspark_swa_attention(const Tensor& q, const Tensor& block_k, const Tensor& block_v,
+                                   const Tensor& context_keys_pos,
+                                   const CyclicKVCacheLayerView& context, std::int32_t lane,
+                                   Tensor& out, cudaStream_t stream);
+
+/**
  * DSpark Full-Attention GQA (`D=128, Hq=24, Hkv=8`) over `[0, F)` in `cache` + non-causal
  * `[F, F+T)` in `block_k`/`block_v` (`1 <= T <= 8`). Standard softmax without relative bias,
  * zero-sink, or output gating.
@@ -88,5 +109,14 @@ void inkling2_dspark_swa_attention(const Tensor& q, const Tensor& block_k, const
 void inkling2_dspark_full_attention(const Tensor& q, const Tensor& block_k, const Tensor& block_v,
                                     const PagedKVLayerView& cache, std::uint32_t context_keys,
                                     WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+
+/**
+ * CUDA-Graph-safe DSpark Full-Attention GQA reading `context_keys = context_keys_pos[0]` on
+ * device and sizing split-KV from `max_context_keys`.
+ */
+void inkling2_dspark_full_attention(const Tensor& q, const Tensor& block_k, const Tensor& block_v,
+                                    const PagedKVLayerView& cache, const Tensor& context_keys_pos,
+                                    std::uint32_t max_context_keys, WorkspaceArena& workspace,
+                                    Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

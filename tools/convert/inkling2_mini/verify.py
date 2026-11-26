@@ -114,13 +114,18 @@ def _dequantize_rows(
     return torch.stack(out_rows, dim=0)
 
 
-def validate_structure(artifact: Artifact) -> bool:
+def validate_structure(artifact: Artifact) -> tuple[bool, bool]:
     expected_identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
     if artifact.identity != expected_identity:
         raise VerificationError(f"identity {artifact.identity!r} != {expected_identity!r}")
     has_mtp = any(obj.name.startswith("mtp/") for obj in artifact.objects)
-    expected_objects = inventory.object_specs(include_mtp=has_mtp)
-    expected_tensors = inventory.tensor_specs(include_mtp=has_mtp)
+    has_draft_head = any(obj.name == "mtp/draft_head" for obj in artifact.objects)
+    expected_objects = inventory.object_specs(
+        include_mtp=has_mtp, include_draft_head=has_draft_head
+    )
+    expected_tensors = inventory.tensor_specs(
+        include_mtp=has_mtp, include_draft_head=has_draft_head
+    )
     if len(artifact.objects) != len(expected_objects):
         raise VerificationError(
             f"object count {len(artifact.objects)} != {len(expected_objects)}"
@@ -161,7 +166,7 @@ def validate_structure(artifact: Artifact) -> bool:
         raise VerificationError(f"layout counts mismatch: {dict(layouts)}")
     if cursor != artifact.file_bytes - artifact.payload_offset:
         raise VerificationError("artifact trailing padding / size mismatch")
-    return has_mtp
+    return has_mtp, has_draft_head
 
 
 def verify_artifact(
@@ -183,8 +188,11 @@ def verify_artifact(
     min_q6 = 1.0
 
     with Artifact.open(artifact_path) as artifact:
-        has_mtp = validate_structure(artifact)
-        t_specs = inventory.tensor_specs(include_mtp=has_mtp)
+        has_mtp, has_draft_head = validate_structure(artifact)
+        t_specs = inventory.tensor_specs(
+            include_mtp=has_mtp, include_draft_head=has_draft_head
+        )
+        draft_head_ids = source.compute_dspark_draft_head_ids() if has_draft_head else None
         mtp_reader = (
             source.MtpSourceReader(source.resolve_mtp_path(sources.model_dir, mtp_path))
             if has_mtp
@@ -203,7 +211,10 @@ def verify_artifact(
                     if spec.format not in inventory.DIRECT_FORMATS:
                         continue
                     stored = decode_direct(artifact.payload(spec.name), spec.format, spec.shape)
-                    if spec.name.startswith("mtp/"):
+                    if spec.name == "mtp/draft_head_token_ids":
+                        assert draft_head_ids is not None
+                        expected = draft_head_ids
+                    elif spec.name.startswith("mtp/"):
                         assert mtp_reader is not None
                         expected = source.load_mtp_tensor(spec, mtp_reader)
                     else:
@@ -232,6 +243,22 @@ def verify_artifact(
                             raise VerificationError(f"{spec.name}: cosine {cos:.5f} < 0.985")
                         min_q4 = min(min_q4, cos)
                         quantized_checked += 1
+
+                if has_draft_head:
+                    assert draft_head_ids is not None
+                    obj = artifact.find("mtp/draft_head")
+                    assert isinstance(obj, TensorObject)
+                    rows = (0, obj.shape[0] // 2, obj.shape[0] - 1)
+                    deq = _dequantize_rows(
+                        artifact.payload(obj), obj.format, obj.shape, rows, target
+                    ).cpu()
+                    src_t = source.load_mtp_draft_head(reader, draft_head_ids)
+                    ref = src_t.index_select(0, torch.tensor(rows, dtype=torch.long)).float()
+                    cos = _cosine_similarity(deq, ref)
+                    if cos < 0.985:
+                        raise VerificationError(f"mtp/draft_head: cosine {cos:.5f} < 0.985")
+                    min_q4 = min(min_q4, cos)
+                    quantized_checked += 1
 
                 # Sampled verification on embedding + output_head
                 for name, min_cos_attr in (
@@ -278,6 +305,22 @@ def verify_artifact(
                         min_q4 = min(min_q4, cos)
                         quantized_checked += 1
 
+                if has_draft_head:
+                    assert draft_head_ids is not None
+                    obj = artifact.find("mtp/draft_head")
+                    assert isinstance(obj, TensorObject)
+                    rows = (0, obj.shape[0] // 2, obj.shape[0] - 1)
+                    deq = _dequantize_rows(
+                        artifact.payload(obj), obj.format, obj.shape, rows, target
+                    ).cpu()
+                    src_t = source.load_mtp_draft_head(reader, draft_head_ids)
+                    ref = src_t.index_select(0, torch.tensor(rows, dtype=torch.long)).float()
+                    cos = _cosine_similarity(deq, ref)
+                    if cos < 0.985:
+                        raise VerificationError(f"mtp/draft_head: cosine {cos:.5f} < 0.985")
+                    min_q4 = min(min_q4, cos)
+                    quantized_checked += 1
+
                     for is_w13, obj_suffix in (
                         (True, "ffn/routed_gate_up"),
                         (False, "ffn/routed_down"),
@@ -310,6 +353,22 @@ def verify_artifact(
                                     raise VerificationError(f"{obj_name} e={expert}: cosine {cos:.5f} < 0.990")
                                 min_q4 = min(min_q4, cos)
                         quantized_checked += 1
+
+                if has_draft_head:
+                    assert draft_head_ids is not None
+                    obj = artifact.find("mtp/draft_head")
+                    assert isinstance(obj, TensorObject)
+                    rows = (0, obj.shape[0] // 2, obj.shape[0] - 1)
+                    deq = _dequantize_rows(
+                        artifact.payload(obj), obj.format, obj.shape, rows, target
+                    ).cpu()
+                    src_t = source.load_mtp_draft_head(reader, draft_head_ids)
+                    ref = src_t.index_select(0, torch.tensor(rows, dtype=torch.long)).float()
+                    cos = _cosine_similarity(deq, ref)
+                    if cos < 0.985:
+                        raise VerificationError(f"mtp/draft_head: cosine {cos:.5f} < 0.985")
+                    min_q4 = min(min_q4, cos)
+                    quantized_checked += 1
         finally:
             if mtp_reader is not None:
                 mtp_reader.close()

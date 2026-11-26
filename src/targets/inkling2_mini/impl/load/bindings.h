@@ -72,6 +72,9 @@ struct MtpPlan {
     artifact::ObjectHandle markov_rnn_proj_bias;
     artifact::ObjectHandle markov_hidden_out_weight;
     artifact::ObjectHandle markov_hidden_out_bias;
+    bool has_draft_head = false;
+    artifact::ObjectHandle draft_head;
+    artifact::ObjectHandle draft_head_token_ids;
 };
 
 struct BindingPlan {
@@ -151,6 +154,9 @@ struct MtpWeights {
     Tensor markov_rnn_proj_bias;
     Tensor markov_hidden_out_weight;
     Tensor markov_hidden_out_bias;
+    bool has_draft_head = false;
+    Weight draft_head;
+    Tensor draft_head_token_ids;
 };
 
 struct RuntimeModelView {
@@ -161,11 +167,13 @@ struct RuntimeModelView {
     Tensor output_res_query;
     Tensor final_norm;
     Weight output_head;
-    bool has_mtp = false;
+    bool has_mtp        = false;
+    bool has_draft_head = false;
     MtpWeights mtp;
 };
 
-[[nodiscard]] ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp = false);
+[[nodiscard]] ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp = false,
+                                             bool load_draft_head = false);
 [[nodiscard]] RuntimeModelView materialize_model(artifact::MaterializedArtifact& materialized,
                                                  const BindingPlan& plan);
 } // namespace ninfer::targets::inkling2_mini::detail

@@ -2,7 +2,9 @@
 #include "ops/inkling2_moe/launch.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/common/rowsplit_a8_quantize.h"
 #include "ops/common/rowsplit_mma.cuh"
+#include "ops/linear/q3/q3_rowsplit_a8_codec.cuh"
 #include "ops/linear/q3/q3_rowsplit_storage.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "core/device.h"
@@ -168,8 +170,13 @@ __global__ void gate_up_kernel(const BF* x, Quant w, const int* ids, float* act)
 
     if constexpr (Q3) {
         // 18 groups of 128; group_lane 0..1, each lane owns 8 codes (24-bit window).
+        // Each 48-byte group is 16-byte aligned; lanes local < 12 load 12 aligned uint32_t words.
         const int group_lane = lane >> 4;
         const int local      = lane & 15;
+        const int half_base  = group_lane << 4;
+        const int w0_lane    = half_base + ((local * 3) >> 2);
+        const int w1_lane    = min(w0_lane + 1, half_base + 11);
+        const int shift24    = ((local & 3) * 24) & 31;
 #pragma unroll
         for (int grp = 0; grp < 18; grp += 2) {
             const int gi   = grp + group_lane;
@@ -186,18 +193,22 @@ __global__ void gate_up_kernel(const BF* x, Quant w, const int* ids, float* act)
             for (int r = 0; r < RowsPerCta; ++r) {
                 const int row_gate = expert_base + r;
                 const int row_up   = row_gate + 1152;
-                const unsigned char* cg =
+                const std::uint32_t* cg = reinterpret_cast<const std::uint32_t*>(
                     w.code + static_cast<std::int64_t>(row_gate) * 864 +
-                    static_cast<std::int64_t>(gi) * 48 + 3 * local;
-                const unsigned char* cu =
+                    static_cast<std::int64_t>(gi) * 48);
+                const std::uint32_t* cu = reinterpret_cast<const std::uint32_t*>(
                     w.code + static_cast<std::int64_t>(row_up) * 864 +
-                    static_cast<std::int64_t>(gi) * 48 + 3 * local;
-                const std::uint32_t wg = static_cast<std::uint32_t>(cg[0]) |
-                                         (static_cast<std::uint32_t>(cg[1]) << 8) |
-                                         (static_cast<std::uint32_t>(cg[2]) << 16);
-                const std::uint32_t wu = static_cast<std::uint32_t>(cu[0]) |
-                                         (static_cast<std::uint32_t>(cu[1]) << 8) |
-                                         (static_cast<std::uint32_t>(cu[2]) << 16);
+                    static_cast<std::int64_t>(gi) * 48);
+                const std::uint32_t rg_raw = local < 12 ? __ldg(cg + local) : 0u;
+                const std::uint32_t ru_raw = local < 12 ? __ldg(cu + local) : 0u;
+                const std::uint32_t wg =
+                    __funnelshift_r(__shfl_sync(0xffffffffu, rg_raw, w0_lane),
+                                    __shfl_sync(0xffffffffu, rg_raw, w1_lane), shift24) &
+                    0x00ffffffu;
+                const std::uint32_t wu =
+                    __funnelshift_r(__shfl_sync(0xffffffffu, ru_raw, w0_lane),
+                                    __shfl_sync(0xffffffffu, ru_raw, w1_lane), shift24) &
+                    0x00ffffffu;
                 const float sg = __half2float(__ushort_as_half(
                     *reinterpret_cast<const std::uint16_t*>(&w.scale[static_cast<std::int64_t>(row_gate) * 18 + gi])));
                 const float su = __half2float(__ushort_as_half(
@@ -259,7 +270,8 @@ __global__ void gate_up_kernel(const BF* x, Quant w, const int* ids, float* act)
     for (int r = 0; r < RowsPerCta; ++r) {
         const float gs = sum_warp(g[r]);
         const float us = sum_warp(u[r]);
-        if (lane == 0) act[row_base + r + 1152 * (slot + 8 * t)] = moe_situ(gs, us);
+        if (lane == 0)
+            act[row_base + r + 1152 * (slot + 8 * t)] = moe_situ(gs, us);
     }
 }
 
@@ -283,24 +295,32 @@ __global__ void down_kernel(Quant w, const int* ids, const float* alpha, const f
         // K = 1152 = 9 groups of 128: paired steps g = 0,2,4,6 plus solo group 8.
         const int group_lane = lane >> 4;
         const int local      = lane & 15;
+        const int half_base  = group_lane << 4;
+        const int w0_lane    = half_base + ((local * 3) >> 2);
+        const int w1_lane    = min(w0_lane + 1, half_base + 11);
+        const int shift24    = ((local & 3) * 24) & 31;
 #pragma unroll
         for (int grp = 0; grp < 9; grp += 2) {
             const int gi = grp + group_lane;
+            float xv[8];
             if (gi < 9) {
-                float xv[8];
                 const float4 f0 = *reinterpret_cast<const float4*>(act_s + gi * 128 + 8 * local);
                 const float4 f1 = *reinterpret_cast<const float4*>(act_s + gi * 128 + 8 * local + 4);
                 xv[0] = f0.x; xv[1] = f0.y; xv[2] = f0.z; xv[3] = f0.w;
                 xv[4] = f1.x; xv[5] = f1.y; xv[6] = f1.z; xv[7] = f1.w;
+            }
 #pragma unroll
-                for (int r = 0; r < RowsPerCta; ++r) {
-                    const int erow = expert * 2304 + blockIdx.x * RowsPerCta + r;
-                    const unsigned char* c =
-                        w.code + static_cast<std::int64_t>(erow) * 432 +
-                        static_cast<std::int64_t>(gi) * 48 + 3 * local;
-                    const std::uint32_t w3 = static_cast<std::uint32_t>(c[0]) |
-                                             (static_cast<std::uint32_t>(c[1]) << 8) |
-                                             (static_cast<std::uint32_t>(c[2]) << 16);
+            for (int r = 0; r < RowsPerCta; ++r) {
+                const int erow = expert * 2304 + blockIdx.x * RowsPerCta + r;
+                const std::uint32_t* c = reinterpret_cast<const std::uint32_t*>(
+                    w.code + static_cast<std::int64_t>(erow) * 432 +
+                    static_cast<std::int64_t>(gi < 9 ? gi : 0) * 48);
+                const std::uint32_t r_raw = (gi < 9 && local < 12) ? __ldg(c + local) : 0u;
+                const std::uint32_t w3 =
+                    __funnelshift_r(__shfl_sync(0xffffffffu, r_raw, w0_lane),
+                                    __shfl_sync(0xffffffffu, r_raw, w1_lane), shift24) &
+                    0x00ffffffu;
+                if (gi < 9) {
                     const float sc = __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
                         &w.scale[static_cast<std::int64_t>(erow) * 9 + gi])));
 #pragma unroll
@@ -375,13 +395,15 @@ void moe_launch(const Tensor& x, const Inkling2MoeWeights& w, Tensor& out, float
                                   alpha);
     CUDA_CHECK(cudaGetLastError());
     if (w.routed_gate_up.qtype == QType::Q3G128_F16S) {
-        gate_up_kernel<true, 4><<<dim3(288, t), 256, 0, s>>>(input, quant(w.routed_gate_up), ids, act);
+        gate_up_kernel<true, 2><<<dim3(576, t), 256, 0, s>>>(input, quant(w.routed_gate_up), ids,
+                                                             act);
         down_kernel<true, 4><<<dim3(576, t), 256, 0, s>>>(quant(w.routed_down), ids, alpha, act,
-                                                           static_cast<BF*>(out.data));
+                                                          static_cast<BF*>(out.data));
     } else {
-        gate_up_kernel<false, 4><<<dim3(288, t), 256, 0, s>>>(input, quant(w.routed_gate_up), ids, act);
+        gate_up_kernel<false, 4><<<dim3(288, t), 256, 0, s>>>(input, quant(w.routed_gate_up), ids,
+                                                              act);
         down_kernel<false, 4><<<dim3(576, t), 256, 0, s>>>(quant(w.routed_down), ids, alpha, act,
-                                                            static_cast<BF*>(out.data));
+                                                           static_cast<BF*>(out.data));
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -900,6 +922,14 @@ __global__ void inkling2_moe_reduce_kernel(const BF* __restrict__ grouped_output
                          *reinterpret_cast<const unsigned*>(&r3)));
 }
 
+template <bool GateUp, int ExpertBN>
+__global__ __launch_bounds__(256, 2) void inkling2_moe_grouped_a8_mma_kernel(
+    const std::int8_t* __restrict__ qx, const float* __restrict__ x_scale, int x_stride_tokens,
+    const int* __restrict__ packed_token, const int* __restrict__ expert_offsets,
+    const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
+    const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
+    const std::uint16_t* __restrict__ scales, BF* __restrict__ out);
+
 void moe_prefill_launch(const void* x, const Inkling2MoeWeights& w, void* out, int tokens,
                         const Inkling2MoePrefillWorkspace& ws, cudaStream_t s) {
     const auto* x_bf = static_cast<const BF*>(x);
@@ -928,12 +958,34 @@ void moe_prefill_launch(const void* x, const Inkling2MoeWeights& w, void* out, i
         const int max_jobs    = (tokens * 8) / ExpertBN + 128;
         const int grid_blocks = max_jobs * 36 < 2048 ? max_jobs * 36 : 2048;
         if (w.routed_gate_up.qtype == QType::Q3G128_F16S) {
-            inkling2_moe_grouped_mma_kernel<true, true, ExpertBN><<<grid_blocks, 256, 0, s>>>(
-                x_bf, ws.packed_token, ws.expert_offsets, ws.route_job_experts,
-                ws.route_job_columns, ws.route_job_count, gu_codes, gu_scales, act_bf);
-            inkling2_moe_grouped_mma_kernel<true, false, ExpertBN><<<grid_blocks, 256, 0, s>>>(
-                act_bf, ws.packed_token, ws.expert_offsets, ws.route_job_experts,
-                ws.route_job_columns, ws.route_job_count, dn_codes, dn_scales, grouped_bf);
+            if (tokens >= 64) {
+                Tensor x_t(const_cast<void*>(x), DType::BF16, {2304, tokens});
+                detail::A8G64Activation x_a8{
+                    Tensor(ws.x_a8_q, DType::I8, {2304, tokens}),
+                    Tensor(ws.x_a8_scale, DType::FP32, {tokens, 36})};
+                detail::a8_g64_quantize(x_t, x_a8, s);
+                inkling2_moe_grouped_a8_mma_kernel<true, ExpertBN><<<grid_blocks, 256, 0, s>>>(
+                    ws.x_a8_q, ws.x_a8_scale, tokens, ws.packed_token, ws.expert_offsets,
+                    ws.route_job_experts, ws.route_job_columns, ws.route_job_count, gu_codes,
+                    gu_scales, act_bf);
+
+                Tensor act_t(ws.routed_activation, DType::BF16, {1152, tokens * 8});
+                detail::A8G64Activation act_a8{
+                    Tensor(ws.act_a8_q, DType::I8, {1152, tokens * 8}),
+                    Tensor(ws.act_a8_scale, DType::FP32, {tokens * 8, 18})};
+                detail::a8_g64_quantize(act_t, act_a8, s);
+                inkling2_moe_grouped_a8_mma_kernel<false, ExpertBN><<<grid_blocks, 256, 0, s>>>(
+                    ws.act_a8_q, ws.act_a8_scale, tokens * 8, ws.packed_token, ws.expert_offsets,
+                    ws.route_job_experts, ws.route_job_columns, ws.route_job_count, dn_codes,
+                    dn_scales, grouped_bf);
+            } else {
+                inkling2_moe_grouped_mma_kernel<true, true, ExpertBN><<<grid_blocks, 256, 0, s>>>(
+                    x_bf, ws.packed_token, ws.expert_offsets, ws.route_job_experts,
+                    ws.route_job_columns, ws.route_job_count, gu_codes, gu_scales, act_bf);
+                inkling2_moe_grouped_mma_kernel<true, false, ExpertBN><<<grid_blocks, 256, 0, s>>>(
+                    act_bf, ws.packed_token, ws.expert_offsets, ws.route_job_experts,
+                    ws.route_job_columns, ws.route_job_count, dn_codes, dn_scales, grouped_bf);
+            }
         } else {
             inkling2_moe_grouped_mma_kernel<false, true, ExpertBN><<<grid_blocks, 256, 0, s>>>(
                 x_bf, ws.packed_token, ws.expert_offsets, ws.route_job_experts,
@@ -951,5 +1003,248 @@ void moe_prefill_launch(const void* x, const Inkling2MoeWeights& w, void* out, i
     inkling2_moe_reduce_kernel<<<tokens, 288, 0, s>>>(grouped_bf, ws.packed_index, ws.token_alpha,
                                                       out_bf);
     CUDA_CHECK(cudaGetLastError());
+}
+
+__device__ __forceinline__ unsigned moe_a8_swz(int line, int chunk) {
+    return static_cast<unsigned>(line * 64 + ((chunk ^ ((line >> 1) & 3)) << 4));
+}
+
+__device__ __forceinline__ std::uint32_t moe_q3_window(std::uint32_t w0, std::uint32_t w1,
+                                                       std::uint32_t w2, int j) {
+    if (j == 0) return w0 & 0x00ffffffu;
+    if (j == 1) return (w0 >> 24) | ((w1 & 0x0000ffffu) << 8);
+    if (j == 2) return (w1 >> 16) | ((w2 & 0x000000ffu) << 16);
+    return w2 >> 8;
+}
+
+template <bool GateUp, int ExpertBN>
+__global__ __launch_bounds__(256, 2) void inkling2_moe_grouped_a8_mma_kernel(
+    const std::int8_t* __restrict__ qx, const float* __restrict__ x_scale, int x_stride_tokens,
+    const int* __restrict__ packed_token, const int* __restrict__ expert_offsets,
+    const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
+    const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
+    const std::uint16_t* __restrict__ scales, BF* __restrict__ out) {
+    constexpr int BM              = 64;
+    constexpr int BN              = ExpertBN;
+    constexpr int BK              = 64;
+    constexpr int K               = GateUp ? 2304 : 1152;
+    constexpr int KTiles          = K / BK;
+    constexpr int GroupsTotal     = K / 128;
+    constexpr int Stages          = 2;
+    constexpr int RowBlocks       = 36;
+    constexpr int kFloatMagic     = 0x4B400000;
+    constexpr float kFloatMagicValue = 12582912.0f;
+
+    struct Stage {
+        std::uint8_t a[BM * BK];
+        std::uint8_t x[BN * BK];
+        float row_scale[BM];
+        float token_scale[BN];
+    };
+
+    __shared__ __align__(128) Stage stages[Stages];
+    __shared__ int block_src_cols[BN];
+
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int warp   = tid >> 5;
+    const int lane   = tid & 31;
+    const int warp_m = warp >> 2;
+    const int warp_n = warp & 3;
+    const int gid    = lane >> 2;
+    const int lid    = lane & 3;
+
+    unsigned a_off[2][2];
+    unsigned b_off[2];
+    {
+        const int a_row_base = warp_m * 32 + (lane & 7) + ((lane >> 3) & 1) * 8;
+        const int b_tok      = warp_n * 8 + (lane & 7);
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            a_off[0][ks] = moe_a8_swz(a_row_base, 2 * ks + (lane >> 4));
+            a_off[1][ks] = moe_a8_swz(a_row_base + 16, 2 * ks + (lane >> 4));
+            b_off[ks]    = moe_a8_swz(b_tok, 2 * ks + ((lane >> 3) & 1));
+        }
+    }
+
+    const int my_row  = tid >> 1;
+    const int my_half = tid & 1;
+
+    const int total_work = route_job_count[0] * RowBlocks;
+    for (int work = static_cast<int>(blockIdx.x); work < total_work;
+         work += static_cast<int>(gridDim.x)) {
+        const int route_job   = work / RowBlocks;
+        const int row_block   = work - route_job * RowBlocks;
+        const int expert      = route_job_experts[route_job];
+        const int begin       = expert_offsets[expert];
+        const int count       = expert_offsets[expert + 1] - begin;
+        const int column_base = route_job_columns[route_job];
+        const int cols        = count - column_base < BN ? count - column_base : BN;
+
+        if (tid < BN) {
+            const int packed_col = tid < cols ? (begin + column_base + tid) : begin;
+            block_src_cols[tid]  = GateUp ? packed_token[packed_col] : packed_col;
+        }
+        __syncthreads();
+
+        int my_global_row = 0;
+        if (tid < 128) {
+            if constexpr (GateUp) {
+                const int logical = row_block * 32 + ((my_row >> 5) << 4) + (my_row & 15);
+                const int is_up   = (my_row >> 4) & 1;
+                my_global_row     = expert * 2304 + logical + (is_up ? 1152 : 0);
+            } else {
+                my_global_row = expert * 2304 + row_block * 64 + my_row;
+            }
+        }
+        const std::uint8_t* my_codes =
+            codes + static_cast<std::int64_t>(my_global_row) * GroupsTotal * 48;
+        const std::uint16_t* my_scales =
+            scales + static_cast<std::int64_t>(my_global_row) * GroupsTotal;
+
+        std::uint32_t raw0 = 0, raw1 = 0, raw2 = 0;
+        std::uint16_t raw_scale = 0;
+        auto load_q3            = [&](int kt) {
+            if (tid < 128) {
+                const std::uint8_t* ptr =
+                    my_codes + static_cast<std::int64_t>(kt >> 1) * 48 + (kt & 1) * 24 +
+                    my_half * 12;
+                asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
+                             : "=r"(raw0)
+                             : "l"(ptr));
+                asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
+                             : "=r"(raw1)
+                             : "l"(ptr + 4));
+                asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
+                             : "=r"(raw2)
+                             : "l"(ptr + 8));
+                if (my_half == 0) raw_scale = __ldg(my_scales + (kt >> 1));
+            }
+        };
+        auto decode_q3 = [&](Stage& s) {
+            if (tid < 128) {
+                unsigned out[8];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const std::uint32_t win = moe_q3_window(raw0, raw1, raw2, j);
+                    out[2 * j]              = detail::q3_a8::spread4(win & 0x0fffu);
+                    out[2 * j + 1]          = detail::q3_a8::spread4(win >> 12);
+                }
+                *reinterpret_cast<uint4*>(s.a + moe_a8_swz(my_row, 2 * my_half)) =
+                    make_uint4(out[0], out[1], out[2], out[3]);
+                *reinterpret_cast<uint4*>(s.a + moe_a8_swz(my_row, 2 * my_half + 1)) =
+                    make_uint4(out[4], out[5], out[6], out[7]);
+                if (my_half == 0) s.row_scale[my_row] = __half2float(__ushort_as_half(raw_scale));
+            }
+        };
+        auto stage_x = [&](int stage, int kt) {
+            if (tid < 128) {
+                const int col   = tid >> 2;
+                const int chunk = tid & 3;
+                const int sc    = block_src_cols[col];
+                cp_async_zfill<16, Cache::cg>(
+                    stages[stage].x + moe_a8_swz(col, chunk),
+                    qx + static_cast<std::int64_t>(sc) * K + kt * 64 + chunk * 16,
+                    col < cols ? 16 : 0);
+            }
+            if (tid < BN) {
+                stages[stage].token_scale[tid] =
+                    tid < cols
+                        ? x_scale[static_cast<std::int64_t>(kt) * x_stride_tokens +
+                                  block_src_cols[tid]]
+                        : 0.0f;
+            }
+        };
+
+        load_q3(0);
+#pragma unroll
+        for (int stage = 0; stage < Stages; ++stage) {
+            if (stage < KTiles) stage_x(stage, stage);
+            cp_commit();
+        }
+
+        float acc[2][4] = {};
+        for (int kt = 0; kt < KTiles; ++kt) {
+            const int stage = kt & 1;
+            cp_wait<Stages - 1>();
+            __syncthreads();
+            decode_q3(stages[stage]);
+            if (kt + 1 < KTiles) load_q3(kt + 1);
+            __syncthreads();
+
+            int g[2][4];
+            const Stage& s     = stages[stage];
+            const unsigned base_a = smem_addr(s.a);
+            const unsigned base_x = smem_addr(s.x);
+#pragma unroll
+            for (int ks = 0; ks < 2; ++ks) {
+                unsigned bf0, bf1;
+                ldmatrix_x2(bf0, bf1, base_x + b_off[ks]);
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi) {
+                    unsigned af0, af1, af2, af3;
+                    ldmatrix_x4(af0, af1, af2, af3, base_a + a_off[mi][ks]);
+                    int* d = g[mi];
+                    if (ks == 0) {
+                        mma_s8_from(d[0], d[1], d[2], d[3], af0, af1, af2, af3, bf0, bf1,
+                                    kFloatMagic, kFloatMagic, kFloatMagic, kFloatMagic);
+                    } else {
+                        mma_s8(d[0], d[1], d[2], d[3], af0, af1, af2, af3, bf0, bf1);
+                    }
+                }
+            }
+            const float ts0 = s.token_scale[warp_n * 8 + 2 * lid];
+            const float ts1 = s.token_scale[warp_n * 8 + 2 * lid + 1];
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                const float rs0 = s.row_scale[warp_m * 32 + mi * 16 + gid];
+                const float rs1 = s.row_scale[warp_m * 32 + mi * 16 + gid + 8];
+                acc[mi][0] = fmaf(rs0 * ts0, __int_as_float(g[mi][0]) - kFloatMagicValue, acc[mi][0]);
+                acc[mi][1] = fmaf(rs0 * ts1, __int_as_float(g[mi][1]) - kFloatMagicValue, acc[mi][1]);
+                acc[mi][2] = fmaf(rs1 * ts0, __int_as_float(g[mi][2]) - kFloatMagicValue, acc[mi][2]);
+                acc[mi][3] = fmaf(rs1 * ts1, __int_as_float(g[mi][3]) - kFloatMagicValue, acc[mi][3]);
+            }
+
+            __syncthreads();
+            const int next = kt + Stages;
+            if (next < KTiles) stage_x(stage, next);
+            cp_commit();
+        }
+        cp_wait<0>();
+
+        const int c0 = warp_n * 8 + 2 * lid;
+        const int c1 = c0 + 1;
+        const int p0 = begin + column_base + c0;
+        const int p1 = begin + column_base + c1;
+        if constexpr (GateUp) {
+            const int r0 = row_block * 32 + warp_m * 16 + gid;
+            const int r1 = r0 + 8;
+            if (c0 < cols) {
+                out[static_cast<std::int64_t>(p0) * 1152 + r0] =
+                    __float2bfloat16_rn(moe_situ(acc[0][0], acc[1][0]));
+                out[static_cast<std::int64_t>(p0) * 1152 + r1] =
+                    __float2bfloat16_rn(moe_situ(acc[0][2], acc[1][2]));
+            }
+            if (c1 < cols) {
+                out[static_cast<std::int64_t>(p1) * 1152 + r0] =
+                    __float2bfloat16_rn(moe_situ(acc[0][1], acc[1][1]));
+                out[static_cast<std::int64_t>(p1) * 1152 + r1] =
+                    __float2bfloat16_rn(moe_situ(acc[0][3], acc[1][3]));
+            }
+        } else {
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                const int r0 = row_block * 64 + warp_m * 32 + mi * 16 + gid;
+                const int r1 = r0 + 8;
+                if (c0 < cols) {
+                    out[static_cast<std::int64_t>(p0) * 2304 + r0] = __float2bfloat16_rn(acc[mi][0]);
+                    out[static_cast<std::int64_t>(p0) * 2304 + r1] = __float2bfloat16_rn(acc[mi][2]);
+                }
+                if (c1 < cols) {
+                    out[static_cast<std::int64_t>(p1) * 2304 + r0] = __float2bfloat16_rn(acc[mi][1]);
+                    out[static_cast<std::int64_t>(p1) * 2304 + r1] = __float2bfloat16_rn(acc[mi][3]);
+                }
+            }
+        }
+    }
 }
 } // namespace ninfer::ops::inkling2_detail

@@ -11,6 +11,9 @@ struct Inkling2Branches {
 void inkling2_proj_launch(const Tensor&, const Tensor&, Tensor&, cudaStream_t);
 void inkling2_sconv_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&, Tensor&,
                           const Tensor&, Tensor&, cudaStream_t);
+void inkling2_sconv_kv_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&, Tensor&,
+                             Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                             Tensor&, Tensor&, cudaStream_t);
 void inkling2_mix_launch(Inkling2Branches, const Tensor&, Tensor&, cudaStream_t);
 void inkling2_control_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                             Inkling2Branches, Tensor&, float*, float*, float*, cudaStream_t);

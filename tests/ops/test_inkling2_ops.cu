@@ -1,5 +1,6 @@
 #include "ninfer/ops/inkling2_attention.h"
 #include "ninfer/ops/inkling2_moe.h"
+#include "ops/a8_g64_reference.h"
 #include "ops/op_tester.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -184,6 +185,40 @@ int swa_case(DeviceContext& ctx,int start,int tokens){
     failures+=verify_exact("swa preserves V ring",from_device<std::uint16_t>(dv,vb.size()),vb);
     std::cout<<"swa start="<<start<<" T="<<tokens<<" failures="<<failures<<'\n';return failures;
 }
+int swa_split_case(DeviceContext& ctx,int start,int tokens,bool append){
+    LogicalKV kv(start+tokens);
+    auto q=pattern(std::size_t(3072)*tokens,18,0.5f),gate=pattern(std::size_t(6528)*tokens,19,2);
+    auto rel=pattern(std::size_t(1025)*24*tokens,20,0.15f);
+    std::vector<std::uint16_t> kb(128*1024*8),vb(kb.size());
+    for(int p=std::max(0,start-1024);p<start;++p)for(int h=0;h<8;++h)for(int d=0;d<128;++d){
+        auto src=d+128*(h+8*p),dst=d+128*((p%1024)+1024*h);
+        kb[dst]=f32_to_bf16(kv.k[src]);vb[dst]=half_bits(kv.v[src]);kv.v[src]=float(half_value(vb[dst]));
+    }
+    std::vector<float> currentk(kv.k.begin()+std::size_t(start)*1024,kv.k.end());
+    std::vector<float> currentv(kv.v.begin()+std::size_t(start)*1024,kv.v.end());
+    auto dk=to_device(kb),dv=to_device(vb),dq=to_device_bf16(q),dg=to_device_bf16(gate),dr=to_device(rel);
+    auto dck=to_device_bf16(currentk),dcv=to_device_bf16(currentv);
+    std::vector<int> positions(tokens);std::iota(positions.begin(),positions.end(),start);auto dp=to_device(positions);
+    CyclicKVCacheLayerView cache;cache.capacity=cache.padded_capacity=1024;cache.head_dim=128;cache.num_kv_heads=8;cache.lane_capacity=1;
+    cache.k=Tensor(dk.p,DType::BF16,{128,1024,8,1});cache.v=Tensor(dv.p,DType::FP16,{128,1024,8,1});
+    Tensor qt(dq.p,DType::BF16,{128,24,tokens}),gt(dg.p,DType::BF16,{6528,tokens});
+    Tensor kt(dck.p,DType::BF16,{128,8,tokens}),vt(dcv.p,DType::BF16,{128,8,tokens});
+    Tensor rt(dr.p,DType::FP32,{1025,24,tokens}),pt(dp.p,DType::I32,{tokens});
+    GuardedDeviceBuffer out(std::size_t(tokens)*3072*2);Tensor ot(out.data(),DType::BF16,{128,24,tokens});
+    WorkspaceArena ws(ops::inkling2_full_attention_workspace_capacity_bytes(KvCacheStorage::RK4V4E8,std::max(1,start+tokens),tokens,tokens));
+    captured(ctx,[&]{ops::inkling2_swa_attention(qt,kt,vt,gt,rt,pt,cache,0,static_cast<std::uint32_t>(start+tokens),ws,ot,ctx.stream,append);});
+    int failures=attention_oracle(q,gate,rel,kv,start,tokens,true,from_device_bf16(out.data(),std::size_t(tokens)*3072));
+    failures+=out.verify_guards("swa split guards");failures+=ws.used()!=0;
+    if(append&&tokens==1){
+        for(int h=0;h<8;++h)for(int d=0;d<128;++d){
+            auto dst=d+128*((start%1024)+1024*h),src=d+128*(h+8*start);
+            kb[dst]=f32_to_bf16(kv.k[src]);vb[dst]=half_bits(kv.v[src]);
+        }
+    }
+    failures+=verify_exact("swa split K ring",from_device<std::uint16_t>(dk,kb.size()),kb);
+    failures+=verify_exact("swa split V ring",from_device<std::uint16_t>(dv,vb.size()),vb);
+    std::cout<<"swa_split start="<<start<<" T="<<tokens<<" append="<<append<<" failures="<<failures<<'\n';return failures;
+}
 
 // Sparse test fixtures retain the complete registered expert geometry and decode every
 // stored nonzero through an independent byte-stream decoder in the host oracle.
@@ -229,6 +264,13 @@ int moe_case(DeviceContext& ctx,bool q3,int tokens){
     Tensor ot(out.data(),DType::BF16,{2304,tokens});
     WorkspaceArena workspace(ops::inkling2_moe_workspace_capacity_bytes(gu.view.qtype,tokens,tokens));
     captured(ctx,[&]{ops::inkling2_moe(xt,weights,ot,workspace,ctx.stream);});
+    const bool use_a8 = q3 && tokens >= 64;
+    std::vector<double> x_q;
+    if (use_a8) {
+        std::vector<std::uint16_t> x_u16(x.size());
+        for (std::size_t i = 0; i < x.size(); ++i) x_u16[i] = f32_to_bf16(x[i]);
+        x_q = a8_g64_dequantized(x_u16, 2304, tokens);
+    }
     std::vector<double> ref(std::size_t(2304)*tokens);
     for(int t=0;t<tokens;++t){
         std::array<double,128> probs{};std::array<int,128> order{};std::iota(order.begin(),order.end(),0);
@@ -238,11 +280,18 @@ int moe_case(DeviceContext& ctx,bool q3,int tokens){
         for(int i=0;i<8;++i){
             int e=order[i];std::array<double,1152> act{};
             for(int row=0;row<1152;++row){
-                double g=gu.dot(e*2304+row,[&](int k){return x[k+2304*t];});
-                double u=gu.dot(e*2304+row+1152,[&](int k){return x[k+2304*t];});
+                double g=gu.dot(e*2304+row,[&](int k){return use_a8?x_q[k+2304*t]:double(x[k+2304*t]);});
+                double u=gu.dot(e*2304+row+1152,[&](int k){return use_a8?x_q[k+2304*t]:double(x[k+2304*t]);});
                 act[row]=(4*std::tanh(g/4)/(1+std::exp(-g)))*(25*std::tanh(u/25));
             }
-            for(int row=0;row<2304;++row)ref[row+2304*t]+=8*probs[e]/norm*down.dot(e*2304+row,[&](int k){return act[k];});
+            if (use_a8) {
+                std::vector<std::uint16_t> act_u16(1152);
+                for (int row = 0; row < 1152; ++row) act_u16[row] = f32_to_bf16(static_cast<float>(act[row]));
+                auto act_q = a8_g64_dequantized(act_u16, 1152, 1);
+                for(int row=0;row<2304;++row)ref[row+2304*t]+=8*probs[e]/norm*down.dot(e*2304+row,[&](int k){return act_q[k];});
+            } else {
+                for(int row=0;row<2304;++row)ref[row+2304*t]+=8*probs[e]/norm*down.dot(e*2304+row,[&](int k){return act[k];});
+            }
         }
     }
     int failures=verify_reduction("inkling2 MoE FP64",from_device_bf16(out.data(),ref.size()),ref,
@@ -354,9 +403,11 @@ int main(int argc,char** argv){
         }
         if(sel=="all"||sel=="swa"){
             for(int start:{0,513,1025,2049})for(int t:{1,8,15,16,17,64,129,1024})failures+=swa_case(ctx,start,t);
+            failures+=swa_split_case(ctx,1025,1,true);
+            failures+=swa_split_case(ctx,2049,8,false);
         }
         if(sel=="all"||sel=="moe"){
-            for(bool q3:{false,true})for(int t:{1,3,4,8,15,16,17,64,65,256,1024})failures+=moe_case(ctx,q3,t);
+            for(bool q3:{false,true})for(int t:{1,3,4,8,15,16,17,63,64,65,256,1024})failures+=moe_case(ctx,q3,t);
         }
         if(sel=="all"||sel=="dspark"){
             for(int ctx_k:{0,65,1025})failures+=dspark_attn_case(ctx,ctx_k,8,true,KvCacheStorage::BFloat16);

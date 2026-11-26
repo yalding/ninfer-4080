@@ -45,9 +45,12 @@ def _build_writer_specs(
     resources: dict[str, bytes],
     *,
     include_mtp: bool = False,
+    include_draft_head: bool = False,
 ) -> list[ArtifactResourceSpec | ArtifactTensorSpec]:
     specs: list[ArtifactResourceSpec | ArtifactTensorSpec] = []
-    for item in inventory.object_specs(include_mtp=include_mtp):
+    for item in inventory.object_specs(
+        include_mtp=include_mtp, include_draft_head=include_draft_head
+    ):
         if isinstance(item, inventory.ResourceSpec):
             specs.append(ArtifactResourceSpec(item.name, item.encoding, len(resources[item.name])))
         else:
@@ -134,10 +137,18 @@ def convert(
         else None
     )
     include_mtp = resolved_mtp is not None
+    include_draft_head = include_mtp
     resources = source.load_frontend_resources(sources.model_dir)
-    writer_specs = _build_writer_specs(resources, include_mtp=include_mtp)
-    t_specs = inventory.tensor_specs(include_mtp=include_mtp)
-    obj_specs = inventory.object_specs(include_mtp=include_mtp)
+    writer_specs = _build_writer_specs(
+        resources, include_mtp=include_mtp, include_draft_head=include_draft_head
+    )
+    t_specs = inventory.tensor_specs(
+        include_mtp=include_mtp, include_draft_head=include_draft_head
+    )
+    obj_specs = inventory.object_specs(
+        include_mtp=include_mtp, include_draft_head=include_draft_head
+    )
+    draft_head_ids = source.compute_dspark_draft_head_ids() if include_draft_head else None
 
     output = Path(out_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -169,7 +180,19 @@ def convert(
                     print(f"[{done}/{total}] {res_spec.name}", flush=True)
 
                 for t_spec in t_specs:
-                    if t_spec.name.startswith("mtp/"):
+                    if t_spec.name == "mtp/draft_head_token_ids":
+                        assert draft_head_ids is not None
+                        payload = encode_direct(draft_head_ids, t_spec.format)
+                        writer.write(t_spec.name, payload)
+                        del payload
+                    elif t_spec.name == "mtp/draft_head":
+                        assert draft_head_ids is not None
+                        tensor = source.load_mtp_draft_head(reader, draft_head_ids)
+                        payload = _encode_non_expert_tensor(t_spec, tensor, resolved_device)
+                        del tensor
+                        writer.write(t_spec.name, payload)
+                        del payload
+                    elif t_spec.name.startswith("mtp/"):
                         assert mtp_reader is not None
                         tensor = source.load_mtp_tensor(t_spec, mtp_reader)
                         payload = _encode_non_expert_tensor(t_spec, tensor, resolved_device)

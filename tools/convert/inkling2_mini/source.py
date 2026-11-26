@@ -549,3 +549,18 @@ def load_mtp_tensor(spec: inventory.TensorSpec, reader: MtpSourceReader) -> torc
         t = reader.get(hp + key)
         return t.to(dtype).contiguous() if dtype is not None else t
     raise ValueError(f"unhandled MTP tensor {name}")
+
+
+def compute_dspark_draft_head_ids() -> torch.Tensor:
+    """Deterministic 32,768-token shortlist: special tokens [200000..200058) + top BPE IDs."""
+
+    specials = list(range(200000, inventory.UNPADDED_VOCAB_SIZE))
+    bpe_count = inventory.MTP_DRAFT_HEAD_ROWS - len(specials)
+    ids = list(range(bpe_count)) + specials
+    assert len(ids) == inventory.MTP_DRAFT_HEAD_ROWS
+    return torch.tensor(ids, dtype=torch.int32)
+
+
+def load_mtp_draft_head(reader: Inkling2SourceReader, ids: torch.Tensor) -> torch.Tensor:
+    unembed = reader.get("model.llm.unembed.weight")
+    return unembed.index_select(0, ids.to(torch.long)).contiguous()

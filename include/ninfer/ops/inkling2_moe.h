@@ -36,6 +36,12 @@ struct Inkling2MoeWeights {
  *   - `SiTU(g, u) = (4.0f * tanh(g / 4.0f) * sigmoid(g)) * (25.0f * tanh(u / 25.0f))`
  *   - `out[:, t] = BF16(sum_{i=0..7} alpha[i] * W_down[id_i] * SiTU(W_gate[id_i]*x, W_up[id_i]*x))`
  *
+ * Numeric:
+ *   - For `Q3G128_F16S` with `T >= 64`, expert projections apply the documented `A8G64` activation
+ *     quantization (`amax / 127`, `rint(x * (127 / amax))` in `[-127, 127]`,
+ *     `src/ops/common/rowsplit_a8_quantize.h`) to `x` before `W_gate`/`W_up` and to
+ *     `BF16(SiTU(...))` before `W_down`; the router projection remains BF16.
+ *
  * `x` and `out` are contiguous BF16 `[2304, T]` (no residual add; `out` is completely overwritten).
  */
 void inkling2_moe(const Tensor& x, const Inkling2MoeWeights& weights, Tensor& out,

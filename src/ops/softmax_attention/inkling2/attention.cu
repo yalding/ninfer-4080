@@ -43,13 +43,15 @@ __global__ __launch_bounds__(NumWarps * 32)
                                  const BF* __restrict__ cv, const BF* __restrict__ gate,
                                  const float* __restrict__ rel, const int* __restrict__ pos,
                                  Cache cache, int tokens, int nsplits, int partition,
-                                 float* __restrict__ parts, BF* __restrict__ output) {
-    constexpr int D = 128;
+                                 bool append_to_ring, float* __restrict__ parts,
+                                 BF* __restrict__ output) {
+    constexpr int D       = 128;
     constexpr float Scale = 0.08838834764831844f;
+    constexpr float Log2E = 1.4426950408889634074f;
 
     const int kh    = blockIdx.x & 7;
     const int t0    = (blockIdx.x >> 3) * Tq;
-    const int split = Swa ? 0 : blockIdx.y;
+    const int split = blockIdx.y;
     const int warp  = threadIdx.x >> 5;
     const int lane  = threadIdx.x & 31;
     const int d0    = lane * 4;
@@ -103,11 +105,16 @@ __global__ __launch_bounds__(NumWarps * 32)
         }
     }
 
-    const int last_t  = min(t0 + Tq - 1, tokens - 1);
-    const int qp_min  = qp[0];
-    const int qp_max  = pos[last_t];
-    const int lo      = Swa ? max(0, qp_min - 1023) : split * partition;
-    const int hi      = Swa ? (qp_max + 1) : min(qp_max + 1, lo + partition);
+    const int last_t    = min(t0 + Tq - 1, tokens - 1);
+    const int qp_min    = qp[0];
+    const int qp_max    = pos[last_t];
+    const int lo_global = Swa ? max(0, qp_min - 1023) : 0;
+    const int hi_global = qp_max + 1;
+    const int part      = Swa ? (nsplits > 1 ? (hi_global - lo_global + nsplits - 1) / nsplits
+                                             : (hi_global - lo_global))
+                              : partition;
+    const int lo        = lo_global + split * part;
+    const int hi        = min(hi_global, lo + part);
 
     for (int key = lo + warp; key < hi; key += NumWarps) {
         float k[4];
@@ -153,28 +160,31 @@ __global__ __launch_bounds__(NumWarps * 32)
         } else {
             const int page = cache.table[key >> 6], off = key & 63;
             if constexpr (Mode == KvMode::RK4) {
-                const std::uint8_t* kp =
-                    reinterpret_cast<const std::uint8_t*>(cache.k.at(page, kh, off));
-                const std::uint8_t* vp =
-                    reinterpret_cast<const std::uint8_t*>(cache.v.at(page, kh, off));
-                const __half* ks = reinterpret_cast<const __half*>(cache.ks.at(page, kh, off));
-                const __half* vs = reinterpret_cast<const __half*>(cache.vs.at(page, kh, off));
-                const float ksc0 = __half2float(ks[0]), ksc1 = __half2float(ks[1]);
-                const float vsc0 = __half2float(vs[0]), vsc1 = __half2float(vs[1]);
-                const int byte0  = lane >> 1;
-                const int hi_nib = lane & 1;
-                auto unpack      = [hi_nib](std::uint8_t b) -> float {
-                    const unsigned nib = hi_nib ? (b >> 4) : (b & 0x0fu);
-                    return static_cast<float>(static_cast<int>(nib ^ 8u) - 8);
+                const std::uint32_t* kp =
+                    reinterpret_cast<const std::uint32_t*>(cache.k.at(page, kh, off));
+                const std::uint32_t* vp =
+                    reinterpret_cast<const std::uint32_t*>(cache.v.at(page, kh, off));
+                const float2 ksc = __half22float2(
+                    *reinterpret_cast<const __half2*>(cache.ks.at(page, kh, off)));
+                const float2 vsc = __half22float2(
+                    *reinterpret_cast<const __half2*>(cache.vs.at(page, kh, off)));
+                const std::uint32_t kw_lane = lane < 16 ? __ldg(kp + lane) : 0u;
+                const std::uint32_t vw_lane = lane < 16 ? __ldg(vp + lane) : 0u;
+                const int w_base            = lane >> 3;
+                const int bit_shift         = (lane & 7) * 4;
+                auto unpack_shfl = [bit_shift](std::uint32_t w_lane, int w_idx, float sc) -> float {
+                    const std::uint32_t word = __shfl_sync(0xffffffffu, w_lane, w_idx);
+                    const unsigned nib       = (word >> bit_shift) & 0x0fu;
+                    return static_cast<float>(static_cast<int>(nib ^ 8u) - 8) * sc;
                 };
-                k[0] = unpack(kp[byte0]) * ksc0;
-                k[1] = unpack(kp[byte0 + 16]) * ksc0;
-                k[2] = unpack(kp[byte0 + 32]) * ksc1;
-                k[3] = unpack(kp[byte0 + 48]) * ksc1;
-                v[0] = unpack(vp[byte0]) * vsc0;
-                v[1] = unpack(vp[byte0 + 16]) * vsc0;
-                v[2] = unpack(vp[byte0 + 32]) * vsc1;
-                v[3] = unpack(vp[byte0 + 48]) * vsc1;
+                k[0] = unpack_shfl(kw_lane, w_base, ksc.x);
+                k[1] = unpack_shfl(kw_lane, w_base + 4, ksc.x);
+                k[2] = unpack_shfl(kw_lane, w_base + 8, ksc.y);
+                k[3] = unpack_shfl(kw_lane, w_base + 12, ksc.y);
+                v[0] = unpack_shfl(vw_lane, w_base, vsc.x);
+                v[1] = unpack_shfl(vw_lane, w_base + 4, vsc.x);
+                v[2] = unpack_shfl(vw_lane, w_base + 8, vsc.y);
+                v[3] = unpack_shfl(vw_lane, w_base + 12, vsc.y);
             } else if constexpr (Mode == KvMode::I8) {
                 const int32_t ki = *reinterpret_cast<const int32_t*>(cache.k.at(page, kh, off) + d0);
                 const auto* k8   = reinterpret_cast<const signed char*>(&ki);
@@ -227,8 +237,10 @@ __global__ __launch_bounds__(NumWarps * 32)
                         (!Swa && dist >= 1024) ? far_rel[qt][g] : rel_row[qt][g][min(dist, 1024)];
                     const float score   = fmaf(dot, Scale, bias);
                     const float next    = fmaxf(maximum[qt][g], score);
-                    const float rescale = maximum[qt][g] == -CUDART_INF_F ? 0.0f : expf(maximum[qt][g] - next);
-                    const float p       = expf(score - next);
+                    const float rescale = maximum[qt][g] == -CUDART_INF_F
+                                              ? 0.0f
+                                              : exp2f((maximum[qt][g] - next) * Log2E);
+                    const float p       = exp2f((score - next) * Log2E);
                     den[qt][g]          = fmaf(den[qt][g], rescale, p);
 #pragma unroll
                     for (int i = 0; i < 4; ++i)
@@ -239,9 +251,22 @@ __global__ __launch_bounds__(NumWarps * 32)
         }
     }
 
-    __shared__ float s_max[NumWarps];
-    __shared__ float s_den[NumWarps];
-    __shared__ float s_acc[NumWarps][D];
+    if constexpr (Swa && Tq == 1) {
+        if (append_to_ring && split == 0 && warp == 0) {
+            const int slot = first & 1023;
+            const int off  = 128 * kh;
+            const uint2 kb = load_vec<uint2>(ck + off + d0);
+            const uint2 vb = load_vec<uint2>(cv + off + d0);
+            store_vec(const_cast<char*>(cache.k.at(cache.lane, kh, slot) + 2 * d0), kb);
+            const uint2 vf16 = make_uint2(bf16x2_bits_to_f16x2_bits(vb.x),
+                                          bf16x2_bits_to_f16x2_bits(vb.y));
+            store_vec(const_cast<char*>(cache.v.at(cache.lane, kh, slot) + 2 * d0), vf16);
+        }
+    }
+
+    __shared__ float s_max[3][NumWarps];
+    __shared__ float s_den[3][NumWarps];
+    __shared__ float s_acc[3][NumWarps][D];
 
 #pragma unroll
     for (int qt = 0; qt < Tq; ++qt) {
@@ -249,69 +274,116 @@ __global__ __launch_bounds__(NumWarps * 32)
         if (t >= tokens) break;
 #pragma unroll
         for (int g = 0; g < 3; ++g) {
-            const int h = 3 * kh + g;
-            s_max[warp] = maximum[qt][g];
-            s_den[warp] = den[qt][g];
+            s_max[g][warp] = maximum[qt][g];
+            s_den[g][warp] = den[qt][g];
             if constexpr (Mode == KvMode::RK4) {
-                s_acc[warp][lane]      = acc[qt][g][0];
-                s_acc[warp][lane + 32] = acc[qt][g][1];
-                s_acc[warp][64 + lane] = acc[qt][g][2];
-                s_acc[warp][96 + lane] = acc[qt][g][3];
+                s_acc[g][warp][lane]      = acc[qt][g][0];
+                s_acc[g][warp][lane + 32] = acc[qt][g][1];
+                s_acc[g][warp][64 + lane] = acc[qt][g][2];
+                s_acc[g][warp][96 + lane] = acc[qt][g][3];
             } else {
 #pragma unroll
-                for (int i = 0; i < 4; ++i) s_acc[warp][d0 + i] = acc[qt][g][i];
+                for (int i = 0; i < 4; ++i) s_acc[g][warp][d0 + i] = acc[qt][g][i];
             }
-            __syncthreads();
-            float m         = -CUDART_INF_F;
-            float acc_total = 0.0f, den_total = 0.0f;
+        }
+        __syncthreads();
+
+        const bool sink = nsplits == 1;
+        if constexpr (Mode == KvMode::RK4) {
             if (threadIdx.x < D) {
                 const int d = threadIdx.x;
 #pragma unroll
-                for (int w = 0; w < NumWarps; ++w) m = fmaxf(m, s_max[w]);
-                const bool sink = Swa || nsplits == 1;
-                if (sink) m = fmaxf(0.0f, m);
+                for (int g = 0; g < 3; ++g) {
+                    float m = -CUDART_INF_F, acc_total = 0.0f, den_total = 0.0f;
 #pragma unroll
-                for (int w = 0; w < NumWarps; ++w) {
-                    const float scale = s_max[w] == -CUDART_INF_F ? 0.0f : expf(s_max[w] - m);
-                    acc_total         = fmaf(scale, s_acc[w][d], acc_total);
-                    den_total         = fmaf(scale, s_den[w], den_total);
-                }
-                if constexpr (Mode == KvMode::RK4) s_acc[0][d] = acc_total;
-            }
-            if constexpr (Mode == KvMode::RK4) {
-                __syncthreads();
-                if (warp < 2) {
-                    const int grp_base = warp * 64;
-                    float x0           = s_acc[0][grp_base + lane];
-                    float x1           = s_acc[0][grp_base + 32 + lane];
-                    kv_cache_hadamard64(x0, x1, 0xffffffffu);
-                    s_acc[0][grp_base + lane]      = x0;
-                    s_acc[0][grp_base + 32 + lane] = x1;
-                }
-                __syncthreads();
-                if (threadIdx.x < D) acc_total = s_acc[0][threadIdx.x];
-            }
-            if (threadIdx.x < D) {
-                const int d     = threadIdx.x;
-                const bool sink = Swa || nsplits == 1;
-                if (sink) {
-                    den_total += expf(-m);
-                    const float gv = __bfloat162float(
-                        gate[3072 + d + 128 * h + static_cast<std::int64_t>(6528) * t]);
-                    output[d + 128 * (h + static_cast<std::int64_t>(24) * t)] =
-                        __float2bfloat16_rn(acc_total / den_total / (1.0f + expf(-gv)));
-                } else {
-                    const std::int64_t base =
-                        (std::int64_t(t) * 24 * nsplits + h * nsplits + split) * 130;
-                    parts[base + d] = acc_total;
+                    for (int w = 0; w < NumWarps; ++w) m = fmaxf(m, s_max[g][w]);
+                    if (sink) m = fmaxf(0.0f, m);
+#pragma unroll
+                    for (int w = 0; w < NumWarps; ++w) {
+                        const float scale =
+                            s_max[g][w] == -CUDART_INF_F ? 0.0f : exp2f((s_max[g][w] - m) * Log2E);
+                        acc_total = fmaf(scale, s_acc[g][w][d], acc_total);
+                        den_total = fmaf(scale, s_den[g][w], den_total);
+                    }
+                    s_acc[g][0][d] = acc_total;
                     if (d == 0) {
-                        parts[base + 128] = m;
-                        parts[base + 129] = den_total;
+                        s_max[g][0] = m;
+                        s_den[g][0] = den_total;
                     }
                 }
             }
             __syncthreads();
+            for (int pair = warp; pair < 6; pair += NumWarps) {
+                const int g        = pair >> 1;
+                const int grp_base = (pair & 1) * 64;
+                float x0           = s_acc[g][0][grp_base + lane];
+                float x1           = s_acc[g][0][grp_base + 32 + lane];
+                kv_cache_hadamard64(x0, x1, 0xffffffffu);
+                s_acc[g][0][grp_base + lane]      = x0;
+                s_acc[g][0][grp_base + 32 + lane] = x1;
+            }
+            __syncthreads();
+            if (threadIdx.x < D) {
+                const int d = threadIdx.x;
+#pragma unroll
+                for (int g = 0; g < 3; ++g) {
+                    const int h         = 3 * kh + g;
+                    const float m       = s_max[g][0];
+                    const float acc_out = s_acc[g][0][d];
+                    float den_out       = s_den[g][0];
+                    if (sink) {
+                        den_out += exp2f(-m * Log2E);
+                        const float gv = __bfloat162float(
+                            gate[3072 + d + 128 * h + static_cast<std::int64_t>(6528) * t]);
+                        output[d + 128 * (h + static_cast<std::int64_t>(24) * t)] =
+                            __float2bfloat16_rn(acc_out / den_out / (1.0f + expf(-gv)));
+                    } else {
+                        const std::int64_t base =
+                            (std::int64_t(t) * 24 * nsplits + h * nsplits + split) * 130;
+                        parts[base + d] = acc_out;
+                        if (d == 0) {
+                            parts[base + 128] = m;
+                            parts[base + 129] = den_out;
+                        }
+                    }
+                }
+            }
+        } else {
+            if (threadIdx.x < D) {
+                const int d = threadIdx.x;
+#pragma unroll
+                for (int g = 0; g < 3; ++g) {
+                    const int h = 3 * kh + g;
+                    float m = -CUDART_INF_F, acc_total = 0.0f, den_total = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < NumWarps; ++w) m = fmaxf(m, s_max[g][w]);
+                    if (sink) m = fmaxf(0.0f, m);
+#pragma unroll
+                    for (int w = 0; w < NumWarps; ++w) {
+                        const float scale =
+                            s_max[g][w] == -CUDART_INF_F ? 0.0f : exp2f((s_max[g][w] - m) * Log2E);
+                        acc_total = fmaf(scale, s_acc[g][w][d], acc_total);
+                        den_total = fmaf(scale, s_den[g][w], den_total);
+                    }
+                    if (sink) {
+                        den_total += exp2f(-m * Log2E);
+                        const float gv = __bfloat162float(
+                            gate[3072 + d + 128 * h + static_cast<std::int64_t>(6528) * t]);
+                        output[d + 128 * (h + static_cast<std::int64_t>(24) * t)] =
+                            __float2bfloat16_rn(acc_total / den_total / (1.0f + expf(-gv)));
+                    } else {
+                        const std::int64_t base =
+                            (std::int64_t(t) * 24 * nsplits + h * nsplits + split) * 130;
+                        parts[base + d] = acc_total;
+                        if (d == 0) {
+                            parts[base + 128] = m;
+                            parts[base + 129] = den_total;
+                        }
+                    }
+                }
+            }
         }
+        if (qt + 1 < Tq && t + 1 < tokens) __syncthreads();
     }
 }
 
@@ -459,12 +531,11 @@ __launch_bounds__(128, 1) __global__
     __shared__ __align__(16) __half v_s[Bc * D];
 
     const int q_block = static_cast<int>(blockIdx.x);
-    const int q_head = static_cast<int>(blockIdx.y);
+    const int kv_head = static_cast<int>(blockIdx.y);
     const int tid = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int q0 = q_block * Br;
-    const int kv_head = q_head / 3;
+    const int q0 = q_block * 21;
     if (q0 >= tokens) return;
 
     const int base_pos = pos[0];
@@ -492,18 +563,23 @@ __launch_bounds__(128, 1) __global__
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r = static_cast<unsigned>(b_rin << 4);
 
-    // Stage Q once.
+    // Stage Q once (21 tokens x 3 GQA heads = 63 active rows; row 63 padded with zeros).
     {
         constexpr int VecPerRow = D / 8; // 16
-        constexpr int QRowStride = D * 24;
-        const BF* q_block_ptr = q + (static_cast<std::int64_t>(q0) * 24 + q_head) * D;
 #pragma unroll
         for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
             const int row = chunk >> 4;
             const int d = (chunk & 15) << 3;
             BF* p = &q_s[row * D + inkling2_swz128(row, d)];
-            if (q0 + row < tokens) {
-                cp_async<16, ninfer::ops::Cache::cg>(p, &q_block_ptr[row * QRowStride + d]);
+            if (row < 63) {
+                const int qrow   = q0 + row / 3;
+                const int q_head = kv_head * 3 + (row % 3);
+                if (qrow < tokens) {
+                    cp_async<16, ninfer::ops::Cache::cg>(
+                        p, &q[(static_cast<std::int64_t>(qrow) * 24 + q_head) * D + d]);
+                } else {
+                    store_vec(p, make_int4(0, 0, 0, 0));
+                }
             } else {
                 store_vec(p, make_int4(0, 0, 0, 0));
             }
@@ -513,7 +589,7 @@ __launch_bounds__(128, 1) __global__
     if constexpr (Mode == KvMode::RK4) {
         cp_wait<0>();
         __syncthreads();
-        for (int row = warp; row < Br; row += 4) {
+        for (int row = warp; row < 63; row += 4) {
             for (int grp = 0; grp < 2; ++grp) {
                 const int c0 = grp * 64 + lane;
                 const int c1 = c0 + 32;
@@ -529,14 +605,18 @@ __launch_bounds__(128, 1) __global__
         __syncthreads();
     }
 
-    const int qrow0 = q0 + warp_row0 + gid;
-    const int qrow1 = q0 + warp_row0 + gid + 8;
-    const int qabs0 = (qrow0 < tokens) ? base_pos + qrow0 : -1;
-    const int qabs1 = (qrow1 < tokens) ? base_pos + qrow1 : -1;
+    const int sr0    = warp_row0 + gid;
+    const int sr1    = warp_row0 + gid + 8;
+    const int qrow0  = q0 + sr0 / 3;
+    const int qrow1  = (sr1 < 63) ? (q0 + sr1 / 3) : tokens;
+    const int qh0    = kv_head * 3 + (sr0 % 3);
+    const int qh1    = kv_head * 3 + (sr1 % 3);
+    const int qabs0  = (qrow0 < tokens) ? base_pos + qrow0 : -1;
+    const int qabs1  = (qrow1 < tokens) ? base_pos + qrow1 : -1;
     const float* rel_row0 =
-        (qrow0 < tokens) ? rel + static_cast<std::int64_t>(q_head + 24 * qrow0) * 1025 : nullptr;
+        (qrow0 < tokens) ? rel + static_cast<std::int64_t>(qh0 + 24 * qrow0) * 1025 : nullptr;
     const float* rel_row1 =
-        (qrow1 < tokens) ? rel + static_cast<std::int64_t>(q_head + 24 * qrow1) * 1025 : nullptr;
+        (qrow1 < tokens) ? rel + static_cast<std::int64_t>(qh1 + 24 * qrow1) * 1025 : nullptr;
     const float far_rel0 = rel_row0 ? rel_row0[1024] : 0.0f;
     const float far_rel1 = rel_row1 ? rel_row1[1024] : 0.0f;
 
@@ -549,7 +629,7 @@ __launch_bounds__(128, 1) __global__
     }
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
 
-    const int tile_rows = min(Br, tokens - q0);
+    const int tile_rows = min(21, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
     const int kb_lo = Swa ? max(0, base_pos + q0 - 1023) / Bc : 0;
     const int kb_hi = max_query_abs / Bc;
@@ -602,7 +682,7 @@ __launch_bounds__(128, 1) __global__
             }
         }
 
-        const bool far_field = (!Swa) && (q0 + Br <= tokens) && ((base_pos + q0) - (k0 + 63) >= 1024);
+        const bool far_field = (!Swa) && (q0 + 21 <= tokens) && ((base_pos + q0) - (k0 + 63) >= 1024);
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
         if (far_field) {
 #pragma unroll
@@ -734,8 +814,11 @@ __launch_bounds__(128, 1) __global__
         }
         __syncwarp();
         for (int r = 0; r < 16; ++r) {
-            const int qrow = q0 + warp_row0 + r;
+            const int sr = warp_row0 + r;
+            if (sr >= 63) break;
+            const int qrow = q0 + sr / 3;
             if (qrow >= tokens) break;
+            const int qh = kv_head * 3 + (sr % 3);
             for (int grp = 0; grp < 2; ++grp) {
                 const int d0 = grp * 64 + lane;
                 const int d1 = d0 + 32;
@@ -743,71 +826,97 @@ __launch_bounds__(128, 1) __global__
                 float x1     = warp_out[r * D + d1];
                 kv_cache_hadamard64(x0, x1, FullMask);
                 const float g0 = __bfloat162float(
-                    gate[3072 + d0 + 128 * q_head + static_cast<std::int64_t>(6528) * qrow]);
+                    gate[3072 + d0 + 128 * qh + static_cast<std::int64_t>(6528) * qrow]);
                 const float g1 = __bfloat162float(
-                    gate[3072 + d1 + 128 * q_head + static_cast<std::int64_t>(6528) * qrow]);
-                out[d0 + 128 * (q_head + static_cast<std::int64_t>(24) * qrow)] =
+                    gate[3072 + d1 + 128 * qh + static_cast<std::int64_t>(6528) * qrow]);
+                out[d0 + 128 * (qh + static_cast<std::int64_t>(24) * qrow)] =
                     __float2bfloat16_rn(x0 / (1.0f + expf(-g0)));
-                out[d1 + 128 * (q_head + static_cast<std::int64_t>(24) * qrow)] =
+                out[d1 + 128 * (qh + static_cast<std::int64_t>(24) * qrow)] =
                     __float2bfloat16_rn(x1 / (1.0f + expf(-g1)));
             }
         }
-        return;
-    }
-
+    } else {
 #pragma unroll
-    for (int n = 0; n < PVNt; ++n) {
-        const int d0 = n * 8 + 2 * lid;
-        if (qrow0 < tokens) {
-            const float2 g0 = __bfloat1622float2(
-                *reinterpret_cast<const __nv_bfloat162*>(
-                    &gate[3072 + d0 + 128 * q_head + static_cast<std::int64_t>(6528) * qrow0]));
-            const float s0 = 1.0f / (1.0f + expf(-g0.x));
-            const float s1 = 1.0f / (1.0f + expf(-g0.y));
-            *reinterpret_cast<unsigned*>(
-                &out[d0 + 128 * (q_head + static_cast<std::int64_t>(24) * qrow0)]) =
-                pack_bf16x2(acc[n][0] * inv_l0 * s0, acc[n][1] * inv_l0 * s1);
-        }
-        if (qrow1 < tokens) {
-            const float2 g1 = __bfloat1622float2(
-                *reinterpret_cast<const __nv_bfloat162*>(
-                    &gate[3072 + d0 + 128 * q_head + static_cast<std::int64_t>(6528) * qrow1]));
-            const float s0 = 1.0f / (1.0f + expf(-g1.x));
-            const float s1 = 1.0f / (1.0f + expf(-g1.y));
-            *reinterpret_cast<unsigned*>(
-                &out[d0 + 128 * (q_head + static_cast<std::int64_t>(24) * qrow1)]) =
-                pack_bf16x2(acc[n][2] * inv_l1 * s0, acc[n][3] * inv_l1 * s1);
+        for (int n = 0; n < PVNt; ++n) {
+            const int d0 = n * 8 + 2 * lid;
+            if (qrow0 < tokens) {
+                const float2 g0 = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(
+                        &gate[3072 + d0 + 128 * qh0 + static_cast<std::int64_t>(6528) * qrow0]));
+                const float s0 = 1.0f / (1.0f + expf(-g0.x));
+                const float s1 = 1.0f / (1.0f + expf(-g0.y));
+                *reinterpret_cast<unsigned*>(
+                    &out[d0 + 128 * (qh0 + static_cast<std::int64_t>(24) * qrow0)]) =
+                    pack_bf16x2(acc[n][0] * inv_l0 * s0, acc[n][1] * inv_l0 * s1);
+            }
+            if (qrow1 < tokens) {
+                const float2 g1 = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(
+                        &gate[3072 + d0 + 128 * qh1 + static_cast<std::int64_t>(6528) * qrow1]));
+                const float s0 = 1.0f / (1.0f + expf(-g1.x));
+                const float s1 = 1.0f / (1.0f + expf(-g1.y));
+                *reinterpret_cast<unsigned*>(
+                    &out[d0 + 128 * (qh1 + static_cast<std::int64_t>(24) * qrow1)]) =
+                    pack_bf16x2(acc[n][2] * inv_l1 * s0, acc[n][3] * inv_l1 * s1);
+            }
         }
     }
 }
 
 void swa_launch(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& gate,
                 const Tensor& rel, const Tensor& pos, const CyclicKVCacheLayerView& c, int lane,
-                Tensor& out, cudaStream_t s) {
+                unsigned swa_keys, float* scratch, bool append_to_ring, Tensor& out,
+                cudaStream_t s) {
     Cache cache{plane(c.k), plane(c.v), {}, {}, nullptr, 1024, lane};
     const int tokens = q.ne[2];
     if (tokens >= 16) {
-        dim3 grid((tokens + 63) / 64, 24);
+        dim3 grid((tokens + 20) / 21, 8);
         inkling2_prompt_kernel<true, KvMode::BF16><<<grid, 128, 0, s>>>(
             static_cast<const BF*>(q.data), static_cast<const BF*>(k.data),
             static_cast<const BF*>(v.data), static_cast<const BF*>(gate.data),
             static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache, tokens,
             static_cast<BF*>(out.data));
-    } else if (tokens == 1) {
-        attention_decode_kernel<true, KvMode::BF16, 8, 1><<<dim3(8), 8 * 32, 0, s>>>(
-            static_cast<const BF*>(q.data), static_cast<const BF*>(k.data),
-            static_cast<const BF*>(v.data), static_cast<const BF*>(gate.data),
-            static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache, tokens,
-            1, 0, nullptr, static_cast<BF*>(out.data));
-    } else {
-        attention_decode_kernel<true, KvMode::BF16, 8, 2>
-            <<<dim3(((tokens + 1) / 2) * 8), 8 * 32, 0, s>>>(
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    const int ns     = scratch ? static_cast<int>(swa_splits(swa_keys, tokens)) : 1;
+    BF* out_arg      = ns == 1 ? static_cast<BF*>(out.data) : nullptr;
+    if (tokens == 1) {
+        if (ns == 1) {
+            attention_decode_kernel<true, KvMode::BF16, 8, 1><<<dim3(8, 1), 8 * 32, 0, s>>>(
                 static_cast<const BF*>(q.data), static_cast<const BF*>(k.data),
                 static_cast<const BF*>(v.data), static_cast<const BF*>(gate.data),
                 static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache,
-                tokens, 1, 0, nullptr, static_cast<BF*>(out.data));
+                tokens, 1, 0, append_to_ring, nullptr, out_arg);
+        } else {
+            attention_decode_kernel<true, KvMode::BF16, 4, 1><<<dim3(8, ns), 4 * 32, 0, s>>>(
+                static_cast<const BF*>(q.data), static_cast<const BF*>(k.data),
+                static_cast<const BF*>(v.data), static_cast<const BF*>(gate.data),
+                static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache,
+                tokens, ns, 0, append_to_ring, scratch, out_arg);
+        }
+    } else {
+        const int xblocks = ((tokens + 1) / 2) * 8;
+        if (ns == 1) {
+            attention_decode_kernel<true, KvMode::BF16, 8, 2><<<dim3(xblocks, 1), 8 * 32, 0, s>>>(
+                static_cast<const BF*>(q.data), static_cast<const BF*>(k.data),
+                static_cast<const BF*>(v.data), static_cast<const BF*>(gate.data),
+                static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache,
+                tokens, 1, 0, false, nullptr, out_arg);
+        } else {
+            attention_decode_kernel<true, KvMode::BF16, 4, 2><<<dim3(xblocks, ns), 4 * 32, 0, s>>>(
+                static_cast<const BF*>(q.data), static_cast<const BF*>(k.data),
+                static_cast<const BF*>(v.data), static_cast<const BF*>(gate.data),
+                static_cast<const float*>(rel.data), static_cast<const int*>(pos.data), cache,
+                tokens, ns, 0, false, scratch, out_arg);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
+    if (ns > 1) {
+        reduce_kernel<<<tokens * 24, 128, 0, s>>>(scratch, static_cast<const BF*>(gate.data), ns,
+                                                  static_cast<BF*>(out.data));
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 void full_launch(const Tensor& q, const Tensor& gate, const Tensor& rel, const Tensor& pos,
@@ -832,7 +941,7 @@ void full_launch(const Tensor& q, const Tensor& gate, const Tensor& rel, const T
         }
     };
     if (tokens >= 16) {
-        dim3 grid((tokens + 63) / 64, 24);
+        dim3 grid((tokens + 20) / 21, 8);
         dispatch_mode([&]<KvMode Mode>() {
             inkling2_prompt_kernel<false, Mode><<<grid, 128, 0, s>>>(
                 static_cast<const BF*>(q.data), nullptr, nullptr, static_cast<const BF*>(gate.data),
@@ -853,7 +962,8 @@ void full_launch(const Tensor& q, const Tensor& gate, const Tensor& rel, const T
             attention_decode_kernel<false, Mode, 4, 1><<<grid, 4 * 32, 0, s>>>(
                 static_cast<const BF*>(q.data), nullptr, nullptr,
                 static_cast<const BF*>(gate.data), static_cast<const float*>(rel.data),
-                static_cast<const int*>(pos.data), cache, tokens, ns, partition, scratch, out_arg);
+                static_cast<const int*>(pos.data), cache, tokens, ns, partition, false, scratch,
+                out_arg);
         });
     } else {
         dim3 grid(((tokens + 1) / 2) * 8, ns);
@@ -861,7 +971,8 @@ void full_launch(const Tensor& q, const Tensor& gate, const Tensor& rel, const T
             attention_decode_kernel<false, Mode, 4, 2><<<grid, 4 * 32, 0, s>>>(
                 static_cast<const BF*>(q.data), nullptr, nullptr,
                 static_cast<const BF*>(gate.data), static_cast<const float*>(rel.data),
-                static_cast<const int*>(pos.data), cache, tokens, ns, partition, scratch, out_arg);
+                static_cast<const int*>(pos.data), cache, tokens, ns, partition, false, scratch,
+                out_arg);
         });
     }
     CUDA_CHECK(cudaGetLastError());
@@ -875,11 +986,13 @@ void full_launch(const Tensor& q, const Tensor& gate, const Tensor& rel, const T
 template <bool Swa, KvMode Mode, int NumWarps, int Tq>
 __global__ __launch_bounds__(NumWarps * 32)
     void dspark_attention_kernel(const BF* __restrict__ q, const BF* __restrict__ ck,
-                                 const BF* __restrict__ cv, Cache cache, int context_keys,
-                                 int tokens, int nsplits, int partition, float* __restrict__ parts,
+                                 const BF* __restrict__ cv, Cache cache, int context_keys_arg,
+                                 const int* __restrict__ context_keys_pos, int tokens, int nsplits,
+                                 int partition, float* __restrict__ parts,
                                  BF* __restrict__ output) {
     constexpr int D       = 128;
     constexpr float Scale = 0.08838834764831844f;
+    const int context_keys = context_keys_pos ? context_keys_pos[0] : context_keys_arg;
 
     const int kh    = blockIdx.x & 7;
     const int t0    = (blockIdx.x >> 3) * Tq;
@@ -928,10 +1041,10 @@ __global__ __launch_bounds__(NumWarps * 32)
         }
     }
 
-    const int lo = Swa ? max(0, context_keys + t0 - 1023) : split * partition;
-    const int hi = Swa ? (context_keys + tokens)
-                       : (split + 1 == nsplits ? (context_keys + tokens)
-                                               : min(context_keys, lo + partition));
+    const int total_keys = context_keys + tokens;
+    const int lo         = Swa ? max(0, context_keys + t0 - 1023) : split * partition;
+    const int hi         = Swa ? total_keys
+                               : min(total_keys, (split + 1 == nsplits) ? total_keys : (lo + partition));
 
     for (int key = lo + warp; key < hi; key += NumWarps) {
         float k[4], v[4];
@@ -973,27 +1086,31 @@ __global__ __launch_bounds__(NumWarps * 32)
         } else {
             const int page = cache.table[key >> 6], off = key & 63;
             if constexpr (Mode == KvMode::RK4) {
-                const std::uint8_t* kp =
-                    reinterpret_cast<const std::uint8_t*>(cache.k.at(page, kh, off));
-                const std::uint8_t* vp =
-                    reinterpret_cast<const std::uint8_t*>(cache.v.at(page, kh, off));
-                const __half* ks = reinterpret_cast<const __half*>(cache.ks.at(page, kh, off));
-                const __half* vs = reinterpret_cast<const __half*>(cache.vs.at(page, kh, off));
-                const float ksc0 = __half2float(ks[0]), ksc1 = __half2float(ks[1]);
-                const float vsc0 = __half2float(vs[0]), vsc1 = __half2float(vs[1]);
-                const int byte0 = lane >> 1, hi_nib = lane & 1;
-                auto unpack = [hi_nib](std::uint8_t b) -> float {
-                    const unsigned nib = hi_nib ? (b >> 4) : (b & 0x0fu);
-                    return static_cast<float>(static_cast<int>(nib ^ 8u) - 8);
+                const std::uint32_t* kp =
+                    reinterpret_cast<const std::uint32_t*>(cache.k.at(page, kh, off));
+                const std::uint32_t* vp =
+                    reinterpret_cast<const std::uint32_t*>(cache.v.at(page, kh, off));
+                const float2 ksc = __half22float2(
+                    *reinterpret_cast<const __half2*>(cache.ks.at(page, kh, off)));
+                const float2 vsc = __half22float2(
+                    *reinterpret_cast<const __half2*>(cache.vs.at(page, kh, off)));
+                const std::uint32_t kw_lane = lane < 16 ? __ldg(kp + lane) : 0u;
+                const std::uint32_t vw_lane = lane < 16 ? __ldg(vp + lane) : 0u;
+                const int w_base            = lane >> 3;
+                const int bit_shift         = (lane & 7) * 4;
+                auto unpack_shfl = [bit_shift](std::uint32_t w_lane, int w_idx, float sc) -> float {
+                    const std::uint32_t word = __shfl_sync(0xffffffffu, w_lane, w_idx);
+                    const unsigned nib       = (word >> bit_shift) & 0x0fu;
+                    return static_cast<float>(static_cast<int>(nib ^ 8u) - 8) * sc;
                 };
-                k[0] = unpack(kp[byte0]) * ksc0;
-                k[1] = unpack(kp[byte0 + 16]) * ksc0;
-                k[2] = unpack(kp[byte0 + 32]) * ksc1;
-                k[3] = unpack(kp[byte0 + 48]) * ksc1;
-                v[0] = unpack(vp[byte0]) * vsc0;
-                v[1] = unpack(vp[byte0 + 16]) * vsc0;
-                v[2] = unpack(vp[byte0 + 32]) * vsc1;
-                v[3] = unpack(vp[byte0 + 48]) * vsc1;
+                k[0] = unpack_shfl(kw_lane, w_base, ksc.x);
+                k[1] = unpack_shfl(kw_lane, w_base + 4, ksc.x);
+                k[2] = unpack_shfl(kw_lane, w_base + 8, ksc.y);
+                k[3] = unpack_shfl(kw_lane, w_base + 12, ksc.y);
+                v[0] = unpack_shfl(vw_lane, w_base, vsc.x);
+                v[1] = unpack_shfl(vw_lane, w_base + 4, vsc.x);
+                v[2] = unpack_shfl(vw_lane, w_base + 8, vsc.y);
+                v[3] = unpack_shfl(vw_lane, w_base + 12, vsc.y);
             } else if constexpr (Mode == KvMode::I8) {
                 const int32_t ki = *reinterpret_cast<const int32_t*>(cache.k.at(page, kh, off) + d0);
                 const auto* k8   = reinterpret_cast<const signed char*>(&ki);
@@ -1128,38 +1245,40 @@ __global__ void dspark_reduce_kernel(const float* parts, int nsplits, BF* out) {
 }
 
 void dspark_swa_launch(const Tensor& q, const Tensor& block_k, const Tensor& block_v,
-                       unsigned context_keys, const CyclicKVCacheLayerView& c, int lane,
-                       Tensor& out, cudaStream_t s) {
+                       unsigned context_keys, const int* context_keys_pos,
+                       const CyclicKVCacheLayerView& c, int lane, Tensor& out, cudaStream_t s) {
     Cache cache{plane(c.k), plane(c.v), {}, {}, nullptr, 1024, lane};
     const int tokens = q.ne[2];
     if (tokens == 1) {
         dspark_attention_kernel<true, KvMode::BF16, 8, 1><<<dim3(8), 8 * 32, 0, s>>>(
             static_cast<const BF*>(q.data), static_cast<const BF*>(block_k.data),
-            static_cast<const BF*>(block_v.data), cache, static_cast<int>(context_keys), tokens, 1,
-            0, nullptr, static_cast<BF*>(out.data));
+            static_cast<const BF*>(block_v.data), cache, static_cast<int>(context_keys),
+            context_keys_pos, tokens, 1, 0, nullptr, static_cast<BF*>(out.data));
     } else {
         dspark_attention_kernel<true, KvMode::BF16, 8, 2>
             <<<dim3(((tokens + 1) / 2) * 8), 8 * 32, 0, s>>>(
                 static_cast<const BF*>(q.data), static_cast<const BF*>(block_k.data),
                 static_cast<const BF*>(block_v.data), cache, static_cast<int>(context_keys),
-                tokens, 1, 0, nullptr, static_cast<BF*>(out.data));
+                context_keys_pos, tokens, 1, 0, nullptr, static_cast<BF*>(out.data));
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 void dspark_full_launch(const Tensor& q, const Tensor& block_k, const Tensor& block_v,
-                        const PagedKVLayerView& c, unsigned context_keys, float* scratch,
+                        const PagedKVLayerView& c, unsigned context_keys,
+                        unsigned max_context_keys, const int* context_keys_pos, float* scratch,
                         Tensor& out, cudaStream_t s) {
     const int tokens = q.ne[2];
-    Cache cache{context_keys > 0 ? plane(c.k_pages) : Plane{},
-                context_keys > 0 ? plane(c.v_pages) : Plane{},
-                context_keys > 0 ? plane(c.k_scale_pages) : Plane{},
-                context_keys > 0 ? plane(c.v_scale_pages) : Plane{},
-                context_keys > 0 ? static_cast<const int*>(c.block_table.data) : nullptr,
+    Cache cache{max_context_keys > 0 ? plane(c.k_pages) : Plane{},
+                max_context_keys > 0 ? plane(c.v_pages) : Plane{},
+                max_context_keys > 0 ? plane(c.k_scale_pages) : Plane{},
+                max_context_keys > 0 ? plane(c.v_scale_pages) : Plane{},
+                max_context_keys > 0 ? static_cast<const int*>(c.block_table.data) : nullptr,
                 0,
                 0};
-    const int ns        = context_keys > 0 ? static_cast<int>(splits(context_keys, tokens)) : 1;
-    const int partition = context_keys > 0 ? (static_cast<int>(context_keys) + ns - 1) / ns : 0;
+    const int ns = max_context_keys > 0 ? static_cast<int>(splits(max_context_keys, tokens)) : 1;
+    const int partition =
+        max_context_keys > 0 ? (static_cast<int>(max_context_keys) + ns - 1) / ns : 0;
     BF* out_arg         = ns == 1 ? static_cast<BF*>(out.data) : nullptr;
     const auto dispatch_mode = [&](auto fn) {
         if (c.storage == KvCacheStorage::Int8Group64) {
@@ -1177,7 +1296,7 @@ void dspark_full_launch(const Tensor& q, const Tensor& block_k, const Tensor& bl
             dspark_attention_kernel<false, Mode, 4, 1><<<grid, 4 * 32, 0, s>>>(
                 static_cast<const BF*>(q.data), static_cast<const BF*>(block_k.data),
                 static_cast<const BF*>(block_v.data), cache, static_cast<int>(context_keys),
-                tokens, ns, partition, scratch, out_arg);
+                context_keys_pos, tokens, ns, partition, scratch, out_arg);
         });
     } else {
         dim3 grid(((tokens + 1) / 2) * 8, ns);
@@ -1185,7 +1304,7 @@ void dspark_full_launch(const Tensor& q, const Tensor& block_k, const Tensor& bl
             dspark_attention_kernel<false, Mode, 4, 2><<<grid, 4 * 32, 0, s>>>(
                 static_cast<const BF*>(q.data), static_cast<const BF*>(block_k.data),
                 static_cast<const BF*>(block_v.data), cache, static_cast<int>(context_keys),
-                tokens, ns, partition, scratch, out_arg);
+                context_keys_pos, tokens, ns, partition, scratch, out_arg);
         });
     }
     CUDA_CHECK(cudaGetLastError());

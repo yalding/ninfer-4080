@@ -33,7 +33,10 @@ constexpr int C = 2304, V = 200058, P = 201024;
 constexpr std::uint32_t kScoreChunk = 128;
 
 std::uint32_t chunk_capacity(const EngineOptions& options) {
-    return std::min({1024U, options.max_context, std::max(1U, options.prefill_chunk)});
+    const std::uint32_t batch =
+        std::min<std::uint32_t>(kMaximumConcurrency, std::max(1U, options.max_concurrency));
+    const auto prefill = std::min({1024U, options.max_context, std::max(1U, options.prefill_chunk)});
+    return std::max(prefill, batch);
 }
 
 std::uint32_t kv_tokens(const EngineOptions& options) {
@@ -45,15 +48,17 @@ std::uint32_t kv_tokens(const EngineOptions& options) {
 int head_columns(const EngineOptions& options) {
     if (options.purpose == EnginePurpose::CausalScoring)
         return static_cast<int>(std::min(kScoreChunk, chunk_capacity(options)));
+    int cols = static_cast<int>(
+        std::min<std::uint32_t>(kMaximumConcurrency, std::max(1U, options.max_concurrency)));
     if (options.speculative.backend != SpeculativeBackend::None) {
         std::uint32_t max_drafts = std::max(1U, options.speculative.draft_tokens);
         if (options.speculative.backend == SpeculativeBackend::Mtp &&
             options.speculative.ngram.mode == NgramDraftMode::Chain) {
             max_drafts = std::min(7U, std::max(max_drafts, options.speculative.ngram.max_drafts));
         }
-        return static_cast<int>(max_drafts + 1U);
+        cols = std::max(cols, static_cast<int>(max_drafts + 1U));
     }
-    return 1;
+    return cols;
 }
 
 std::size_t op_workspace(const EngineOptions& options) {
@@ -64,12 +69,12 @@ std::size_t op_workspace(const EngineOptions& options) {
                                 options.kv_cache, options.max_context, 1, t));
     for (const auto [n, k] : {std::pair{6528, 2304}, {1024, 2304}, {2304, 3072}})
         bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
-                                    QType::Q4G64_F16S, n, k, ops::LinearPolicy::A16Only, 1, t));
+                                    QType::Q4G64_F16S, n, k, ops::LinearPolicy::AllowA8, 1, t));
     if (options.speculative.backend == SpeculativeBackend::DFlash2) {
         const int w_max = head_columns(options);
         const int k_max = std::max(1, w_max - 1);
         bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
-                                    QType::Q4G64_F16S, C, 9216, ops::LinearPolicy::A16Only, 1, t));
+                                    QType::Q4G64_F16S, C, 9216, ops::LinearPolicy::AllowA8, 1, t));
         for (const auto [n, k] : {std::pair{4096, C}, {1024, C}, {C, 4096}, {13824, C}, {C, 6912}})
             bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
                                         QType::Q4G64_F16S, n, k, ops::LinearPolicy::A16Only, 1,
@@ -83,6 +88,7 @@ std::size_t op_workspace(const EngineOptions& options) {
                                     V, {false}, 1, k_max, 1, 1));
     } else if (options.speculative.backend != SpeculativeBackend::None) {
         bytes = std::max(bytes, ops::inkling2_dspark_rnn_step_workspace_bytes());
+        bytes = std::max(bytes, ops::inkling2_dspark_rnn_step_folded_workspace_bytes());
         bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
                                     QType::Q4G64_F16S, 18432, 2304, ops::LinearPolicy::A16Only, 1, 8));
         bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
@@ -101,11 +107,12 @@ std::size_t op_workspace(const EngineOptions& options) {
 struct ScratchLayout {
     TensorRegion cur, residual, blocks[4], prelude, bank, previous, mix, messages, inputs;
     TensorRegion qgr, kraw, vraw, kconv, vconv, q, k, v, r, sink, dynamic_k, dynamic_v, rel;
-    TensorRegion attention, projection, moe, ffn_mix, ids, positions, count, lane;
+    TensorRegion attention, projection, moe, ffn_mix, ids, positions, count, lane, batch_slots;
     TensorRegion logits, sampled, sample_position, counts, score_targets, score_result;
     TensorRegion dspark_features, dspark_mixed, dspark_c_head, dspark_block, dspark_res, dspark_norm;
     TensorRegion dspark_q, dspark_k, dspark_v, dspark_attn, dspark_proj, dspark_mlp_gu, dspark_mlp_act;
     TensorRegion dspark_h_prime, dspark_rnn_state, dspark_pos, dspark_draft_tok, dspark_draft_logits;
+    TensorRegion dspark_w_fold_q, dspark_w_fold_scale, dspark_b_fold;
     TensorRegion dspark_pre_conv, dspark_conv_trace, dspark_target_toks, dspark_extents;
     TensorRegion dspark_lengths, dspark_anchors, dspark_licensed, dspark_licensed_cnt, dspark_accepted;
     TensorRegion dflash2_features, dflash2_ctx_proj, dflash2_ctx, dflash2_ids, dflash2_pos;
@@ -151,19 +158,22 @@ ScratchLayout scratch_layout(const EngineOptions& options) {
     s.sink            = fp({24, t});
     s.dynamic_k       = fp({32, t});
     s.dynamic_v       = fp({32, t});
-    s.rel             = fp({1025, 24, t});
+    s.rel             = bf({1025, 24, std::max(t, 32)});
     s.attention       = bf({128, 24, t});
     s.projection      = bf({C, t});
     s.moe             = bf({C, t});
     s.ffn_mix         = bf({C, t});
+    const int max_b   = static_cast<int>(
+        std::min<std::uint32_t>(kMaximumConcurrency, std::max(1U, options.max_concurrency)));
     s.ids             = i32({t});
     s.positions       = i32({t});
     s.count           = i32({1});
     s.lane            = i32({1});
+    s.batch_slots     = i32({max_b});
     s.logits          = bf({P, head_columns(options)});
-    s.sampled         = i32({1});
-    s.sample_position = i32({1});
-    s.counts          = i32({V});
+    s.sampled         = i32({max_b});
+    s.sample_position = i32({max_b});
+    s.counts          = i32({V, max_b});
     s.score_targets   = i32({head_columns(options)});
     s.score_result    = fp({head_columns(options)});
     if (options.speculative.backend != SpeculativeBackend::None) {
@@ -209,7 +219,14 @@ ScratchLayout scratch_layout(const EngineOptions& options) {
             s.dspark_rnn_state  = fp({256});
             s.dspark_pos        = i32({8});
             s.dspark_draft_tok  = i32({8});
-            s.dspark_draft_logits = bf({P, 1});
+            s.dspark_draft_logits = bf({P, 7});
+            if (options.speculative.proposal_head != ProposalHead::Optimized) {
+                s.dspark_w_fold_q =
+                    b.add_tensor(DType::I8, {256, P}, 256, "Inkling DSpark folded W");
+                s.dspark_w_fold_scale =
+                    b.add_tensor(DType::FP16, {4, P}, 256, "Inkling DSpark folded scale");
+                s.dspark_b_fold = fp({P});
+            }
         }
         s.dspark_pre_conv     = bf({6656 * 3, 48});
         s.dspark_conv_trace   = bf({6656 * max_w, 48});
@@ -221,7 +238,7 @@ ScratchLayout scratch_layout(const EngineOptions& options) {
         s.dspark_licensed_cnt = i32({1});
         s.dspark_accepted     = i32({1});
     }
-    s.config          = b.add(sizeof(ops::SamplingConfig), 256, "Inkling sampling config");
+    s.config          = b.add(sizeof(ops::SamplingConfig) * max_b, 256, "Inkling sampling config");
     s.bytes           = b.finish(256);
     return s;
 }
@@ -283,9 +300,16 @@ public:
         std::int32_t dflash2_frontier;
         std::int32_t dflash2_valid_cols;
         std::int32_t dflash2_base_pos;
+        std::int32_t batch_slots[kMaximumConcurrency];
+        TokenId batch_ids[kMaximumConcurrency];
+        std::int32_t batch_positions[kMaximumConcurrency];
+        std::int32_t batch_sample_positions[kMaximumConcurrency];
+        TokenId batch_sampled[kMaximumConcurrency];
+        ops::SamplingConfig batch_configs[kMaximumConcurrency];
     };
 
     std::map<std::pair<std::uint32_t, std::uint32_t>, Graph> graphs;
+    std::map<std::pair<int, std::uint32_t>, Graph> batch_graphs;
     std::map<std::tuple<std::uint32_t, std::uint32_t, int>, Graph> draft_graphs;
     std::map<std::tuple<std::uint32_t, std::uint32_t, int>, Graph> dflash2_draft_graphs;
     std::map<std::tuple<std::uint32_t, std::uint32_t, int>, Graph> verify_graphs;
@@ -299,12 +323,25 @@ public:
     int last_spec_w                = 0;
     int last_spec_accepted         = 0;
 
-    Impl(const RuntimeModelView& m, DeviceContext& d, const EngineOptions& o)
-        : model(m), device(d), options(o), states(o, kv_tokens(o)), layout(scratch_layout(o)),
-          scratch(layout.bytes), workspace(op_workspace(o)),
+    Impl(const RuntimeModelView& m, DeviceContext& d, const EngineOptions& o,
+         const StartupObserver* observer = nullptr)
+        : model(m), device(d), options(o), states(o, kv_tokens(o), observer),
+          layout(scratch_layout(o)), scratch(layout.bytes), workspace(op_workspace(o)),
           pinned_step(sizeof(HostStepStaging)),
           pinned_ids(chunk_capacity(o) * sizeof(TokenId)),
-          pinned_positions(chunk_capacity(o) * sizeof(std::int32_t)), host_counts(V) {}
+          pinned_positions(chunk_capacity(o) * sizeof(std::int32_t)),
+          host_counts(static_cast<std::size_t>(V) * std::max(1U, o.max_concurrency)) {
+        if (model.has_mtp && states.has_dspark() &&
+            options.speculative.proposal_head != ProposalHead::Optimized) {
+            Tensor w_fold_q = bf(layout.dspark_w_fold_q, 256, P);
+            Tensor w_fold_s = bf(layout.dspark_w_fold_scale, 4, P);
+            Tensor b_fold   = bf(layout.dspark_b_fold, P);
+            ops::inkling2_dspark_fold_head(model.output_head, model.mtp.markov_hidden_out_weight,
+                                           model.mtp.markov_hidden_out_bias, w_fold_q, w_fold_s,
+                                           b_fold, device.stream);
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        }
+    }
 
     Tensor bf(const TensorRegion& r, int a, int b = 1, int c = 1) {
         return region(r, scratch, {a, b, c});
@@ -333,7 +370,11 @@ public:
                v = bf(layout.v, 128, 8, t);
         Tensor r = bf(layout.r, 16, 24, t), sink = bf(layout.sink, 24, t),
                dk = bf(layout.dynamic_k, 32, t), dv = bf(layout.dynamic_v, 32, t);
-        Tensor table = bf(layout.rel, 1025, 24, t), attention = bf(layout.attention, 128, 24, t);
+        Tensor table =
+            t <= 16 ? Tensor(layout.rel.region.bind({scratch.p, scratch.bytes}).data, DType::FP32,
+                             {1025, 24, t})
+                    : bf(layout.rel, 1025, 24, t);
+        Tensor attention = bf(layout.attention, 128, 24, t);
         Tensor projection = bf(layout.projection, C, t), moe = bf(layout.moe, C, t),
                ffn          = bf(layout.ffn_mix, C, t);
         auto capture_feat = [&](int slice, const Tensor& src) {
@@ -349,10 +390,11 @@ public:
                                            cudaMemcpyDeviceToDevice, stream));
             }
         };
-        auto record_conv_comp = [&](int visit_idx, int comp_off, const Tensor& src) {
+        auto conv_trace_slice = [&](int visit_idx, int comp_off, int channels) -> Tensor {
+            if (!record_conv) return {};
             auto* dst = static_cast<std::byte*>(bf(layout.dspark_conv_trace, 6656 * t, 48).data) +
                         (static_cast<std::size_t>(visit_idx) * 6656 + comp_off) * t * 2;
-            CUDA_CHECK(cudaMemcpyAsync(dst, src.data, src.bytes(), cudaMemcpyDeviceToDevice, stream));
+            return Tensor(dst, DType::BF16, {channels, t});
         };
         auto states_and_cur = [&] {
             std::array<Tensor, 5> values;
@@ -402,21 +444,19 @@ public:
             const int kv_idx = (loop || branches == 3) ? 1 : 0;
             const int v_idx  = (loop || branches == 3) ? 2 : 0;
             auto qi = branch(attn_in, 0), ki = branch(attn_in, kv_idx), vi = branch(attn_in, v_idx);
-            ops::linear(qi, w.attention_qgr, qgr, ops::LinearPolicy::A16Only, workspace, stream);
-            ops::linear(ki, w.attention_k, kraw, ops::LinearPolicy::A16Only, workspace, stream);
-            ops::linear(vi, w.attention_v, vraw, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::linear(qi, w.attention_qgr, qgr, ops::LinearPolicy::AllowA8, workspace, stream);
+            ops::linear(ki, w.attention_k, kraw, ops::LinearPolicy::AllowA8, workspace, stream);
+            ops::linear(vi, w.attention_v, vraw, ops::LinearPolicy::AllowA8, workspace, stream);
             if (w.full_attention) {
                 ops::inkling2_small_bf16_proj(ki, w.attention_k_conv_proj, dk, stream);
                 ops::inkling2_small_bf16_proj(vi, w.attention_v_conv_proj, dv, stream);
             }
             auto ks = states.convolution(slot, visit, 0), vs = states.convolution(slot, visit, 1);
-            if (record_conv) {
-                record_conv_comp(visit, 0, kraw);
-                record_conv_comp(visit, 1024, vraw);
-            }
             ops::inkling2_fused_sconv_kv(kraw, w.attention_k_conv, w.full_attention ? dk : Tensor{},
                                          ks, ks, kc, vraw, w.attention_v_conv,
-                                         w.full_attention ? dv : Tensor{}, vs, vs, vc, stream);
+                                         w.full_attention ? dv : Tensor{}, vs, vs, vc, stream,
+                                         conv_trace_slice(visit, 0, 1024),
+                                         conv_trace_slice(visit, 1024, 1024));
             ops::inkling2_qkr_clip_v_norm(qgr, kc, vc, w.attention_q_clip, w.attention_rel_clip,
                                           positions, w.full_attention, q, k, v, r, stream);
             ops::inkling2_small_bf16_proj(qi, w.attention_sink_proj, sink, stream);
@@ -442,19 +482,19 @@ public:
                 }
             }
             Tensor flat(attention.data, DType::BF16, {3072, t});
-            ops::linear(flat, w.attention_output, projection, ops::LinearPolicy::A16Only, workspace,
+            ops::linear(flat, w.attention_output, projection, ops::LinearPolicy::AllowA8, workspace,
                         stream);
             auto as = states.convolution(slot, visit, 2);
-            if (record_conv) record_conv_comp(visit, 2048, projection);
+            auto attn_trace = conv_trace_slice(visit, 2048, C);
             if (physical % 6 == 0) {
                 if (block_count >= 4)
                     throw std::logic_error("Inkling residual block schedule overflow");
                 copy(cur, blocks[block_count++], stream);
                 ops::inkling2_fused_sconv(projection, w.attention_post_conv, {}, as, as, {},
-                                          residual, stream);
+                                          residual, stream, attn_trace);
             } else {
                 ops::inkling2_fused_sconv(projection, w.attention_post_conv, {}, as, as, cur,
-                                          residual, stream);
+                                          residual, stream, attn_trace);
             }
             std::array<Tensor, 5> values;
             for (int i = 0; i < block_count; ++i) values[i] = blocks[i];
@@ -471,10 +511,15 @@ public:
             }
             ops::Inkling2MoeWeights mw{w.ffn_router, w.ffn_exp_probs_bias, w.ffn_routed_gate_up,
                                        w.ffn_routed_down};
-            ops::inkling2_moe(ffn, mw, moe, workspace, stream);
             auto fs = states.convolution(slot, visit, 3);
-            if (record_conv) record_conv_comp(visit, 4352, moe);
-            ops::inkling2_fused_sconv(moe, w.ffn_post_conv, {}, fs, fs, residual, cur, stream);
+            if (t <= 16) {
+                ops::inkling2_moe_post_sconv(ffn, mw, w.ffn_post_conv, fs, fs, residual, cur,
+                                             conv_trace_slice(visit, 4352, C), workspace, stream);
+            } else {
+                ops::inkling2_moe(ffn, mw, moe, workspace, stream);
+                ops::inkling2_fused_sconv(moe, w.ffn_post_conv, {}, fs, fs, residual, cur, stream,
+                                          conv_trace_slice(visit, 4352, C));
+            }
         };
         int visit = 0;
         for (int p = 0; p < 6; ++p) layer(p, visit++, false);
@@ -508,6 +553,163 @@ public:
         auto logits       = bf(layout.logits, P, cols);
         ops::linear(head_input, model.output_head, logits, ops::LinearPolicy::A16Only, workspace,
                     stream);
+        ops::inkling2_softcap_slice(logits, 30.0f, V, logits, stream);
+    }
+
+    void schedule_batched(int b, std::uint32_t envelope) {
+        auto stream    = device.stream;
+        Tensor cur     = bf(layout.cur, C, b), residual = bf(layout.residual, C, b);
+        Tensor ids     = bf(layout.ids, b), positions = bf(layout.positions, b);
+        Tensor b_slots = bf(layout.batch_slots, b);
+        Tensor all_conv = states.all_convolutions();
+        ops::embedding(ids, model.token_embedding, cur, stream);
+        ops::rmsnorm(cur, model.token_norm, 1e-6f, false, cur, stream);
+        std::array<Tensor, 4> blocks;
+        for (int i = 0; i < 4; ++i) blocks[i] = bf(layout.blocks[i], C, b);
+        Tensor prelude = bf(layout.prelude, C, b), bank = bf(layout.bank, C, b),
+               previous = bf(layout.previous, C, b);
+        int block_count = 0, full_layer = 0, swa_layer = 0;
+        Tensor mix = bf(layout.mix, C, b, 3), messages = bf(layout.messages, C, b, 4),
+               inputs = bf(layout.inputs, C, b, 3);
+        Tensor qgr = bf(layout.qgr, 6528, b), kraw = bf(layout.kraw, 1024, b),
+               vraw = bf(layout.vraw, 1024, b);
+        Tensor kc = bf(layout.kconv, 1024, b), vc = bf(layout.vconv, 1024, b);
+        Tensor q = bf(layout.q, 128, 24, b), k = bf(layout.k, 128, 8, b),
+               v = bf(layout.v, 128, 8, b);
+        Tensor r = bf(layout.r, 16, 24, b), sink = bf(layout.sink, 24, b),
+               dk = bf(layout.dynamic_k, 32, b), dv = bf(layout.dynamic_v, 32, b);
+        Tensor table(layout.rel.region.bind({scratch.p, scratch.bytes}).data, DType::FP32,
+                     {1025, 24, b});
+        Tensor attention = bf(layout.attention, 128, 24, b);
+        Tensor projection = bf(layout.projection, C, b), moe = bf(layout.moe, C, b),
+               ffn        = bf(layout.ffn_mix, C, b);
+        auto states_and_cur = [&] {
+            std::array<Tensor, 5> values;
+            for (int i = 0; i < block_count; ++i) values[i] = blocks[i];
+            values[block_count] = cur;
+            return values;
+        };
+        auto layer = [&](int physical, int visit, bool loop) {
+            const auto& w      = model.layers[physical];
+            const int branches = w.full_attention ? 3 : 1;
+            Tensor mixed(mix.data, DType::BF16, {C, b, branches});
+            std::array<Tensor, 3> norms;
+            for (int j = 0; j < 3; ++j)
+                norms[j] =
+                    w.full_attention
+                        ? (j == 0 ? w.attention_q_input_norm
+                                  : (j == 1 ? w.attention_k_input_norm : w.attention_v_input_norm))
+                        : w.attention_input_norm;
+            Tensor attn_in;
+            if (loop) {
+                auto values = states_and_cur();
+                ops::inkling2_attn_res_mix(std::span(values.data(), block_count + 1),
+                                           w.attention_res_query, {}, mixed, stream);
+                Tensor msg3(messages.data, DType::BF16, {C, b, 3});
+                ops::inkling2_loop_control(mixed, msg3, controls(w.loop_ctrl_down, 0, 3),
+                                           controls(w.loop_ctrl_gain_forget, 0, 3), norms, inputs,
+                                           workspace, stream);
+                attn_in = inputs;
+            } else if (physical) {
+                auto values = states_and_cur();
+                ops::inkling2_attn_res_mix(std::span(values.data(), block_count + 1),
+                                           w.attention_res_query, std::span(norms.data(), branches),
+                                           mixed, stream);
+                attn_in = mixed;
+            } else {
+                for (int j = 0; j < branches; ++j) {
+                    auto dst = branch(inputs, j);
+                    ops::rmsnorm(cur, norms[j], 1e-6f, false, dst, stream);
+                }
+                attn_in = inputs;
+            }
+            const int kv_idx = (loop || branches == 3) ? 1 : 0;
+            const int v_idx  = (loop || branches == 3) ? 2 : 0;
+            auto qi = branch(attn_in, 0), ki = branch(attn_in, kv_idx), vi = branch(attn_in, v_idx);
+            ops::linear(qi, w.attention_qgr, qgr, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::linear(ki, w.attention_k, kraw, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::linear(vi, w.attention_v, vraw, ops::LinearPolicy::A16Only, workspace, stream);
+            if (w.full_attention) {
+                ops::inkling2_small_bf16_proj(ki, w.attention_k_conv_proj, dk, stream);
+                ops::inkling2_small_bf16_proj(vi, w.attention_v_conv_proj, dv, stream);
+            }
+            ops::inkling2_fused_sconv_kv_batched(
+                kraw, w.attention_k_conv, w.full_attention ? dk : Tensor{}, kc, vraw,
+                w.attention_v_conv, w.full_attention ? dv : Tensor{}, vc, all_conv, visit, b_slots,
+                stream);
+            ops::inkling2_qkr_clip_v_norm(qgr, kc, vc, w.attention_q_clip, w.attention_rel_clip,
+                                          positions, w.full_attention, q, k, v, r, stream);
+            ops::inkling2_small_bf16_proj(qi, w.attention_sink_proj, sink, stream);
+            ops::inkling2_rel_bias_prepare(r, w.attention_rel_bias, sink, table, stream);
+            if (w.full_attention) {
+                auto cache = states.full_batch(full_layer++);
+                ops::inkling2_kv_append_batched(k, v, positions, b_slots, cache, stream);
+                ops::inkling2_full_attention_batched(q, qgr, table, positions, b_slots, cache,
+                                                     envelope, workspace, attention, stream);
+            } else {
+                auto cache = states.swa(swa_layer++);
+                ops::inkling2_swa_attention_batched(
+                    q, k, v, qgr, table, positions, b_slots, cache,
+                    std::min<std::uint32_t>(envelope, 1025U), workspace, attention, stream, true);
+            }
+            Tensor flat(attention.data, DType::BF16, {3072, b});
+            ops::linear(flat, w.attention_output, projection, ops::LinearPolicy::A16Only, workspace,
+                        stream);
+            if (physical % 6 == 0) {
+                if (block_count >= 4)
+                    throw std::logic_error("Inkling residual block schedule overflow");
+                copy(cur, blocks[block_count++], stream);
+                ops::inkling2_fused_sconv_batched(projection, w.attention_post_conv, all_conv,
+                                                  visit, 2, b_slots, {}, residual, stream);
+            } else {
+                ops::inkling2_fused_sconv_batched(projection, w.attention_post_conv, all_conv,
+                                                  visit, 2, b_slots, cur, residual, stream);
+            }
+            std::array<Tensor, 5> values;
+            for (int i = 0; i < block_count; ++i) values[i] = blocks[i];
+            values[block_count] = residual;
+            const std::array<Tensor, 1> fnorm{w.ffn_input_norm};
+            ops::inkling2_attn_res_mix(
+                std::span(values.data(), block_count + 1), w.ffn_res_query,
+                loop ? std::span<const Tensor>{} : std::span<const Tensor>(fnorm), ffn, stream);
+            if (loop) {
+                auto msg = branch(messages, 3);
+                ops::inkling2_loop_control(ffn, msg, controls(w.loop_ctrl_down, 3, 1),
+                                           controls(w.loop_ctrl_gain_forget, 3, 1), fnorm, ffn,
+                                           workspace, stream);
+            }
+            ops::Inkling2MoeWeights mw{w.ffn_router, w.ffn_exp_probs_bias, w.ffn_routed_gate_up,
+                                       w.ffn_routed_down};
+            ops::inkling2_moe(ffn, mw, moe, workspace, stream);
+            ops::inkling2_fused_sconv_batched(moe, w.ffn_post_conv, all_conv, visit, 3, b_slots,
+                                              residual, cur, stream);
+        };
+        int visit = 0;
+        for (int p = 0; p < 6; ++p) layer(p, visit++, false);
+        copy(cur, prelude, stream);
+        for (int pass = 0; pass < 3; ++pass) {
+            if (pass) {
+                copy(blocks[2], bank, stream);
+                copy(cur, previous, stream);
+                copy(prelude, cur, stream);
+                block_count = 1;
+            }
+            for (int p = 6; p < 18; ++p) {
+                if (pass) {
+                    const std::array<Tensor, 2> bank_states{bank, previous};
+                    ops::inkling2_attn_res_mix(bank_states, model.layers[p].loop_msg_query, {},
+                                               messages, stream);
+                }
+                layer(p, visit++, pass != 0);
+            }
+        }
+        for (int p = 18; p < 24; ++p) layer(p, visit++, false);
+        auto values = states_and_cur();
+        const std::array<Tensor, 1> final_norm{model.final_norm};
+        ops::inkling2_attn_res_mix(std::span(values.data(), block_count + 1),
+                                   model.output_res_query, final_norm, ffn, stream);
+        auto logits = bf(layout.logits, P, b);
+        ops::linear(ffn, model.output_head, logits, ops::LinearPolicy::A16Only, workspace, stream);
         ops::inkling2_softcap_slice(logits, 30.0f, V, logits, stream);
     }
 
@@ -647,30 +849,28 @@ public:
                 bf(layout.dspark_c_head, C, static_cast<int>(states.slots())).data) +
                 static_cast<std::size_t>(state_slot) * C * 2,
             DType::BF16, {C});
-        auto h_prime = bf(layout.dspark_h_prime, C);
-        Tensor h_prime_2d(h_prime.data, DType::BF16, {C, 1});
-        auto draft_logits = bf(layout.dspark_draft_logits, P, 1);
         const bool use_shortlist =
             options.speculative.proposal_head == ProposalHead::Optimized && model.has_draft_head;
-        Tensor draft_logits_short(draft_logits.data, DType::BF16, {32768, 1});
-
-        for (int i = 0; i < K; ++i) {
-            Tensor h_in(
-                static_cast<std::byte*>(norm.data) + static_cast<std::size_t>(i + 1) * C * 2,
-                DType::BF16, {C});
-            Tensor cur_tok(static_cast<std::byte*>(draft_toks.data) +
-                               static_cast<std::size_t>(i) * sizeof(TokenId),
-                           DType::I32, {1});
-            Tensor next_tok(static_cast<std::byte*>(draft_toks.data) +
-                                static_cast<std::size_t>(i + 1) * sizeof(TokenId),
-                            DType::I32, {1});
-            ops::inkling2_dspark_rnn_step(cur_tok, model.mtp.markov_w1,
-                                          model.mtp.markov_rnn_proj_weight,
-                                          model.mtp.markov_rnn_proj_bias,
-                                          model.mtp.markov_hidden_out_weight,
-                                          model.mtp.markov_hidden_out_bias, h_in, c_head, rnn_state,
-                                          h_prime, workspace, stream);
-            if (use_shortlist) {
+        if (use_shortlist) {
+            auto h_prime = bf(layout.dspark_h_prime, C);
+            Tensor h_prime_2d(h_prime.data, DType::BF16, {C, 1});
+            auto draft_logits = bf(layout.dspark_draft_logits, P, 1);
+            Tensor draft_logits_short(draft_logits.data, DType::BF16, {32768, 1});
+            for (int i = 0; i < K; ++i) {
+                Tensor h_in(
+                    static_cast<std::byte*>(norm.data) + static_cast<std::size_t>(i + 1) * C * 2,
+                    DType::BF16, {C});
+                Tensor cur_tok(static_cast<std::byte*>(draft_toks.data) +
+                                   static_cast<std::size_t>(i) * sizeof(TokenId),
+                               DType::I32, {1});
+                Tensor next_tok(static_cast<std::byte*>(draft_toks.data) +
+                                    static_cast<std::size_t>(i + 1) * sizeof(TokenId),
+                                DType::I32, {1});
+                ops::inkling2_dspark_rnn_step(
+                    cur_tok, model.mtp.markov_w1, model.mtp.markov_rnn_proj_weight,
+                    model.mtp.markov_rnn_proj_bias, model.mtp.markov_hidden_out_weight,
+                    model.mtp.markov_hidden_out_bias, h_in, c_head, rnn_state, h_prime, workspace,
+                    stream);
                 ops::linear(h_prime_2d, model.mtp.draft_head, draft_logits_short,
                             ops::LinearPolicy::A16Only, workspace, stream);
                 ops::argmax(draft_logits_short, next_tok, 32768, stream);
@@ -678,10 +878,33 @@ public:
                     next_tok,
                     static_cast<const std::int32_t*>(model.mtp.draft_head_token_ids.data), 32768,
                     stream);
-            } else {
-                ops::linear(h_prime_2d, model.output_head, draft_logits,
-                            ops::LinearPolicy::A16Only, workspace, stream);
-                ops::argmax(draft_logits, next_tok, V, stream);
+            }
+        } else {
+            Tensor norm_drafts(static_cast<std::byte*>(norm.data) + static_cast<std::size_t>(C) * 2,
+                               DType::BF16, {C, K});
+            auto base_logits = bf(layout.dspark_draft_logits, P, K);
+            ops::linear(norm_drafts, model.output_head, base_logits, ops::LinearPolicy::A16Only,
+                        workspace, stream);
+            Tensor w_fold_q = bf(layout.dspark_w_fold_q, 256, P);
+            Tensor w_fold_s = bf(layout.dspark_w_fold_scale, 4, P);
+            Tensor b_fold   = bf(layout.dspark_b_fold, P);
+            for (int i = 0; i < K; ++i) {
+                Tensor h_in(
+                    static_cast<std::byte*>(norm.data) + static_cast<std::size_t>(i + 1) * C * 2,
+                    DType::BF16, {C});
+                Tensor base_col(static_cast<std::byte*>(base_logits.data) +
+                                    static_cast<std::size_t>(i) * P * 2,
+                                DType::BF16, {P});
+                Tensor cur_tok(static_cast<std::byte*>(draft_toks.data) +
+                                   static_cast<std::size_t>(i) * sizeof(TokenId),
+                               DType::I32, {1});
+                Tensor next_tok(static_cast<std::byte*>(draft_toks.data) +
+                                    static_cast<std::size_t>(i + 1) * sizeof(TokenId),
+                                DType::I32, {1});
+                ops::inkling2_dspark_rnn_step_folded(
+                    cur_tok, model.mtp.markov_w1, model.mtp.markov_rnn_proj_weight,
+                    model.mtp.markov_rnn_proj_bias, h_in, c_head, base_col, w_fold_q, w_fold_s,
+                    b_fold, V, rnn_state, next_tok, workspace, stream);
             }
         }
     }
@@ -692,7 +915,7 @@ public:
         Tensor feats   = bf(layout.dflash2_features, 9216, append_count);
         Tensor ctx_p   = bf(layout.dflash2_ctx_proj, C, append_count);
         Tensor ctx     = bf(layout.dflash2_ctx, C, append_count);
-        ops::linear(feats, model.dflash2.fc, ctx_p, ops::LinearPolicy::A16Only, workspace, stream);
+        ops::linear(feats, model.dflash2.fc, ctx_p, ops::LinearPolicy::AllowA8, workspace, stream);
         ops::rmsnorm(ctx_p, model.dflash2.hidden_norm, 1e-6f, false, ctx, stream);
 
         auto* step     = static_cast<HostStepStaging*>(pinned_step.data());
@@ -816,8 +1039,8 @@ public:
 };
 
 Executor::Executor(const RuntimeModelView& model, DeviceContext& device,
-                   const EngineOptions& options)
-    : impl_(std::make_unique<Impl>(model, device, options)) {}
+                   const EngineOptions& options, const StartupObserver* observer)
+    : impl_(std::make_unique<Impl>(model, device, options, observer)) {}
 
 Executor::~Executor() {
     if (impl_) {
@@ -887,7 +1110,7 @@ TokenId Executor::sample(const Tensor& logits, const ResolvedSamplingParameters&
         sampling.presence_penalty != 0.0f || sampling.frequency_penalty != 0.0f;
     int* counts_ptr = nullptr;
     if (use_penalties) {
-        std::fill(p.host_counts.begin(), p.host_counts.end(), 0);
+        std::fill_n(p.host_counts.data(), V, 0);
         for (auto id : history)
             if (id >= 0 && id < V) ++p.host_counts[id];
         auto counts = p.bf(p.layout.counts, V);
@@ -918,6 +1141,105 @@ TokenId Executor::sample(const Tensor& logits, const ResolvedSamplingParameters&
                                cudaMemcpyDeviceToHost, stream));
     sync();
     return step->sampled;
+}
+
+std::vector<TokenId> Executor::decode_batch(std::span<const DecodeRow> rows) {
+    auto& p     = *impl_;
+    if (rows.empty() || rows.size() > p.options.max_concurrency)
+        throw std::invalid_argument("Inkling decode_batch: invalid batch sizes");
+    const int b = static_cast<int>(rows.size());
+    for (const auto& row : rows)
+        if (row.id < 0 || row.id >= V)
+            throw std::invalid_argument("Inkling token ID outside vocabulary");
+
+    auto stream            = p.device.stream;
+    std::uint32_t max_next = 1;
+    auto* step             = static_cast<Impl::HostStepStaging*>(p.pinned_step.data());
+    for (int i = 0; i < b; ++i) {
+        const auto& row = rows[i];
+        p.states.prepare_append(row.slot, row.start, 1, stream);
+        step->batch_ids[i]       = row.id;
+        step->batch_positions[i] = static_cast<std::int32_t>(row.start);
+        step->batch_slots[i]     = static_cast<std::int32_t>(row.slot);
+        max_next                 = std::max(max_next, row.start + 1U);
+    }
+    auto d_ids = p.bf(p.layout.ids, b), d_pos = p.bf(p.layout.positions, b),
+         d_slots = p.bf(p.layout.batch_slots, b);
+    CUDA_CHECK(cudaMemcpyAsync(d_ids.data, step->batch_ids, b * sizeof(TokenId),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_pos.data, step->batch_positions, b * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_slots.data, step->batch_slots, b * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    if (p.options.use_cuda_graph) {
+        std::uint32_t envelope = std::min(256U, p.options.max_context);
+        while (envelope < max_next) envelope = std::min(envelope * 2U, p.options.max_context);
+        auto& graph = p.batch_graphs[{b, envelope}];
+        if (!graph.executable.ready()) {
+            sync();
+            graph.definition.capture(stream, [&] { p.schedule_batched(b, envelope); });
+            graph.executable.instantiate(graph.definition);
+        }
+        graph.executable.launch(stream);
+    } else {
+        p.schedule_batched(b, max_next);
+    }
+
+    auto logits_all    = p.bf(p.layout.logits, P, b);
+    auto* dev_configs  = static_cast<ops::SamplingConfig*>(
+        p.layout.config.bind({p.scratch.p, p.scratch.bytes}).data);
+    auto dev_pos_all   = p.bf(p.layout.sample_position, b);
+    auto dev_out_all   = p.bf(p.layout.sampled, b);
+    auto dev_cnt_all   = p.bf(p.layout.counts, V, b);
+
+    for (int i = 0; i < b; ++i) {
+        const auto& row = rows[i];
+        const auto& sampling = row.sampling;
+        const bool use_penalties =
+            sampling.presence_penalty != 0.0f || sampling.frequency_penalty != 0.0f;
+        int* counts_ptr = nullptr;
+        if (use_penalties) {
+            auto* host_row = p.host_counts.data() + static_cast<std::size_t>(i) * V;
+            std::fill_n(host_row, V, 0);
+            for (auto id : row.history)
+                if (id >= 0 && id < V) ++host_row[id];
+            counts_ptr = static_cast<int*>(dev_cnt_all.data) + static_cast<std::size_t>(i) * V;
+            CUDA_CHECK(cudaMemcpyAsync(counts_ptr, host_row, V * sizeof(int),
+                                       cudaMemcpyHostToDevice, stream));
+        }
+        step->batch_configs[i] = ops::SamplingConfig{sampling.temperature,
+                                                     sampling.top_k,
+                                                     sampling.top_p,
+                                                     sampling.min_p,
+                                                     sampling.presence_penalty,
+                                                     sampling.frequency_penalty,
+                                                     sampling.seed,
+                                                     counts_ptr};
+        step->batch_sample_positions[i] = static_cast<std::int32_t>(row.logical_position);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(dev_configs, step->batch_configs, b * sizeof(ops::SamplingConfig),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dev_pos_all.data, step->batch_sample_positions,
+                               b * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+    for (int i = 0; i < b; ++i) {
+        Tensor col_logits(static_cast<std::byte*>(logits_all.data) +
+                              static_cast<std::size_t>(i) * P * 2,
+                          DType::BF16, {P, 1});
+        Tensor col_pos(static_cast<std::byte*>(dev_pos_all.data) +
+                           static_cast<std::size_t>(i) * sizeof(std::int32_t),
+                       DType::I32, {1});
+        Tensor col_out(static_cast<std::byte*>(dev_out_all.data) +
+                           static_cast<std::size_t>(i) * sizeof(TokenId),
+                       DType::I32, {1});
+        ops::sample(col_logits, col_out, V, &dev_configs[i], col_pos, ops::kSamplePurposeDecode,
+                    p.workspace, stream);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(step->batch_sampled, dev_out_all.data, b * sizeof(TokenId),
+                               cudaMemcpyDeviceToHost, stream));
+    sync();
+    for (const auto& row : rows) p.states.commit_append(row.slot, row.start + 1U);
+    return std::vector<TokenId>(step->batch_sampled, step->batch_sampled + b);
 }
 
 void Executor::reset(std::uint32_t slot) { impl_->states.reset(slot, impl_->device.stream); }
@@ -1095,7 +1417,7 @@ std::vector<TokenId> Executor::speculative_step_dspark(std::uint32_t state_slot,
             sampling.presence_penalty != 0.0f || sampling.frequency_penalty != 0.0f;
         int* counts_ptr = nullptr;
         if (use_penalties) {
-            std::fill(p.host_counts.begin(), p.host_counts.end(), 0);
+            std::fill_n(p.host_counts.data(), V, 0);
             for (auto id : generated_history)
                 if (id >= 0 && id < V) ++p.host_counts[id];
             auto counts = p.bf(p.layout.counts, V);
@@ -1237,7 +1559,7 @@ std::vector<TokenId> Executor::verify_dspark(std::uint32_t state_slot,
             sampling.presence_penalty != 0.0f || sampling.frequency_penalty != 0.0f;
         int* counts_ptr = nullptr;
         if (use_penalties) {
-            std::fill(p.host_counts.begin(), p.host_counts.end(), 0);
+            std::fill_n(p.host_counts.data(), V, 0);
             for (auto id : generated_history)
                 if (id >= 0 && id < V) ++p.host_counts[id];
             auto counts = p.bf(p.layout.counts, V);
@@ -1337,7 +1659,7 @@ std::vector<TokenId> Executor::speculative_step_dflash2(std::uint32_t state_slot
         sampling.presence_penalty != 0.0f || sampling.frequency_penalty != 0.0f;
     int* counts_ptr = nullptr;
     if (use_penalties) {
-        std::fill(p.host_counts.begin(), p.host_counts.end(), 0);
+        std::fill_n(p.host_counts.data(), V, 0);
         for (auto id : generated_history)
             if (id >= 0 && id < V) ++p.host_counts[id];
         auto counts = p.bf(p.layout.counts, V);

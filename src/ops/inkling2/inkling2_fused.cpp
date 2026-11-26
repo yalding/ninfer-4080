@@ -55,7 +55,7 @@ void inkling2_small_bf16_proj(const Tensor& x, const Tensor& weight, Tensor& out
 
 void inkling2_fused_sconv(const Tensor& x, const Tensor& w, const Tensor& dynamic,
                           const Tensor& state_in, Tensor& state_out, const Tensor& residual,
-                          Tensor& out, cudaStream_t s) {
+                          Tensor& out, cudaStream_t s, Tensor trace_out) {
     const int c = x.ne[0], t = x.ne[1];
     require(c == 1024 || c == 2304, "convolution channels must be 1024 or 2304");
     shape(x, DType::BF16, {c, t}); shape(out, DType::BF16, {c, t});
@@ -74,17 +74,22 @@ void inkling2_fused_sconv(const Tensor& x, const Tensor& w, const Tensor& dynami
         shape(residual, DType::BF16, {c, t});
         identical_or_disjoint(residual, out); disjoint(residual, state_out);
     }
-    detail::inkling2_sconv_launch(x, w, dynamic, state_in, state_out, residual, out, s);
+    if (trace_out.data) {
+        shape(trace_out, DType::BF16, {c, t});
+        disjoint(x, trace_out); disjoint(out, trace_out); disjoint(state_out, trace_out);
+    }
+    detail::inkling2_sconv_launch(x, w, dynamic, state_in, state_out, residual, out, trace_out, s);
 }
 
 void inkling2_fused_sconv_kv(const Tensor& kx, const Tensor& k_weight, const Tensor& k_dynamic,
                              const Tensor& k_state_in, Tensor& k_state_out, Tensor& k_out,
                              const Tensor& vx, const Tensor& v_weight, const Tensor& v_dynamic,
                              const Tensor& v_state_in, Tensor& v_state_out, Tensor& v_out,
-                             cudaStream_t s) {
+                             cudaStream_t s, Tensor k_trace_out, Tensor v_trace_out) {
     const int t = kx.ne[1];
     auto check_branch = [&](const Tensor& x, const Tensor& w, const Tensor& dyn,
-                            const Tensor& st_in, const Tensor& st_out, const Tensor& out) {
+                            const Tensor& st_in, const Tensor& st_out, const Tensor& out,
+                            const Tensor& trace) {
         shape(x, DType::BF16, {1024, t});
         shape(out, DType::BF16, {1024, t});
         shape(w, DType::FP32, {4, 1024});
@@ -99,13 +104,76 @@ void inkling2_fused_sconv_kv(const Tensor& kx, const Tensor& k_weight, const Ten
             shape(dyn, dyn.dtype, {32, t});
             disjoint(dyn, out); disjoint(dyn, st_out);
         }
+        if (trace.data) {
+            shape(trace, DType::BF16, {1024, t});
+            disjoint(x, trace); disjoint(out, trace); disjoint(st_out, trace);
+        }
     };
-    check_branch(kx, k_weight, k_dynamic, k_state_in, k_state_out, k_out);
-    check_branch(vx, v_weight, v_dynamic, v_state_in, v_state_out, v_out);
+    check_branch(kx, k_weight, k_dynamic, k_state_in, k_state_out, k_out, k_trace_out);
+    check_branch(vx, v_weight, v_dynamic, v_state_in, v_state_out, v_out, v_trace_out);
     require(k_dynamic.data != nullptr == (v_dynamic.data != nullptr),
             "paired sconv_kv dynamic taps mismatch");
     detail::inkling2_sconv_kv_launch(kx, k_weight, k_dynamic, k_state_in, k_state_out, k_out, vx,
-                                     v_weight, v_dynamic, v_state_in, v_state_out, v_out, s);
+                                     v_weight, v_dynamic, v_state_in, v_state_out, v_out,
+                                     k_trace_out, v_trace_out, s);
+}
+
+void inkling2_fused_sconv_batched(const Tensor& x, const Tensor& static_weight,
+                                  Tensor& all_conv_states, std::int32_t visit,
+                                  std::int32_t component, const Tensor& slots,
+                                  const Tensor& residual, Tensor& out, cudaStream_t s) {
+    const int b = x.ne[1];
+    require(b >= 1 && b <= 8 && visit >= 0 && visit < 48 && (component == 2 || component == 3),
+            "inkling2_fused_sconv_batched: invalid B/visit/component");
+    shape(x, DType::BF16, {2304, b});
+    shape(static_weight, DType::FP32, {4, 2304});
+    require(all_conv_states.data != nullptr && all_conv_states.dtype == DType::BF16 &&
+                all_conv_states.is_contiguous() && all_conv_states.ne[0] == 6656 * 3 &&
+                all_conv_states.ne[1] == 48 && all_conv_states.ne[2] >= 1 &&
+                all_conv_states.ne[3] == 1,
+            "inkling2_fused_sconv_batched: invalid all_conv_states");
+    shape(slots, DType::I32, {b});
+    shape(out, DType::BF16, {2304, b});
+    disjoint(out, x);
+    if (residual.data) {
+        shape(residual, DType::BF16, {2304, b});
+        disjoint(out, residual);
+    }
+    detail::inkling2_sconv_batched_launch(x, static_weight, all_conv_states, visit, component,
+                                          slots, residual, out, s);
+}
+
+void inkling2_fused_sconv_kv_batched(const Tensor& kx, const Tensor& kw, const Tensor& kdyn,
+                                     Tensor& kout, const Tensor& vx, const Tensor& vw,
+                                     const Tensor& vdyn, Tensor& vout, Tensor& all_conv_states,
+                                     std::int32_t visit, const Tensor& slots, cudaStream_t s) {
+    const int b = kx.ne[1];
+    require(b >= 1 && b <= 8 && visit >= 0 && visit < 48,
+            "inkling2_fused_sconv_kv_batched: invalid B/visit");
+    shape(kx, DType::BF16, {1024, b});
+    shape(vx, DType::BF16, {1024, b});
+    shape(kw, DType::FP32, {4, 1024});
+    shape(vw, DType::FP32, {4, 1024});
+    shape(kout, DType::BF16, {1024, b});
+    shape(vout, DType::BF16, {1024, b});
+    shape(slots, DType::I32, {b});
+    require(all_conv_states.data != nullptr && all_conv_states.dtype == DType::BF16 &&
+                all_conv_states.is_contiguous() && all_conv_states.ne[0] == 6656 * 3 &&
+                all_conv_states.ne[1] == 48 && all_conv_states.ne[2] >= 1 &&
+                all_conv_states.ne[3] == 1,
+            "inkling2_fused_sconv_kv_batched: invalid all_conv_states");
+    if (kdyn.data || vdyn.data) {
+        require(kdyn.data && vdyn.data && (kdyn.dtype == DType::FP32 || kdyn.dtype == DType::BF16) &&
+                    vdyn.dtype == kdyn.dtype,
+                "inkling2_fused_sconv_kv_batched: dynamic taps");
+        shape(kdyn, kdyn.dtype, {32, b});
+        shape(vdyn, vdyn.dtype, {32, b});
+    }
+    disjoint(kout, kx);
+    disjoint(vout, vx);
+    disjoint(kout, vout);
+    detail::inkling2_sconv_kv_batched_launch(kx, kw, kdyn, kout, vx, vw, vdyn, vout,
+                                             all_conv_states, visit, slots, s);
 }
 
 void inkling2_attn_res_mix(std::span<const Tensor> states, const Tensor& q,
@@ -259,6 +327,71 @@ void inkling2_dspark_rnn_step(const Tensor& prev_token, const Tensor& markov_w1,
     detail::inkling2_dspark_rnn_step_launch(prev_token, markov_w1, rnn_proj_weight, rnn_proj_bias,
                                             hidden_out_weight, hidden_out_bias, h_in, c_head, state,
                                             h_out, x_buf, guz, s);
+}
+
+void inkling2_dspark_fold_head(const Weight& output_head, const Tensor& hidden_out_weight,
+                               const Tensor& hidden_out_bias, Tensor& w_fold_q,
+                               Tensor& w_fold_scale, Tensor& b_fold, cudaStream_t s) {
+    require(output_head.qtype == QType::Q6G64_F16S && output_head.layout == QuantLayout::RowSplit &&
+                output_head.group_size == 64 && output_head.group == 64 &&
+                output_head.scale_dtype == DType::FP16 && output_head.k == 2304 &&
+                output_head.padded_shape[1] == 2304 && output_head.n > 0 &&
+                (output_head.n % 64) == 0 && output_head.qdata != nullptr &&
+                output_head.qhigh != nullptr && output_head.scales != nullptr,
+            "dspark fold head: output_head must be Q6G64_F16S [N, 2304] with 64 | N");
+    shape(hidden_out_weight, DType::BF16, {256, 2304});
+    shape(hidden_out_bias, DType::FP32, {2304});
+    shape(w_fold_q, DType::I8, {256, output_head.n});
+    shape(w_fold_scale, DType::FP16, {4, output_head.n});
+    shape(b_fold, DType::FP32, {output_head.n});
+    disjoint(w_fold_q, hidden_out_weight);
+    disjoint(w_fold_scale, hidden_out_weight);
+    disjoint(b_fold, hidden_out_bias);
+    detail::inkling2_dspark_fold_head_launch(output_head, hidden_out_weight, hidden_out_bias,
+                                             w_fold_q, w_fold_scale, b_fold, s);
+}
+
+std::size_t inkling2_dspark_rnn_step_folded_workspace_bytes() {
+    return ((5120 * 2 + 255) & ~std::size_t(255)) +
+           ((768 * sizeof(float) + 255) & ~std::size_t(255)) +
+           ((256 * sizeof(float) + 255) & ~std::size_t(255)) +
+           ((272 * sizeof(float) + 255) & ~std::size_t(255)) +
+           ((272 * sizeof(int) + 255) & ~std::size_t(255));
+}
+
+void inkling2_dspark_rnn_step_folded(const Tensor& prev_token, const Tensor& markov_w1,
+                                     const Tensor& rnn_proj_weight, const Tensor& rnn_proj_bias,
+                                     const Tensor& h_in, const Tensor& c_head,
+                                     const Tensor& base_logits_col, const Tensor& w_fold_q,
+                                     const Tensor& w_fold_scale, const Tensor& b_fold,
+                                     std::int32_t valid_vocab, Tensor& state, Tensor& next_token,
+                                     WorkspaceArena& workspace, cudaStream_t s) {
+    shape(prev_token, DType::I32, {1});
+    shape(markov_w1, DType::BF16, {256, 201024});
+    shape(rnn_proj_weight, DType::BF16, {5120, 768});
+    shape(rnn_proj_bias, DType::FP32, {768});
+    shape(h_in, DType::BF16, {2304});
+    shape(c_head, DType::BF16, {2304});
+    const int n = b_fold.ne[0];
+    require(n > 0 && (n % 64) == 0 && valid_vocab > 0 && valid_vocab <= n,
+            "dspark folded step: invalid vocab");
+    shape(base_logits_col, DType::BF16, {n});
+    shape(w_fold_q, DType::I8, {256, n});
+    shape(w_fold_scale, DType::FP16, {4, n});
+    shape(b_fold, DType::FP32, {n});
+    shape(state, DType::FP32, {256});
+    shape(next_token, DType::I32, {1});
+    disjoint(next_token, state);
+    auto scope       = workspace.scope();
+    void* x_buf      = workspace.alloc_bytes(5120 * 2).data;
+    auto* guz        = static_cast<float*>(workspace.alloc_bytes(768 * sizeof(float)).data);
+    auto* m_latent   = static_cast<float*>(workspace.alloc_bytes(256 * sizeof(float)).data);
+    auto* part_vals  = static_cast<float*>(workspace.alloc_bytes(272 * sizeof(float)).data);
+    auto* part_ids   = static_cast<int*>(workspace.alloc_bytes(272 * sizeof(int)).data);
+    detail::inkling2_dspark_rnn_step_folded_launch(
+        prev_token, markov_w1, rnn_proj_weight, rnn_proj_bias, h_in, c_head, base_logits_col,
+        w_fold_q, w_fold_scale, b_fold, valid_vocab, state, next_token, x_buf, guz, m_latent,
+        part_vals, part_ids, s);
 }
 
 void inkling2_dspark_commit_conv_state(const Tensor& pre_state, const Tensor& conv_trace,

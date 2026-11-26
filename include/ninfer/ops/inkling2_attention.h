@@ -21,7 +21,7 @@ namespace ninfer::ops {
  *   - `r_in`: contiguous FP32 `[16, 24, T]`
  *   - `rel_bias`: contiguous FP32 `[16, 1024]`
  *   - `sink`: contiguous FP32 or BF16 `[24, T]`
- *   - `rel_table`: contiguous FP32 `[1025, 24, T]`
+ *   - `rel_table`: contiguous FP32 or BF16 `[1025, 24, T]`
  */
 void inkling2_rel_bias_prepare(const Tensor& r_in, const Tensor& rel_bias, const Tensor& sink,
                                Tensor& rel_table, cudaStream_t stream);
@@ -38,7 +38,7 @@ void inkling2_rel_bias_prepare(const Tensor& r_in, const Tensor& rel_bias, const
  *   - `q`: contiguous BF16 `[128, 24, T]`
  *   - `query_k`, `query_v`: contiguous BF16 `[128, 8, T]`
  *   - `gate_qgr`: contiguous BF16 `[6528, T]` (reads gate rows `[3072, 6144)`)
- *   - `rel_table`: contiguous FP32 `[1025, 24, T]`
+ *   - `rel_table`: contiguous FP32 `[1025, 24, T]`, or BF16 when `T > 16`
  *   - `positions`: contiguous I32 `[T]`, strictly sequential `[L, L+1, ..., L+T-1]`
  *   - `lane`: scalar cyclic lane index in `[0, context.lane_capacity)`
  *   - `out`: contiguous BF16 `[128, 24, T]` (equals `sum * sigmoid(gate)`)
@@ -62,16 +62,17 @@ void inkling2_swa_attention(const Tensor& q, const Tensor& query_k, const Tensor
 
 /**
  * Returns caller-owned transient workspace capacity in bytes required by
- * `inkling2_full_attention` for `storage in {BFloat16, Int8Group64}`, visible key envelope, and
- * query token interval `[min_tokens, max_tokens]`.
+ * `inkling2_full_attention` for the selected KV storage, visible key envelope, and query token
+ * interval `[min_tokens, max_tokens]`.
  */
 [[nodiscard]] std::size_t inkling2_full_attention_workspace_capacity_bytes(
     KvCacheStorage storage, std::uint32_t max_visible_keys, std::int32_t min_tokens,
     std::int32_t max_tokens);
 
 /**
- * Full-Attention causal GQA (`D=128, Hq=24, Hkv=8`) over paged KV cache (`BFloat16` or
- * `Int8Group64`) with clamped relative-position bias (`rel_table[min(q_pos - k_pos, 1024)]`),
+ * Full-Attention causal GQA (`D=128, Hq=24, Hkv=8`) over paged KV cache (`BFloat16`,
+ * `Int8Group64`, `RotatedInt4KeyInt4ValueGroup64`, or `RK4V4E8`) with clamped relative-position
+ * bias (`rel_table[min(q_pos - k_pos, 1024)]`, FP32 or BF16 when `T > 16`),
  * zero-sink softmax, and fused `sigmoid(gate)` output epilogue.
  *
  * Expects current tokens `[positions[0]..positions[T-1]]` to ALREADY be appended in `cache`.
@@ -81,6 +82,35 @@ void inkling2_full_attention(const Tensor& q, const Tensor& gate_qgr, const Tens
                              const Tensor& positions, const PagedKVLayerView& cache,
                              std::uint32_t max_visible_keys, WorkspaceArena& workspace, Tensor& out,
                              cudaStream_t stream);
+
+/**
+ * Multi-slot batched (`1 <= B <= 8`, 1 token/slot) SWA GQA indexing `context` at `slots[b]`,
+ * `positions[b]` with optional ring append.
+ */
+void inkling2_swa_attention_batched(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
+                                    const Tensor& gate_qgr, const Tensor& rel_table,
+                                    const Tensor& positions, const Tensor& slots,
+                                    const CyclicKVCacheLayerView& context,
+                                    std::uint32_t max_visible_keys, WorkspaceArena& workspace,
+                                    Tensor& out, cudaStream_t stream, bool append_to_ring = true);
+
+/**
+ * Multi-slot batched (`1 <= B <= 8`, 1 token/slot) paged KV append supporting BFloat16,
+ * Int8Group64, RotatedInt4KeyInt4ValueGroup64, and RK4V4E8. Each slot appears at most once.
+ */
+void inkling2_kv_append_batched(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                const Tensor& slots, const PagedKVBatchLayerView& cache,
+                                cudaStream_t stream);
+
+/**
+ * Multi-slot batched (`1 <= B <= 8`, 1 token/slot) Full-Attention GQA indexing `cache.block_tables`
+ * at `slots[b]` up to `positions[b]`.
+ */
+void inkling2_full_attention_batched(const Tensor& q, const Tensor& gate_qgr,
+                                     const Tensor& rel_table, const Tensor& positions,
+                                     const Tensor& slots, const PagedKVBatchLayerView& cache,
+                                     std::uint32_t max_visible_keys, WorkspaceArena& workspace,
+                                     Tensor& out, cudaStream_t stream);
 
 /**
  * DSpark Sliding-Window GQA (`D=128, Hq=24, Hkv=8, W=1024`) over `[max(0, F+t-1023), F)` in

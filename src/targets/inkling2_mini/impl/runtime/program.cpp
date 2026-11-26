@@ -3,6 +3,7 @@
 #include "targets/inkling2_mini/impl/state/state_image.h"
 #include "runtime/ngram_pool.h"
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <limits>
 #include <map>
@@ -110,10 +111,13 @@ public:
         PromptIdentity identity;
         std::vector<Checkpoint> checkpoints;
         std::shared_ptr<detail::HostStateImage> host;
+        float spec_accept_ema              = 0.5f;
+        std::uint32_t spec_probe_countdown = 0;
     };
 
-    Impl(const detail::RuntimeModelView& model, DeviceContext& device, EngineOptions options)
-        : options(std::move(options)), executor(model, device, this->options),
+    Impl(const detail::RuntimeModelView& model, DeviceContext& device, EngineOptions options,
+         const StartupObserver* observer = nullptr)
+        : options(std::move(options)), executor(model, device, this->options, observer),
           slots(detail::state_slot_count(this->options), 0) {
         if (this->options.speculative.backend == SpeculativeBackend::Mtp &&
             this->options.speculative.ngram.mode == NgramDraftMode::Chain) {
@@ -324,7 +328,11 @@ public:
 
 Program::Program(const detail::RuntimeModelView& model, DeviceContext& device,
                  EngineOptions options)
-    : impl_(std::make_unique<Impl>(model, device, std::move(options))) {}
+    : Program(model, device, std::move(options), nullptr) {}
+
+Program::Program(const detail::RuntimeModelView& model, DeviceContext& device,
+                 EngineOptions options, const StartupObserver* observer)
+    : impl_(std::make_unique<Impl>(model, device, std::move(options), observer)) {}
 
 Program::~Program() {
     try {
@@ -821,99 +829,166 @@ PendingBatch Program::decode(std::span<const SequenceHandle> handles,
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed);
     PendingBatch pending;
     pending.transaction = impl_->next++;
-    for (std::size_t i = 0; i < handles.size(); ++i) {
-        auto& seq = impl_->get(handles[i]);
-        if (!budgets[i].generated_tokens_remaining)
-            throw std::logic_error("Inkling-2 decode has zero budget");
-        auto depth = impl_->executor.slot_depth(seq.slot);
-        if (depth >= seq.ledger.size())
-            throw std::logic_error("Inkling-2 decode has no committed input");
-        auto input = std::span(seq.ledger).subspan(depth);
-        pending.rows[i] = handles[i];
-        const bool use_dspark = impl_->options.speculative.backend != SpeculativeBackend::None &&
-                                input.size() == 1 && budgets[i].generated_tokens_remaining > 1 &&
-                                depth + 2 <= impl_->options.max_context;
-        if (use_dspark) {
-            const auto k = std::min<std::uint32_t>({impl_->options.speculative.draft_tokens,
-                                                    budgets[i].generated_tokens_remaining - 1,
-                                                    impl_->options.max_context - depth - 1});
-            std::vector<TokenId> licensed;
-            std::uint32_t mtp_drafts   = k;
-            std::uint32_t ngram_drafts = 0;
-            if (impl_->options.speculative.backend == SpeculativeBackend::DFlash2) {
-                timing.begin_wait();
-                licensed = impl_->executor.speculative_step_dflash2(
-                    seq.slot, input[0], k, depth, seq.options.sampling,
-                    static_cast<std::uint32_t>(seq.generated.size()), seq.generated);
-                timing.end_wait();
-                timing.resume_submit();
-            } else if (!impl_->ngram_pool) {
-                timing.begin_wait();
-                licensed = impl_->executor.speculative_step_dspark(
-                    seq.slot, input[0], k, depth, seq.options.sampling,
-                    static_cast<std::uint32_t>(seq.generated.size()), seq.generated);
-                timing.end_wait();
-                timing.resume_submit();
-            } else {
-                auto drafts = impl_->executor.draft_dspark(seq.slot, input[0], k);
-                std::vector<TokenId> verify_ids;
-                verify_ids.reserve(8);
-                verify_ids.push_back(input[0]);
-                verify_ids.insert(verify_ids.end(), drafts.begin(), drafts.end());
-                const std::uint32_t max_total_drafts = std::min<std::uint32_t>(
-                    {7U, impl_->options.speculative.ngram.max_drafts,
-                     budgets[i].generated_tokens_remaining - 1U,
-                     impl_->options.max_context - depth - 1U});
-                if (max_total_drafts > k) {
-                    const std::size_t n = impl_->ngram_pool->match_tokens();
-                    std::vector<TokenId> ctx;
-                    const std::size_t from_ledger = std::min(seq.ledger.size(), n);
-                    ctx.reserve(from_ledger + drafts.size());
-                    ctx.insert(ctx.end(),
-                               seq.ledger.end() - static_cast<std::ptrdiff_t>(from_ledger),
-                               seq.ledger.end());
-                    ctx.insert(ctx.end(), drafts.begin(), drafts.end());
-                    std::vector<TokenId> ext(max_total_drafts - k);
-                    const std::size_t ext_len = impl_->ngram_pool->propose(ctx, ext);
-                    const std::size_t min_ext =
-                        std::max<std::size_t>(2U, impl_->options.speculative.ngram.min_drafts);
-                    if (ext_len >= min_ext) {
-                        ngram_drafts = static_cast<std::uint32_t>(ext_len);
-                        verify_ids.insert(verify_ids.end(), ext.begin(), ext.begin() + ext_len);
+    const bool can_batch = handles.size() > 1 &&
+                           impl_->options.speculative.backend == SpeculativeBackend::None &&
+                           std::all_of(handles.begin(), handles.end(), [&](SequenceHandle h) {
+                               const auto& seq = impl_->get(h);
+                               return seq.ledger.size() - impl_->executor.slot_depth(seq.slot) ==
+                                      1;
+                           });
+    if (can_batch) {
+        const std::size_t n = handles.size();
+        std::array<detail::DecodeRow, kMaximumConcurrency> rows;
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& seq = impl_->get(handles[i]);
+            const auto depth = impl_->executor.slot_depth(seq.slot);
+            pending.rows[i] = handles[i];
+            rows[i] = {seq.ledger[depth], depth, seq.slot, seq.options.sampling,
+                       static_cast<std::uint32_t>(seq.generated.size()), seq.generated};
+        }
+        timing.begin_wait();
+        auto sampled = impl_->executor.decode_batch(std::span(rows).first(n));
+        timing.end_wait();
+        timing.resume_submit();
+        ++impl_->revision;
+        pending.stride = 1;
+        pending.counts.assign(n, 1);
+        pending.values = std::move(sampled);
+    } else {
+        std::vector<std::vector<TokenId>> row_values(handles.size());
+        std::uint32_t max_stride = 1;
+        for (std::size_t i = 0; i < handles.size(); ++i) {
+            auto& seq = impl_->get(handles[i]);
+            if (!budgets[i].generated_tokens_remaining)
+                throw std::logic_error("Inkling-2 decode has zero budget");
+            auto depth = impl_->executor.slot_depth(seq.slot);
+            if (depth >= seq.ledger.size())
+                throw std::logic_error("Inkling-2 decode has no committed input");
+            auto input      = std::span(seq.ledger).subspan(depth);
+            pending.rows[i] = handles[i];
+            const std::uint32_t max_k =
+                impl_->options.speculative.backend != SpeculativeBackend::None &&
+                        input.size() == 1 && budgets[i].generated_tokens_remaining > 1 &&
+                        depth + 2 <= impl_->options.max_context
+                    ? std::min<std::uint32_t>({impl_->options.speculative.draft_tokens,
+                                               budgets[i].generated_tokens_remaining - 1,
+                                               impl_->options.max_context - depth - 1})
+                    : 0U;
+            std::uint32_t k    = max_k;
+            bool adaptive_skip = false;
+            if (max_k > 0 && impl_->options.speculative.adaptive_depth && !impl_->ngram_pool) {
+                if (seq.spec_probe_countdown > 0) {
+                    --seq.spec_probe_countdown;
+                    if (seq.spec_probe_countdown > 0) {
+                        k             = 0;
+                        adaptive_skip = true;
+                    } else {
+                        k = std::min<std::uint32_t>(max_k, 2U);
                     }
+                } else if (seq.spec_accept_ema >= 0.35f) {
+                    k = max_k;
+                } else if (seq.spec_accept_ema >= 0.20f) {
+                    k = std::min<std::uint32_t>(max_k, 4U);
+                } else if (seq.spec_accept_ema >= 0.12f) {
+                    k = std::min<std::uint32_t>(max_k, 2U);
+                } else {
+                    seq.spec_probe_countdown = 12;
+                    k                        = 0;
+                    adaptive_skip            = true;
                 }
+            }
+            if (k > 0) {
+                std::vector<TokenId> licensed;
+                std::uint32_t mtp_drafts   = k;
+                std::uint32_t ngram_drafts = 0;
+                if (impl_->options.speculative.backend == SpeculativeBackend::DFlash2) {
+                    timing.begin_wait();
+                    licensed = impl_->executor.speculative_step_dflash2(
+                        seq.slot, input[0], k, depth, seq.options.sampling,
+                        static_cast<std::uint32_t>(seq.generated.size()), seq.generated);
+                    timing.end_wait();
+                    timing.resume_submit();
+                } else if (!impl_->ngram_pool) {
+                    timing.begin_wait();
+                    licensed = impl_->executor.speculative_step_dspark(
+                        seq.slot, input[0], k, depth, seq.options.sampling,
+                        static_cast<std::uint32_t>(seq.generated.size()), seq.generated);
+                    timing.end_wait();
+                    timing.resume_submit();
+                } else {
+                    auto drafts = impl_->executor.draft_dspark(seq.slot, input[0], k);
+                    std::vector<TokenId> verify_ids;
+                    verify_ids.reserve(8);
+                    verify_ids.push_back(input[0]);
+                    verify_ids.insert(verify_ids.end(), drafts.begin(), drafts.end());
+                    const std::uint32_t max_total_drafts = std::min<std::uint32_t>(
+                        {7U, impl_->options.speculative.ngram.max_drafts,
+                         budgets[i].generated_tokens_remaining - 1U,
+                         impl_->options.max_context - depth - 1U});
+                    if (max_total_drafts > k) {
+                        const std::size_t n = impl_->ngram_pool->match_tokens();
+                        std::vector<TokenId> ctx;
+                        const std::size_t from_ledger = std::min(seq.ledger.size(), n);
+                        ctx.reserve(from_ledger + drafts.size());
+                        ctx.insert(ctx.end(),
+                                   seq.ledger.end() - static_cast<std::ptrdiff_t>(from_ledger),
+                                   seq.ledger.end());
+                        ctx.insert(ctx.end(), drafts.begin(), drafts.end());
+                        std::vector<TokenId> ext(max_total_drafts - k);
+                        const std::size_t ext_len = impl_->ngram_pool->propose(ctx, ext);
+                        const std::size_t min_ext =
+                            std::max<std::size_t>(2U, impl_->options.speculative.ngram.min_drafts);
+                        if (ext_len >= min_ext) {
+                            ngram_drafts = static_cast<std::uint32_t>(ext_len);
+                            verify_ids.insert(verify_ids.end(), ext.begin(), ext.begin() + ext_len);
+                        }
+                    }
+                    timing.begin_wait();
+                    licensed = impl_->executor.verify_dspark(
+                        seq.slot, verify_ids, depth, seq.options.sampling,
+                        static_cast<std::uint32_t>(seq.generated.size()), seq.generated);
+                    timing.end_wait();
+                    timing.resume_submit();
+                }
+                ++impl_->revision;
+                pending.counts.push_back(static_cast<std::int32_t>(licensed.size()));
+                max_stride    = std::max(max_stride, static_cast<std::uint32_t>(licensed.size()));
+                row_values[i] = std::move(licensed);
+                ++seq.speculative.rounds;
+                seq.speculative.drafted_tokens += mtp_drafts + ngram_drafts;
+                const auto accepted_drafts = static_cast<std::uint32_t>(row_values[i].size() - 1);
+                seq.speculative.accepted_tokens += accepted_drafts;
+                seq.speculative.ngram_drafted_tokens += ngram_drafts;
+                const auto mtp_acc = std::min(accepted_drafts, mtp_drafts);
+                seq.speculative.ngram_accepted_tokens += accepted_drafts - mtp_acc;
+                if (ngram_drafts > 0) ++seq.speculative.wide_rounds;
+                for (std::uint32_t j = 0;
+                     j < accepted_drafts && j < seq.speculative.accepted_per_position.size(); ++j)
+                    ++seq.speculative.accepted_per_position[j];
+                if (impl_->options.speculative.adaptive_depth && mtp_drafts > 0) {
+                    const float round_rate =
+                        static_cast<float>(accepted_drafts) / static_cast<float>(mtp_drafts);
+                    seq.spec_accept_ema = 0.8f * seq.spec_accept_ema + 0.2f * round_rate;
+                }
+            } else {
+                Tensor logits = impl_->executor.forward(input, depth, seq.slot);
+                ++impl_->revision;
+                pending.counts.push_back(1);
                 timing.begin_wait();
-                licensed = impl_->executor.verify_dspark(
-                    seq.slot, verify_ids, depth, seq.options.sampling,
-                    static_cast<std::uint32_t>(seq.generated.size()), seq.generated);
+                row_values[i].push_back(impl_->executor.sample(logits, seq.options.sampling,
+                                                               seq.generated.size(),
+                                                               seq.generated));
                 timing.end_wait();
                 timing.resume_submit();
+                if (impl_->options.speculative.backend != SpeculativeBackend::None && !adaptive_skip)
+                    ++seq.speculative.fallback_steps;
             }
-            ++impl_->revision;
-            pending.counts.push_back(static_cast<std::uint32_t>(licensed.size()));
-            pending.values.insert(pending.values.end(), licensed.begin(), licensed.end());
-            ++seq.speculative.rounds;
-            seq.speculative.drafted_tokens += mtp_drafts + ngram_drafts;
-            const auto accepted_drafts = static_cast<std::uint32_t>(licensed.size() - 1);
-            seq.speculative.accepted_tokens += accepted_drafts;
-            seq.speculative.ngram_drafted_tokens += ngram_drafts;
-            const auto mtp_acc = std::min(accepted_drafts, mtp_drafts);
-            seq.speculative.ngram_accepted_tokens += accepted_drafts - mtp_acc;
-            if (ngram_drafts > 0) ++seq.speculative.wide_rounds;
-            for (std::uint32_t j = 0;
-                 j < accepted_drafts && j < seq.speculative.accepted_per_position.size(); ++j)
-                ++seq.speculative.accepted_per_position[j];
-        } else {
-            Tensor logits = impl_->executor.forward(input, depth, seq.slot);
-            ++impl_->revision;
-            pending.counts.push_back(1);
-            timing.begin_wait();
-            pending.values.push_back(impl_->executor.sample(logits, seq.options.sampling,
-                                                            seq.generated.size(), seq.generated));
-            timing.end_wait();
-            timing.resume_submit();
-            if (impl_->options.speculative.backend != SpeculativeBackend::None)
-                ++seq.speculative.fallback_steps;
+        }
+        pending.stride = max_stride;
+        pending.values.resize(handles.size() * max_stride, 0);
+        for (std::size_t i = 0; i < handles.size(); ++i) {
+            std::copy(row_values[i].begin(), row_values[i].end(),
+                      pending.values.begin() + static_cast<std::ptrdiff_t>(i * max_stride));
         }
     }
     impl_->observe_external();
@@ -930,9 +1005,7 @@ CommitResult Program::commit(PendingBatch&& pending,
     if (!impl_->pending || pending.transaction != impl_->pending ||
         decisions.size() != pending.row_count())
         throw std::logic_error("Inkling-2 invalid pending commit");
-    std::size_t expected_values = 0;
-    for (std::size_t i = 0; i < decisions.size(); ++i) expected_values += pending.counts[i];
-    if (pending.values.size() != expected_values)
+    if (pending.values.size() < static_cast<std::size_t>(pending.row_stride()) * decisions.size())
         throw std::logic_error("Inkling-2 pending values truncated");
     for (std::size_t i = 0; i < decisions.size(); ++i) {
         if (decisions[i].accepted_tokens > pending.counts[i])
@@ -944,16 +1017,15 @@ CommitResult Program::commit(PendingBatch&& pending,
     }
     CommitResult out;
     out.row_count = decisions.size();
-    std::size_t value_offset = 0;
     for (std::size_t i = 0; i < decisions.size(); ++i) {
-        const auto& d = decisions[i];
-        auto& s       = impl_->get(pending.rows[i]);
-        out.rows[i].timings     = s.timings;
-        out.rows[i].speculative = s.speculative;
+        const std::size_t value_offset = i * pending.row_stride();
+        const auto& d                  = decisions[i];
+        auto& s                        = impl_->get(pending.rows[i]);
+        out.rows[i].timings            = s.timings;
+        out.rows[i].speculative        = s.speculative;
         if (d.cancelled) {
             impl_->erase(s.id);
             out.rows[i].disposition = runtime::CommitDisposition::CancelledReleased;
-            value_offset += pending.counts[i];
             continue;
         }
         if (d.accepted_tokens) {
@@ -972,7 +1044,6 @@ CommitResult Program::commit(PendingBatch&& pending,
                 impl_->executor.truncate_speculative_commit(s.slot, d.accepted_tokens);
             }
         }
-        value_offset += pending.counts[i];
         out.rows[i].disposition = d.terminal ? runtime::CommitDisposition::Finishable
                                              : runtime::CommitDisposition::Active;
     }

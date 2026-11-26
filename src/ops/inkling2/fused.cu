@@ -4,8 +4,10 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/linear/q6/q6_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 #include <cstdint>
 
@@ -188,10 +190,11 @@ __global__ void sconv_single_vec4_kernel(const BF* __restrict__ x, const float* 
                                          const void* __restrict__ taps, bool taps_fp32,
                                          const BF* __restrict__ old, BF* __restrict__ state,
                                          const BF* __restrict__ residual, BF* __restrict__ out,
-                                         int channels) {
+                                         BF* __restrict__ trace, int channels) {
     const int c = (static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x)) * 4;
     if (c >= channels) return;
     const uint2 u0v = load_vec<uint2>(x + c);
+    if (trace) store_vec(trace + c, u0v);
     const uint2 u1v = load_vec<uint2>(old + 2 * channels + c);
     const uint2 u2v = load_vec<uint2>(old + channels + c);
     const uint2 u3v = load_vec<uint2>(old + c);
@@ -247,12 +250,124 @@ __global__ void sconv_single_vec4_kernel(const BF* __restrict__ x, const float* 
     store_vec(state + 2 * channels + c, u0v);
 }
 
+__global__ void sconv_batched_vec4_kernel(const BF* __restrict__ x, const float* __restrict__ weight,
+                                          BF* __restrict__ all_conv_states, int visit,
+                                          int comp_off, const int* __restrict__ slots,
+                                          const BF* __restrict__ residual, BF* __restrict__ out) {
+    constexpr int channels = 2304;
+    const int b            = static_cast<int>(blockIdx.y);
+    const int c            = (static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x)) * 4;
+    if (c >= channels) return;
+    const int slot = slots[b];
+    BF* state = all_conv_states + (static_cast<std::int64_t>(slot) * 48 + visit) * (6656 * 3) +
+                comp_off * 3;
+    const std::int64_t tok_off = static_cast<std::int64_t>(b) * channels + c;
+    const uint2 u0v            = load_vec<uint2>(x + tok_off);
+    const uint2 u1v            = load_vec<uint2>(state + 2 * channels + c);
+    const uint2 u2v            = load_vec<uint2>(state + channels + c);
+    const uint2 u3v            = load_vec<uint2>(state + c);
+    const float4 w0            = load_vec<float4>(weight + 4 * c);
+    const float4 w1            = load_vec<float4>(weight + 4 * c + 4);
+    const float4 w2            = load_vec<float4>(weight + 4 * c + 8);
+    const float4 w3            = load_vec<float4>(weight + 4 * c + 12);
+    constexpr float scale      = 0.44721359549995794f;
+    uint2 resv{};
+    if (residual) resv = load_vec<uint2>(residual + tok_off);
+    const auto unpack2 = [](const uint2& v, int idx) -> float2 {
+        return __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&v)[idx]);
+    };
+    const float2 u0a = unpack2(u0v, 0), u0b = unpack2(u0v, 1);
+    const float2 u1a = unpack2(u1v, 0), u1b = unpack2(u1v, 1);
+    const float2 u2a = unpack2(u2v, 0), u2b = unpack2(u2v, 1);
+    const float2 u3a = unpack2(u3v, 0), u3b = unpack2(u3v, 1);
+    const float2 r0a = residual ? unpack2(resv, 0) : make_float2(0.0f, 0.0f);
+    const float2 r0b = residual ? unpack2(resv, 1) : make_float2(0.0f, 0.0f);
+    auto eval = [&](float x0, float x1, float x2, float x3, float4 w, float res) {
+        float val = (x0 + w.x * x3 + w.y * x2 + w.z * x1 + w.w * x0) * scale;
+        if (residual) val += res;
+        return val;
+    };
+    const __nv_bfloat162 o0 = __floats2bfloat162_rn(
+        eval(u0a.x, u1a.x, u2a.x, u3a.x, w0, r0a.x), eval(u0a.y, u1a.y, u2a.y, u3a.y, w1, r0a.y));
+    const __nv_bfloat162 o1 = __floats2bfloat162_rn(
+        eval(u0b.x, u1b.x, u2b.x, u3b.x, w2, r0b.x), eval(u0b.y, u1b.y, u2b.y, u3b.y, w3, r0b.y));
+    store_vec(out + tok_off, make_uint2(*reinterpret_cast<const unsigned*>(&o0),
+                                        *reinterpret_cast<const unsigned*>(&o1)));
+    store_vec(state + c, u2v);
+    store_vec(state + channels + c, u1v);
+    store_vec(state + 2 * channels + c, u0v);
+}
+
+__global__ void sconv_kv_batched_vec4_kernel(
+    const BF* __restrict__ kx, const float* __restrict__ kw, const void* __restrict__ ktaps,
+    BF* __restrict__ kout, const BF* __restrict__ vx, const float* __restrict__ vw,
+    const void* __restrict__ vtaps, BF* __restrict__ vout, BF* __restrict__ all_conv_states,
+    int visit, const int* __restrict__ slots, bool taps_fp32) {
+    const int b     = static_cast<int>(blockIdx.x);
+    const bool is_v = blockIdx.y != 0;
+    const int c     = static_cast<int>(threadIdx.x) * 4;
+    const int slot  = slots[b];
+    const BF* x     = is_v ? vx : kx;
+    const float* w  = is_v ? vw : kw;
+    const void* taps = is_v ? vtaps : ktaps;
+    BF* out         = is_v ? vout : kout;
+    BF* state = all_conv_states + (static_cast<std::int64_t>(slot) * 48 + visit) * (6656 * 3) +
+                (is_v ? 1024 * 3 : 0);
+    const std::int64_t tok_off = static_cast<std::int64_t>(b) * 1024 + c;
+    const uint2 u0v            = load_vec<uint2>(x + tok_off);
+    const uint2 u1v            = load_vec<uint2>(state + 2048 + c);
+    const uint2 u2v            = load_vec<uint2>(state + 1024 + c);
+    const uint2 u3v            = load_vec<uint2>(state + c);
+    const float4 w0            = load_vec<float4>(w + 4 * c);
+    const float4 w1            = load_vec<float4>(w + 4 * c + 4);
+    const float4 w2            = load_vec<float4>(w + 4 * c + 8);
+    const float4 w3            = load_vec<float4>(w + 4 * c + 12);
+    float dt0 = 0.0f, dt1 = 0.0f, dt2 = 0.0f, dt3 = 0.0f;
+    if (taps) {
+        const int base = static_cast<int>(b) * 32 + 4 * (c / 128);
+        if (taps_fp32) {
+            const float4 tv = load_vec<float4>(static_cast<const float*>(taps) + base);
+            dt0 = tv.x; dt1 = tv.y; dt2 = tv.z; dt3 = tv.w;
+        } else {
+            const uint2 tv = load_vec<uint2>(static_cast<const BF*>(taps) + base);
+            const auto* tp = reinterpret_cast<const __nv_bfloat162*>(&tv);
+            const float2 t01 = __bfloat1622float2(tp[0]);
+            const float2 t23 = __bfloat1622float2(tp[1]);
+            dt0 = t01.x; dt1 = t01.y; dt2 = t23.x; dt3 = t23.y;
+        }
+    }
+    const float scale = taps ? (1.0f / 3.0f) : 0.44721359549995794f;
+    const auto unpack2 = [](const uint2& v, int idx) -> float2 {
+        return __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&v)[idx]);
+    };
+    const float2 u0a = unpack2(u0v, 0), u0b = unpack2(u0v, 1);
+    const float2 u1a = unpack2(u1v, 0), u1b = unpack2(u1v, 1);
+    const float2 u2a = unpack2(u2v, 0), u2b = unpack2(u2v, 1);
+    const float2 u3a = unpack2(u3v, 0), u3b = unpack2(u3v, 1);
+    auto eval = [&](float x0, float x1, float x2, float x3, float4 ww) {
+        float val = x0 + ww.x * x3 + ww.y * x2 + ww.z * x1 + ww.w * x0;
+        if (taps) {
+            val = fmaf(dt0, x0, fmaf(dt1, x1, fmaf(dt2, x2, fmaf(dt3, x3, val))));
+        }
+        return val * scale;
+    };
+    const __nv_bfloat162 o0 = __floats2bfloat162_rn(
+        eval(u0a.x, u1a.x, u2a.x, u3a.x, w0), eval(u0a.y, u1a.y, u2a.y, u3a.y, w1));
+    const __nv_bfloat162 o1 = __floats2bfloat162_rn(
+        eval(u0b.x, u1b.x, u2b.x, u3b.x, w2), eval(u0b.y, u1b.y, u2b.y, u3b.y, w3));
+    store_vec(out + tok_off, make_uint2(*reinterpret_cast<const unsigned*>(&o0),
+                                        *reinterpret_cast<const unsigned*>(&o1)));
+    store_vec(state + c, u2v);
+    store_vec(state + 1024 + c, u1v);
+    store_vec(state + 2048 + c, u0v);
+}
+
 __global__ void sconv_kv_single_vec4_kernel(
     const BF* __restrict__ kx, const float* __restrict__ kw, const void* __restrict__ ktaps,
     const BF* __restrict__ kold, BF* __restrict__ kstate, BF* __restrict__ kout,
-    const BF* __restrict__ vx, const float* __restrict__ vw, const void* __restrict__ vtaps,
-    const BF* __restrict__ vold, BF* __restrict__ vstate, BF* __restrict__ vout,
-    bool taps_fp32) {
+    BF* __restrict__ ktrace, const BF* __restrict__ vx, const float* __restrict__ vw,
+    const void* __restrict__ vtaps, const BF* __restrict__ vold, BF* __restrict__ vstate,
+    BF* __restrict__ vout, BF* __restrict__ vtrace, bool taps_fp32) {
     const bool is_v = blockIdx.y != 0;
     const int c     = threadIdx.x * 4;
     const BF* x     = is_v ? vx : kx;
@@ -261,7 +376,9 @@ __global__ void sconv_kv_single_vec4_kernel(
     const BF* old   = is_v ? vold : kold;
     BF* state       = is_v ? vstate : kstate;
     BF* out         = is_v ? vout : kout;
+    BF* trace       = is_v ? vtrace : ktrace;
     const uint2 u0v = load_vec<uint2>(x + c);
+    if (trace) store_vec(trace + c, u0v);
     const uint2 u1v = load_vec<uint2>(old + 2048 + c);
     const uint2 u2v = load_vec<uint2>(old + 1024 + c);
     const uint2 u3v = load_vec<uint2>(old + c);
@@ -312,10 +429,11 @@ __device__ float conv_input(const BF* x, const BF* old, int c, int channels, int
 }
 template<bool Single>
 __global__ void sconv_kernel(const BF* x, const float* weight, const void* taps, bool taps_fp32,
-                             const BF* old, BF* state, const BF* residual, BF* out, int channels,
-                             int tokens) {
+                             const BF* old, BF* state, const BF* residual, BF* out, BF* trace,
+                             int channels, int tokens) {
     const auto i = static_cast<std::int64_t>(blockIdx.x) * 256 + threadIdx.x;
     if (i >= static_cast<std::int64_t>(channels) * tokens) return;
+    if (trace) trace[i] = x[i];
     const int c = i % channels, t = i / channels;
     const float* wc = weight + 4 * c;
     const float4 w = make_float4(wc[0], wc[1], wc[2], wc[3]);
@@ -355,7 +473,7 @@ __global__ void sconv_small_t_kernel(const BF* __restrict__ x, const float* __re
                                      const void* __restrict__ taps, bool taps_fp32,
                                      const BF* __restrict__ old, BF* __restrict__ state,
                                      const BF* __restrict__ residual, BF* __restrict__ out,
-                                     int channels, int tokens) {
+                                     BF* __restrict__ trace, int channels, int tokens) {
     const int c = static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x);
     if (c >= channels) return;
     const float* wc   = weight + 4 * c;
@@ -365,9 +483,11 @@ __global__ void sconv_small_t_kernel(const BF* __restrict__ x, const float* __re
     float u1          = __bfloat162float(old[2 * channels + c]);
     const float scale = taps ? (1.0f / 3.0f) : 0.44721359549995794f;
     for (int t = 0; t < tokens; ++t) {
-        const auto idx = static_cast<std::int64_t>(t) * channels + c;
-        const float u0 = __bfloat162float(x[idx]);
-        float result   = u0 + w.x * u3 + w.y * u2 + w.z * u1 + w.w * u0;
+        const auto idx  = static_cast<std::int64_t>(t) * channels + c;
+        const BF x_bf   = x[idx];
+        if (trace) trace[idx] = x_bf;
+        const float u0  = __bfloat162float(x_bf);
+        float result    = u0 + w.x * u3 + w.y * u2 + w.z * u1 + w.w * u0;
         if (taps) {
             const auto tbase = static_cast<std::int64_t>(t) * 32 + 4 * (c / 128);
             auto tap_at      = [&](int lag) {
@@ -389,6 +509,55 @@ __global__ void sconv_small_t_kernel(const BF* __restrict__ x, const float* __re
     state[c]                = __float2bfloat16_rn(u3);
     state[channels + c]     = __float2bfloat16_rn(u2);
     state[2 * channels + c] = __float2bfloat16_rn(u1);
+}
+
+__global__ void sconv_kv_small_t_kernel(
+    const BF* __restrict__ kx, const float* __restrict__ kw, const void* __restrict__ ktaps,
+    const BF* __restrict__ kold, BF* __restrict__ kstate, BF* __restrict__ kout,
+    BF* __restrict__ ktrace, const BF* __restrict__ vx, const float* __restrict__ vw,
+    const void* __restrict__ vtaps, const BF* __restrict__ vold, BF* __restrict__ vstate,
+    BF* __restrict__ vout, BF* __restrict__ vtrace, bool taps_fp32, int tokens) {
+    const bool is_v  = blockIdx.y != 0;
+    const int c      = static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x);
+    if (c >= 1024) return;
+    const BF* x      = is_v ? vx : kx;
+    const float* w   = is_v ? vw : kw;
+    const void* taps = is_v ? vtaps : ktaps;
+    const BF* old    = is_v ? vold : kold;
+    BF* state        = is_v ? vstate : kstate;
+    BF* out          = is_v ? vout : kout;
+    BF* trace        = is_v ? vtrace : ktrace;
+    const float* wc  = w + 4 * c;
+    const float4 ww  = make_float4(wc[0], wc[1], wc[2], wc[3]);
+    float u3         = __bfloat162float(old[c]);
+    float u2         = __bfloat162float(old[1024 + c]);
+    float u1         = __bfloat162float(old[2048 + c]);
+    const float scale = taps ? (1.0f / 3.0f) : 0.44721359549995794f;
+    for (int t = 0; t < tokens; ++t) {
+        const auto idx = static_cast<std::int64_t>(t) * 1024 + c;
+        const BF x_bf  = x[idx];
+        if (trace) trace[idx] = x_bf;
+        const float u0 = __bfloat162float(x_bf);
+        float result   = u0 + ww.x * u3 + ww.y * u2 + ww.z * u1 + ww.w * u0;
+        if (taps) {
+            const auto tbase = static_cast<std::int64_t>(t) * 32 + 4 * (c / 128);
+            auto tap_at      = [&](int lag) {
+                return taps_fp32 ? static_cast<const float*>(taps)[tbase + lag]
+                                 : bf(taps, tbase + lag);
+            };
+            result = fmaf(tap_at(0), u0, result);
+            result = fmaf(tap_at(1), u1, result);
+            result = fmaf(tap_at(2), u2, result);
+            result = fmaf(tap_at(3), u3, result);
+        }
+        out[idx] = __float2bfloat16_rn(result * scale);
+        u3       = u2;
+        u2       = u1;
+        u1       = u0;
+    }
+    state[c]        = __float2bfloat16_rn(u3);
+    state[1024 + c] = __float2bfloat16_rn(u2);
+    state[2048 + c] = __float2bfloat16_rn(u1);
 }
 
 __global__ void mix_kernel(Inkling2Branches inputs, const float* __restrict__ query,
@@ -1205,6 +1374,279 @@ __global__ void dspark_commit_conv_kernel(const BF* __restrict__ pre,
         dst[state_base + static_cast<std::int64_t>(lag) * c_comp + local_c] = val;
     }
 }
+
+__global__ void dspark_fold_head_mma_kernel(const std::uint8_t* __restrict__ codes,
+                                            const std::uint8_t* __restrict__ qhigh,
+                                            const std::uint16_t* __restrict__ scales,
+                                            const BF* __restrict__ hidden_out_w,
+                                            const float* __restrict__ hidden_out_b,
+                                            std::int8_t* __restrict__ w_fold_q,
+                                            std::uint16_t* __restrict__ w_fold_scale,
+                                            float* __restrict__ b_fold) {
+    constexpr int BM      = 64;
+    constexpr int BN      = 256;
+    constexpr int BK      = 64;
+    constexpr int K       = 2304;
+    constexpr int Groups  = K / BK; // 36
+    constexpr int KTiles  = K / BK; // 36
+
+    union Smem {
+        struct {
+            BF As[BM * BK];
+            BF Bs[BN * BK];
+        } gemm;
+        float stage_f[16][BN];
+    };
+    __shared__ __align__(16) Smem smem;
+    __shared__ __align__(16) float b_s[BK];
+
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int warp   = tid >> 5;
+    const int lane   = tid & 31;
+    const int warp_m = warp >> 2; // 0..1
+    const int warp_n = warp & 3;  // 0..3
+    const int gid    = lane >> 2;
+    const int lid    = lane & 3;
+    const int row0   = static_cast<int>(blockIdx.x) * BM;
+
+    float acc[2][8][4];
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            acc[mt][nt][0] = acc[mt][nt][1] = acc[mt][nt][2] = acc[mt][nt][3] = 0.0f;
+        }
+    }
+    float b_acc = 0.0f;
+
+    const int a_row_tid  = tid >> 2;
+    const int a_c4       = tid & 3;
+    const int global_row = row0 + a_row_tid;
+
+    for (int kt = 0; kt < KTiles; ++kt) {
+        const float sc =
+            __half2float(__ushort_as_half(scales[static_cast<std::int64_t>(global_row) * Groups + kt]));
+        const std::int64_t code_base =
+            (static_cast<std::int64_t>(global_row) * Groups + kt) * 32 + a_c4 * 8;
+        const std::int64_t high_base =
+            (static_cast<std::int64_t>(global_row) * Groups + kt) * 16 + a_c4 * 4;
+        const unsigned word0 = *reinterpret_cast<const unsigned*>(&codes[code_base]);
+        const unsigned word1 = *reinterpret_cast<const unsigned*>(&codes[code_base + 4]);
+        unsigned out0[4], out1[4];
+        Q6MmaDecodeAtom::decode_eight(word0, &qhigh[high_base], sc, out0);
+        Q6MmaDecodeAtom::decode_eight(word1, &qhigh[high_base + 2], sc, out1);
+        store_vec(&smem.gemm.As[a_row_tid * BK + gemm_swz64(a_row_tid, a_c4 * 16)],
+                  make_uint4(out0[0], out0[1], out0[2], out0[3]));
+        store_vec(&smem.gemm.As[a_row_tid * BK + gemm_swz64(a_row_tid, a_c4 * 16 + 8)],
+                  make_uint4(out1[0], out1[1], out1[2], out1[3]));
+
+        const int d0    = (tid & 31) * 8;
+        const int k_sub = tid >> 5;
+#pragma unroll
+        for (int it = 0; it < 8; ++it) {
+            const int k_loc = it * 8 + k_sub;
+            const uint4 wv  = load_vec<uint4>(
+                hidden_out_w + static_cast<std::int64_t>(kt * BK + k_loc) * BN + d0);
+            const auto* wb = reinterpret_cast<const BF*>(&wv);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                smem.gemm.Bs[(d0 + j) * BK + gemm_swz64(d0 + j, k_loc)] = wb[j];
+            }
+        }
+        if (tid < BK) { b_s[tid] = hidden_out_b[kt * BK + tid]; }
+        __syncthreads();
+
+        if (tid < BM) {
+#pragma unroll
+            for (int k = 0; k < BK; ++k) {
+                b_acc = fmaf(__bfloat162float(smem.gemm.As[tid * BK + gemm_swz64(tid, k)]), b_s[k],
+                             b_acc);
+            }
+        }
+
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            unsigned af[2][4];
+            unsigned bf[8][2];
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                const int ar = warp_m * 32 + mt * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+                const int ac = ks * 16 + ((lane >> 4) & 1) * 8;
+                ldmatrix_x4(af[mt][0], af[mt][1], af[mt][2], af[mt][3],
+                            smem_addr(&smem.gemm.As[ar * BK + gemm_swz64(ar, ac)]));
+            }
+#pragma unroll
+            for (int np = 0; np < 4; ++np) {
+                const int bc = warp_n * 64 + np * 16 + (lane & 7) + ((lane >> 4) & 1) * 8;
+                const int bk = ks * 16 + ((lane >> 3) & 1) * 8;
+                ldmatrix_x4(bf[2 * np][0], bf[2 * np][1], bf[2 * np + 1][0], bf[2 * np + 1][1],
+                            smem_addr(&smem.gemm.Bs[bc * BK + gemm_swz64(bc, bk)]));
+            }
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+                for (int nt = 0; nt < 8; ++nt) {
+                    mma_bf16(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3],
+                             af[mt][0], af[mt][1], af[mt][2], af[mt][3], bf[nt][0], bf[nt][1]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid < BM) { b_fold[row0 + tid] = b_acc; }
+
+    for (int wm = 0; wm < 2; ++wm) {
+        for (int mt = 0; mt < 2; ++mt) {
+            __syncthreads();
+            if (warp_m == wm) {
+#pragma unroll
+                for (int nt = 0; nt < 8; ++nt) {
+                    const int col = warp_n * 64 + nt * 8 + 2 * lid;
+                    smem.stage_f[gid][col]         = acc[mt][nt][0];
+                    smem.stage_f[gid][col + 1]     = acc[mt][nt][1];
+                    smem.stage_f[gid + 8][col]     = acc[mt][nt][2];
+                    smem.stage_f[gid + 8][col + 1] = acc[mt][nt][3];
+                }
+            }
+            __syncthreads();
+            const int r_base = row0 + wm * 32 + mt * 16;
+            for (int unit = warp; unit < 64; unit += 8) {
+                const int lr  = unit >> 2;
+                const int grp = unit & 3;
+                const int d0  = grp * 64 + lane;
+                const int d1  = d0 + 32;
+                const float v0   = smem.stage_f[lr][d0];
+                const float v1   = smem.stage_f[lr][d1];
+                const float amax = warp_max(fmaxf(fabsf(v0), fabsf(v1)));
+                const __half sh  = __float2half_rn(amax > 0.0f ? amax / 127.0f : 0.0f);
+                const float sc   = __half2float(sh);
+                const float inv  = sc > 0.0f ? 1.0f / sc : 0.0f;
+                const int q0 =
+                    sc > 0.0f ? max(-127, min(127, static_cast<int>(rintf(v0 * inv)))) : 0;
+                const int q1 =
+                    sc > 0.0f ? max(-127, min(127, static_cast<int>(rintf(v1 * inv)))) : 0;
+                const std::int64_t gr   = r_base + lr;
+                w_fold_q[gr * 256 + d0] = static_cast<std::int8_t>(q0);
+                w_fold_q[gr * 256 + d1] = static_cast<std::int8_t>(q1);
+                if (lane == 0) { w_fold_scale[gr * 4 + grp] = __half_as_ushort(sh); }
+            }
+        }
+    }
+}
+
+__global__ void dspark_rnn_latent_kernel(const float* __restrict__ guz, float* __restrict__ state,
+                                         float* __restrict__ m_out) {
+    const int tid = static_cast<int>(threadIdx.x);
+    if (tid >= 256) return;
+    const float g      = guz[tid];
+    const float u      = guz[256 + tid];
+    const float z      = guz[512 + tid];
+    const float u_tanh = tanhf(u);
+    const float g_sig  = 1.0f / (1.0f + expf(-g));
+    const float s_prev = state[tid];
+    state[tid]         = u_tanh + g_sig * (s_prev - u_tanh);
+    m_out[tid]         = tanhf(z);
+}
+
+__global__ void dspark_folded_head_argmax_kernel(
+    const float* __restrict__ m_latent, const BF* __restrict__ base_logits,
+    const std::int8_t* __restrict__ w_fold_q, const std::uint16_t* __restrict__ w_fold_scale,
+    const float* __restrict__ b_fold, int valid_vocab, float* __restrict__ part_vals,
+    int* __restrict__ part_ids) {
+    __shared__ __align__(16) float m_s[256];
+    __shared__ float warp_vals[8];
+    __shared__ int warp_ids[8];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    m_s[tid] = m_latent[tid];
+    __syncthreads();
+
+    const float4 m0 = load_vec<float4>(m_s + lane * 8);
+    const float4 m1 = load_vec<float4>(m_s + lane * 8 + 4);
+    const int grp   = lane >> 3;
+
+    float best_val = -CUDART_INF_F;
+    int best_id    = valid_vocab;
+
+    const int total_warps = static_cast<int>(gridDim.x) * 8;
+    for (int v = static_cast<int>(blockIdx.x) * 8 + warp; v < valid_vocab; v += total_warps) {
+        const int2 qv  = load_vec<int2>(w_fold_q + static_cast<std::int64_t>(v) * 256 + lane * 8);
+        const auto* qb = reinterpret_cast<const std::int8_t*>(&qv);
+        const float sc =
+            __half2float(__ushort_as_half(w_fold_scale[static_cast<std::int64_t>(v) * 4 + grp]));
+        float acc = static_cast<float>(qb[0]) * m0.x + static_cast<float>(qb[1]) * m0.y +
+                    static_cast<float>(qb[2]) * m0.z + static_cast<float>(qb[3]) * m0.w +
+                    static_cast<float>(qb[4]) * m1.x + static_cast<float>(qb[5]) * m1.y +
+                    static_cast<float>(qb[6]) * m1.z + static_cast<float>(qb[7]) * m1.w;
+        acc *= sc;
+        acc = warp_sum(acc);
+        if (lane == 0) {
+            const float val = acc + __bfloat162float(base_logits[v]) + b_fold[v];
+            if (val > best_val || (val == best_val && v < best_id)) {
+                best_val = val;
+                best_id  = v;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        warp_vals[warp] = best_val;
+        warp_ids[warp]  = best_id;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float bv = -CUDART_INF_F;
+        int bi   = valid_vocab;
+        for (int w = 0; w < 8; ++w) {
+            const float vw = warp_vals[w];
+            const int iw   = warp_ids[w];
+            if (vw > bv || (vw == bv && iw < bi)) {
+                bv = vw;
+                bi = iw;
+            }
+        }
+        part_vals[blockIdx.x] = bv;
+        part_ids[blockIdx.x]  = bi;
+    }
+}
+
+__global__ void dspark_folded_argmax_final_kernel(const float* __restrict__ part_vals,
+                                                  const int* __restrict__ part_ids, int count,
+                                                  int* __restrict__ next_token) {
+    __shared__ float s_vals[256];
+    __shared__ int s_ids[256];
+    const int tid = static_cast<int>(threadIdx.x);
+    float bv      = -CUDART_INF_F;
+    int bi        = 0x7fffffff;
+    for (int i = tid; i < count; i += 256) {
+        const float v = part_vals[i];
+        const int id  = part_ids[i];
+        if (v > bv || (v == bv && id < bi)) {
+            bv = v;
+            bi = id;
+        }
+    }
+    s_vals[tid] = bv;
+    s_ids[tid]  = bi;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float v = s_vals[tid + stride];
+            const int id  = s_ids[tid + stride];
+            if (v > s_vals[tid] || (v == s_vals[tid] && id < s_ids[tid])) {
+                s_vals[tid] = v;
+                s_ids[tid]  = id;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) { next_token[0] = s_ids[0]; }
+}
 } // namespace
 
 void inkling2_proj_launch(const Tensor& x, const Tensor& w, Tensor& out, cudaStream_t s) {
@@ -1223,7 +1665,7 @@ void inkling2_proj_launch(const Tensor& x, const Tensor& w, Tensor& out, cudaStr
 }
 void inkling2_sconv_launch(const Tensor& x, const Tensor& w, const Tensor& dynamic,
                           const Tensor& old, Tensor& state, const Tensor& residual, Tensor& out,
-                          cudaStream_t s) {
+                          const Tensor& trace, cudaStream_t s) {
     const int c = x.ne[0], t = x.ne[1];
     if (t == 1) {
         const int vec4_threads = c / 4;
@@ -1231,20 +1673,20 @@ void inkling2_sconv_launch(const Tensor& x, const Tensor& w, const Tensor& dynam
             static_cast<const BF*>(x.data), static_cast<const float*>(w.data), dynamic.data,
             dynamic.dtype == DType::FP32, static_cast<const BF*>(old.data),
             static_cast<BF*>(state.data), static_cast<const BF*>(residual.data),
-            static_cast<BF*>(out.data), c);
-    } else if (t <= 15) {
+            static_cast<BF*>(out.data), static_cast<BF*>(trace.data), c);
+    } else if (t <= 16) {
         sconv_small_t_kernel<<<(c + 255) / 256, 256, 0, s>>>(
             static_cast<const BF*>(x.data), static_cast<const float*>(w.data), dynamic.data,
             dynamic.dtype == DType::FP32, static_cast<const BF*>(old.data),
             static_cast<BF*>(state.data), static_cast<const BF*>(residual.data),
-            static_cast<BF*>(out.data), c, t);
+            static_cast<BF*>(out.data), static_cast<BF*>(trace.data), c, t);
     } else {
         const auto grid = (x.numel() + 255) / 256;
         sconv_kernel<false><<<grid, 256, 0, s>>>(
             static_cast<const BF*>(x.data), static_cast<const float*>(w.data), dynamic.data,
             dynamic.dtype == DType::FP32, static_cast<const BF*>(old.data),
             static_cast<BF*>(state.data), static_cast<const BF*>(residual.data),
-            static_cast<BF*>(out.data), c, t);
+            static_cast<BF*>(out.data), static_cast<BF*>(trace.data), c, t);
         sconv_state_kernel<<<(c + 255) / 256, 256, 0, s>>>(
             static_cast<const BF*>(x.data), static_cast<const BF*>(old.data),
             static_cast<BF*>(state.data), c, t);
@@ -1254,21 +1696,60 @@ void inkling2_sconv_launch(const Tensor& x, const Tensor& w, const Tensor& dynam
 void inkling2_sconv_kv_launch(const Tensor& kx, const Tensor& kw, const Tensor& kdyn,
                              const Tensor& kold, Tensor& kstate, Tensor& kout, const Tensor& vx,
                              const Tensor& vw, const Tensor& vdyn, const Tensor& vold,
-                             Tensor& vstate, Tensor& vout, cudaStream_t s) {
+                             Tensor& vstate, Tensor& vout, const Tensor& ktrace,
+                             const Tensor& vtrace, cudaStream_t s) {
     const int t = kx.ne[1];
     if (t == 1) {
         sconv_kv_single_vec4_kernel<<<dim3(1, 2), 256, 0, s>>>(
             static_cast<const BF*>(kx.data), static_cast<const float*>(kw.data), kdyn.data,
             static_cast<const BF*>(kold.data), static_cast<BF*>(kstate.data),
-            static_cast<BF*>(kout.data), static_cast<const BF*>(vx.data),
-            static_cast<const float*>(vw.data), vdyn.data, static_cast<const BF*>(vold.data),
-            static_cast<BF*>(vstate.data), static_cast<BF*>(vout.data),
+            static_cast<BF*>(kout.data), static_cast<BF*>(ktrace.data),
+            static_cast<const BF*>(vx.data), static_cast<const float*>(vw.data), vdyn.data,
+            static_cast<const BF*>(vold.data), static_cast<BF*>(vstate.data),
+            static_cast<BF*>(vout.data), static_cast<BF*>(vtrace.data),
             kdyn.dtype == DType::FP32);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    inkling2_sconv_launch(kx, kw, kdyn, kold, kstate, {}, kout, s);
-    inkling2_sconv_launch(vx, vw, vdyn, vold, vstate, {}, vout, s);
+    if (t <= 16) {
+        sconv_kv_small_t_kernel<<<dim3(4, 2), 256, 0, s>>>(
+            static_cast<const BF*>(kx.data), static_cast<const float*>(kw.data), kdyn.data,
+            static_cast<const BF*>(kold.data), static_cast<BF*>(kstate.data),
+            static_cast<BF*>(kout.data), static_cast<BF*>(ktrace.data),
+            static_cast<const BF*>(vx.data), static_cast<const float*>(vw.data), vdyn.data,
+            static_cast<const BF*>(vold.data), static_cast<BF*>(vstate.data),
+            static_cast<BF*>(vout.data), static_cast<BF*>(vtrace.data),
+            kdyn.dtype == DType::FP32, t);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    inkling2_sconv_launch(kx, kw, kdyn, kold, kstate, {}, kout, ktrace, s);
+    inkling2_sconv_launch(vx, vw, vdyn, vold, vstate, {}, vout, vtrace, s);
+}
+void inkling2_sconv_batched_launch(const Tensor& x, const Tensor& w, Tensor& all_conv_states,
+                                   int visit, int component, const Tensor& slots,
+                                   const Tensor& residual, Tensor& out, cudaStream_t s) {
+    const int b        = x.ne[1];
+    const int comp_off = component == 2 ? 2048 : 4352;
+    sconv_batched_vec4_kernel<<<dim3((2304 / 4 + 255) / 256, b), 256, 0, s>>>(
+        static_cast<const BF*>(x.data), static_cast<const float*>(w.data),
+        static_cast<BF*>(all_conv_states.data), visit, comp_off,
+        static_cast<const int*>(slots.data), static_cast<const BF*>(residual.data),
+        static_cast<BF*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+void inkling2_sconv_kv_batched_launch(const Tensor& kx, const Tensor& kw, const Tensor& kdyn,
+                                      Tensor& kout, const Tensor& vx, const Tensor& vw,
+                                      const Tensor& vdyn, Tensor& vout, Tensor& all_conv_states,
+                                      int visit, const Tensor& slots, cudaStream_t s) {
+    const int b = kx.ne[1];
+    sconv_kv_batched_vec4_kernel<<<dim3(b, 2), 256, 0, s>>>(
+        static_cast<const BF*>(kx.data), static_cast<const float*>(kw.data), kdyn.data,
+        static_cast<BF*>(kout.data), static_cast<const BF*>(vx.data),
+        static_cast<const float*>(vw.data), vdyn.data, static_cast<BF*>(vout.data),
+        static_cast<BF*>(all_conv_states.data), visit, static_cast<const int*>(slots.data),
+        kdyn.dtype == DType::FP32);
+    CUDA_CHECK(cudaGetLastError());
 }
 void inkling2_mix_launch(Inkling2Branches branches, const Tensor& q, Tensor& out, cudaStream_t s) {
     mix_kernel<<<static_cast<std::uint64_t>(out.ne[1]) * out.ne[2], 256, 0, s>>>(branches, static_cast<const float*>(q.data), static_cast<BF*>(out.data), out.ne[1]);
@@ -1362,6 +1843,41 @@ void inkling2_dspark_commit_conv_launch(const Tensor& pre, const Tensor& trace, 
     dspark_commit_conv_kernel<<<dim3((6656 + 255) / 256, 48), 256, 0, s>>>(
         static_cast<const BF*>(pre.data), static_cast<const BF*>(trace.data),
         static_cast<BF*>(dst.data), width, accepted);
+    CUDA_CHECK(cudaGetLastError());
+}
+void inkling2_dspark_fold_head_launch(const Weight& output_head, const Tensor& hidden_out_w,
+                                      const Tensor& hidden_out_b, Tensor& w_fold_q,
+                                      Tensor& w_fold_scale, Tensor& b_fold, cudaStream_t s) {
+    dspark_fold_head_mma_kernel<<<output_head.n / 64, 256, 0, s>>>(
+        static_cast<const std::uint8_t*>(output_head.qdata),
+        static_cast<const std::uint8_t*>(output_head.qhigh),
+        static_cast<const std::uint16_t*>(output_head.scales),
+        static_cast<const BF*>(hidden_out_w.data), static_cast<const float*>(hidden_out_b.data),
+        static_cast<std::int8_t*>(w_fold_q.data), static_cast<std::uint16_t*>(w_fold_scale.data),
+        static_cast<float*>(b_fold.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+void inkling2_dspark_rnn_step_folded_launch(
+    const Tensor& prev_token, const Tensor& w1, const Tensor& rnn_proj_w,
+    const Tensor& rnn_proj_b, const Tensor& h_in, const Tensor& c_head,
+    const Tensor& base_logits_col, const Tensor& w_fold_q, const Tensor& w_fold_scale,
+    const Tensor& b_fold, int valid_vocab, Tensor& state, Tensor& next_token, void* x_buf,
+    float* guz, float* m_latent, float* part_vals, int* part_ids, cudaStream_t s) {
+    dspark_rnn_pack_kernel<<<5120 / 256, 256, 0, s>>>(
+        static_cast<const int*>(prev_token.data), static_cast<const BF*>(w1.data),
+        static_cast<const float*>(state.data), static_cast<const BF*>(h_in.data),
+        static_cast<const BF*>(c_head.data), static_cast<BF*>(x_buf));
+    dspark_rnn_proj_kernel<<<768 / 8, 256, 0, s>>>(
+        static_cast<const BF*>(x_buf), static_cast<const BF*>(rnn_proj_w.data),
+        static_cast<const float*>(rnn_proj_b.data), guz);
+    dspark_rnn_latent_kernel<<<1, 256, 0, s>>>(guz, static_cast<float*>(state.data), m_latent);
+    dspark_folded_head_argmax_kernel<<<272, 256, 0, s>>>(
+        m_latent, static_cast<const BF*>(base_logits_col.data),
+        static_cast<const std::int8_t*>(w_fold_q.data),
+        static_cast<const std::uint16_t*>(w_fold_scale.data),
+        static_cast<const float*>(b_fold.data), valid_vocab, part_vals, part_ids);
+    dspark_folded_argmax_final_kernel<<<1, 256, 0, s>>>(part_vals, part_ids, 272,
+                                                        static_cast<int*>(next_token.data));
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail

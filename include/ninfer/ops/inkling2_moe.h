@@ -47,4 +47,14 @@ struct Inkling2MoeWeights {
 void inkling2_moe(const Tensor& x, const Inkling2MoeWeights& weights, Tensor& out,
                   WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * Fused Inkling-2-Mini Sparse-MoE + width-4 `ffn_post_conv` + residual add + 3-tap state update.
+ * Preserves exact BF16 intermediate rounding between MoE reduction and `ffn_post_conv`.
+ * When `moe_trace` is non-empty (BF16 `[2304, T]`), writes the pre-conv reduced MoE output there.
+ */
+void inkling2_moe_post_sconv(const Tensor& x, const Inkling2MoeWeights& weights,
+                             const Tensor& post_conv_weight, const Tensor& state_in,
+                             Tensor& state_out, const Tensor& residual_in, Tensor& out,
+                             Tensor moe_trace, WorkspaceArena& workspace, cudaStream_t stream);
+
 } // namespace ninfer::ops

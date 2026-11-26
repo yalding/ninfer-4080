@@ -1,7 +1,9 @@
 #include "targets/inkling2_mini/impl/state/state_image.h"
 #include "core/device.h"
+#include "core/startup.h"
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <utility>
 #include <limits>
 #include <stdexcept>
@@ -78,7 +80,13 @@ StateLayout plan_state(const EngineOptions& options, std::uint32_t kv_tokens) {
     return out;
 }
 
-StateImage::StateImage(const EngineOptions& options, std::uint32_t tokens)
+struct StateImage::SlabPool {
+    std::mutex mutex;
+    std::vector<std::unique_ptr<HostStateImage>> free_slabs;
+};
+
+StateImage::StateImage(const EngineOptions& options, std::uint32_t tokens,
+                       const StartupObserver* observer)
     : has_dspark_(options.speculative.backend == SpeculativeBackend::DFlash ||
                   options.speculative.backend == SpeculativeBackend::Mtp),
       has_dflash2_(options.speculative.backend == SpeculativeBackend::DFlash2),
@@ -103,10 +111,34 @@ StateImage::StateImage(const EngineOptions& options, std::uint32_t tokens)
         slots_[i].row = tables_.acquire(static_cast<int>(i));
         slots_[i].pages.reserve((max_context_ + 63) / 64);
     }
-    if (host_state_capacity_ && options.context_cache.host_kv_capacity_bytes)
+    if (host_state_capacity_ && options.context_cache.host_kv_capacity_bytes) {
         host_arena_ =
             std::make_unique<HostKVArena>(options.context_cache.host_kv_capacity_bytes,
                                           std::span<const HostKVPageLayout>(&host_layout_, 1));
+        const auto conv_bytes = std::size_t(kConvElements) * 48 * 2;
+        const auto ring_bytes = std::size_t(128) * 1024 * 8 * 2;
+        const auto d2_bytes =
+            dflash2_cyclic_ ? static_cast<std::size_t>(dflash2_cyclic_->layer_view(0).k.nb[3])
+                            : std::size_t(0);
+        const std::size_t fixed_bytes =
+            conv_bytes + static_cast<std::size_t>(swa_layers_) * 2 * ring_bytes +
+            (dflash2_cyclic_ ? 5ULL * 2ULL * d2_bytes : 0ULL);
+        const std::uint64_t total_bytes =
+            static_cast<std::uint64_t>(fixed_bytes) * host_state_capacity_;
+        StartupObserver no_op_observer;
+        const StartupObserver& obs = observer ? *observer : no_op_observer;
+        StartupPhaseScope host_state_phase(obs, StartupPhase::HostStatePin,
+                                           StartupProgressUnit::Bytes, total_bytes);
+        slab_pool_ = std::make_shared<SlabPool>();
+        slab_pool_->free_slabs.reserve(host_state_capacity_);
+        std::uint64_t pinned_so_far = 0;
+        for (std::uint32_t i = 0; i < host_state_capacity_; ++i) {
+            slab_pool_->free_slabs.push_back(std::make_unique<HostStateImage>(fixed_bytes));
+            pinned_so_far += fixed_bytes;
+            host_state_phase.progress(pinned_so_far, total_bytes);
+        }
+        host_state_phase.complete(total_bytes, total_bytes);
+    }
 }
 
 void StateImage::reset(std::uint32_t slot, cudaStream_t stream) {
@@ -225,6 +257,24 @@ PagedKVLayerView StateImage::full(std::uint32_t slot, int layer) const {
     return view;
 }
 
+PagedKVBatchLayerView StateImage::full_batch(int layer) const {
+    if (layer < 0 || layer >= full_layers_) throw std::out_of_range("Inkling full attention layer");
+    const auto n    = kv_storage_is_int8_family(storage_) ? 4 : 2;
+    const auto base = layer * n;
+    PagedKVBatchLayerView view;
+    view.k_pages = pages_.plane(base);
+    view.v_pages = pages_.plane(base + 1);
+    if (n == 4) {
+        view.k_scale_pages = pages_.plane(base + 2);
+        view.v_scale_pages = pages_.plane(base + 3);
+    }
+    view.block_tables = tables_.matrix();
+    view.head_dim     = 128;
+    view.num_kv_heads = 8;
+    view.storage      = storage_;
+    return view;
+}
+
 CyclicKVCacheLayerView StateImage::dspark_swa(int layer) const {
     if (!has_dspark_ || layer < 0 || layer >= 2)
         throw std::out_of_range("Inkling DSpark SWA layer");
@@ -300,9 +350,9 @@ std::uint32_t StateImage::reclaimable_pages(std::span<const std::uint32_t> slots
 }
 
 std::uint32_t StateImage::host_state_count() const noexcept {
-    return static_cast<std::uint32_t>(
-        std::count_if(host_images_.begin(), host_images_.end(),
-                      [](const auto& image) { return !image.expired(); }));
+    if (!slab_pool_) return 0;
+    std::lock_guard lock(slab_pool_->mutex);
+    return host_state_capacity_ - static_cast<std::uint32_t>(slab_pool_->free_slabs.size());
 }
 
 std::size_t StateImage::host_kv_bytes() const noexcept {
@@ -333,9 +383,20 @@ std::shared_ptr<HostStateImage> StateImage::snapshot_to_host(std::uint32_t slot,
     const auto d2_bytes    = dflash2_cyclic_
                                  ? static_cast<std::size_t>(dflash2_cyclic_->layer_view(0).k.nb[3])
                                  : std::size_t(0);
-    auto image             = std::make_shared<HostStateImage>(
-        conv_bytes + static_cast<std::size_t>(swa_layers_) * 2 * ring_bytes +
-        (dflash2_cyclic_ ? 5ULL * 2ULL * d2_bytes : 0ULL));
+    const auto pool = slab_pool_;
+    std::unique_ptr<HostStateImage> slab;
+    {
+        std::lock_guard lock(pool->mutex);
+        if (pool->free_slabs.empty())
+            throw std::runtime_error("Inkling host checkpoint capacity exhausted");
+        slab = std::move(pool->free_slabs.back());
+        pool->free_slabs.pop_back();
+    }
+    std::shared_ptr<HostStateImage> image(slab.release(), [pool](HostStateImage* ptr) {
+        ptr->pages = {};
+        std::lock_guard lock(pool->mutex);
+        pool->free_slabs.emplace_back(ptr);
+    });
     image->pages         = std::move(*allocation);
     image->depth         = state.depth;
     image->dspark_depth  = state.dspark_depth;
@@ -383,8 +444,6 @@ std::shared_ptr<HostStateImage> StateImage::snapshot_to_host(std::uint32_t slot,
                           0,
                           fixed_state_transfer_work(),
                           0});
-    std::erase_if(host_images_, [](const auto& item) { return item.expired(); });
-    host_images_.push_back(image);
     return image;
 }
 

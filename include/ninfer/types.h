@@ -103,6 +103,8 @@ struct SpeculativeOptions {
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Dynamically scales draft depth in [0, draft_tokens] from acceptance EMA when enabled.
+    bool adaptive_depth = false;
     // Requires the MTP backend.
     NgramOptions ngram;
 };

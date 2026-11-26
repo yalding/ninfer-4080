@@ -11,6 +11,7 @@
 
 namespace ninfer {
 struct DeviceContext;
+struct StartupObserver;
 }
 
 namespace ninfer::targets::inkling2_mini {
@@ -293,6 +294,7 @@ struct PendingBatch {
     std::vector<std::int32_t> counts;
     runtime::ExecutionTiming timing;
     std::uint64_t transaction = 0;
+    std::uint32_t stride      = 1;
 
     std::size_t row_count() const noexcept { return counts.size(); }
 
@@ -300,9 +302,7 @@ struct PendingBatch {
 
     std::span<const std::int32_t> row_counts() const noexcept { return counts; }
 
-    std::uint32_t row_stride() const noexcept {
-        return counts.empty() ? 1U : static_cast<std::uint32_t>(values.size() / counts.size());
-    }
+    std::uint32_t row_stride() const noexcept { return stride; }
 
     runtime::ExecutionTiming execution_timing() const noexcept { return timing; }
 };
@@ -413,6 +413,8 @@ struct ReleaseResult {
 class Program {
 public:
     Program(const detail::RuntimeModelView&, DeviceContext&, EngineOptions);
+    Program(const detail::RuntimeModelView&, DeviceContext&, EngineOptions,
+            const StartupObserver*);
     ~Program();
     RequestBasePlan plan_request(const PreparedPrompt&, const runtime::ResolvedExecutionOptions&);
     std::vector<float> causal_score(PreparedPrompt&&, std::uint32_t);

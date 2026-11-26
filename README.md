@@ -118,11 +118,10 @@ the port is active; the same numbers are repeated in the model card.
 - KV modes: `rk4v4-e8` is the 100K accuracy profile. `int8` and `rk8v4` trade context for
   accuracy and fit below 100K. The pinned host pools hold one deep checkpoint so rewrites reuse
   the prefix instead of re-prefilling.
-- **Inkling-2-Mini (Phase 1–6):** Native `inkling2-mini/q3g128` target (`scripts/run-ninfer-4060ti-inkling2.bat`)
-  validated at 128K (`131,072` tokens) with `rk4v4-e8` and `int8` KV on the RTX 4060 Ti 16 GB,
-  supporting `minimal`/`low`/`medium`/`high`/`xhigh` reasoning effort, prefix reuse, `--spec mtp`
-  (DSpark), and `--spec dflash2` (DFlash 2, up to `116.7 tok/s` math / `86–102 tok/s` code); see
-  [docs/maintainer/inkling2-mini.md](docs/maintainer/inkling2-mini.md).
+- **Inkling-2-Mini** (`inkling2-mini/q3g128`) supports reasoning effort, prefix reuse, batched
+  non-speculative decode, `--spec mtp` (DSpark), and `--spec dflash2`. With `rk4v4-e8` KV and a
+  131,072-token context limit on the RTX 4060 Ti 16 GB, DFlash2 K=7 decoded at 85.25 tok/s after a
+  65,536-token prefill. [Inkling-2-Mini implementation and benchmarks](docs/maintainer/inkling2-mini.md)
 - The official 16.96 GiB `groupwise-int` artifact does not load on this card; the 3-bit GSQ3
   artifact is the registered 4080 fit.
 

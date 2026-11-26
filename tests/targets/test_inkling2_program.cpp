@@ -292,6 +292,16 @@ void control_tests() {
         cap_prog.finalize_context_transaction();
         cap_prog.fail_all_cleanup();
     }
+
+    // PendingBatch ragged row_stride invariant for multi-row speculative/batched decode.
+    {
+        ik::PendingBatch pb;
+        pb.counts = {2, 1};
+        pb.stride = 2;
+        pb.values = {10, 11, 20, 0};
+        require(pb.row_count() == 2 && pb.row_stride() == 2 && pb.tokens().size() == 4,
+                "PendingBatch preserves explicit ragged stride across multi-row batches");
+    }
 }
 } // namespace
 

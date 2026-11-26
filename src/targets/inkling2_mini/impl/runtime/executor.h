@@ -8,17 +8,31 @@
 #include <span>
 #include <vector>
 
+namespace ninfer {
+struct StartupObserver;
+}
 namespace ninfer::targets::inkling2_mini::detail {
 struct RuntimeModelView;
 struct HostStateImage;
 std::size_t executor_device_bytes(const EngineOptions& options, std::uint32_t kv_tokens);
 
+struct DecodeRow {
+    TokenId id;
+    std::uint32_t start;
+    std::uint32_t slot;
+    ResolvedSamplingParameters sampling;
+    std::uint32_t logical_position;
+    std::span<const TokenId> history;
+};
+
 class Executor {
 public:
-    Executor(const RuntimeModelView& model, DeviceContext& device, const EngineOptions& options);
+    Executor(const RuntimeModelView& model, DeviceContext& device, const EngineOptions& options,
+             const StartupObserver* observer = nullptr);
     ~Executor();
     Tensor forward(std::span<const TokenId> ids, std::uint32_t start, std::uint32_t state_slot,
                    bool all_logits = false);
+    std::vector<TokenId> decode_batch(std::span<const DecodeRow> rows);
     std::vector<TokenId> draft_dspark(std::uint32_t state_slot, TokenId anchor,
                                       std::uint32_t draft_tokens);
     std::vector<TokenId> verify_dspark(std::uint32_t state_slot, std::span<const TokenId> verify_ids,

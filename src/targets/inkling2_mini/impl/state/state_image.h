@@ -39,7 +39,8 @@ StateLayout plan_state(const EngineOptions& options, std::uint32_t kv_tokens);
 // retains complete pages; only a shared partial tail is copied before the next append.
 class StateImage {
 public:
-    StateImage(const EngineOptions& options, std::uint32_t kv_tokens);
+    StateImage(const EngineOptions& options, std::uint32_t kv_tokens,
+               const StartupObserver* observer = nullptr);
     void reset(std::uint32_t slot, cudaStream_t stream);
     void copy(std::uint32_t source, std::uint32_t destination, cudaStream_t stream);
     void prepare_append(std::uint32_t slot, std::uint32_t start, std::uint32_t count,
@@ -47,8 +48,10 @@ public:
     void commit_append(std::uint32_t slot, std::uint32_t depth);
     Tensor convolution(std::uint32_t slot, int visit, int component) const;
     Tensor slot_convolution(std::uint32_t slot) const;
+    Tensor all_convolutions() const noexcept { return convolution_; }
     CyclicKVCacheLayerView swa(int layer) const;
     PagedKVLayerView full(std::uint32_t slot, int layer) const;
+    PagedKVBatchLayerView full_batch(int layer) const;
     CyclicKVCacheLayerView dspark_swa(int layer) const;
     PagedKVLayerView dspark_full(std::uint32_t slot) const;
     std::uint32_t dspark_depth(std::uint32_t slot) const;
@@ -107,7 +110,8 @@ private:
     HostKVPageLayout host_layout_;
     std::unique_ptr<HostKVArena> host_arena_;
     std::uint32_t host_state_capacity_;
-    std::vector<std::weak_ptr<HostStateImage>> host_images_;
+    struct SlabPool;
+    std::shared_ptr<SlabPool> slab_pool_;
     std::vector<runtime::ContextTransferObservation> transfers_;
 };
 } // namespace ninfer::targets::inkling2_mini::detail

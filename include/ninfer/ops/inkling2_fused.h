@@ -47,7 +47,8 @@ void inkling2_small_bf16_proj(const Tensor& x, const Tensor& weight, Tensor& out
  */
 void inkling2_fused_sconv(const Tensor& x, const Tensor& static_weight,
                           const Tensor& dynamic_taps, const Tensor& state_in, Tensor& state_out,
-                          const Tensor& residual_in, Tensor& out, cudaStream_t stream);
+                          const Tensor& residual_in, Tensor& out, cudaStream_t stream,
+                          Tensor trace_out = {});
 
 /**
  * Paired depthwise causal width-4 short convolution for K and V (`C = 1024`, `T > 0`) in a
@@ -57,7 +58,28 @@ void inkling2_fused_sconv_kv(const Tensor& kx, const Tensor& k_weight, const Ten
                              const Tensor& k_state_in, Tensor& k_state_out, Tensor& k_out,
                              const Tensor& vx, const Tensor& v_weight, const Tensor& v_dynamic,
                              const Tensor& v_state_in, Tensor& v_state_out, Tensor& v_out,
-                             cudaStream_t stream);
+                             cudaStream_t stream, Tensor k_trace_out = {},
+                             Tensor v_trace_out = {});
+
+/**
+ * Multi-slot batched (`1 <= B <= 8`, 1 token/slot) `inkling2_fused_sconv` indexing
+ * `all_conv_states [6656*3, 48, total_slots]` via device `slots [B]` for `component in {2, 3}`.
+ */
+void inkling2_fused_sconv_batched(const Tensor& x, const Tensor& static_weight,
+                                  Tensor& all_conv_states, std::int32_t visit,
+                                  std::int32_t component, const Tensor& slots,
+                                  const Tensor& residual_in, Tensor& out, cudaStream_t stream);
+
+/**
+ * Multi-slot batched (`1 <= B <= 8`, 1 token/slot) `inkling2_fused_sconv_kv` indexing
+ * `all_conv_states [6656*3, 48, total_slots]` via device `slots [B]` for components `0` (K)
+ * and `1` (V).
+ */
+void inkling2_fused_sconv_kv_batched(const Tensor& kx, const Tensor& k_weight,
+                                     const Tensor& k_dynamic, Tensor& k_out, const Tensor& vx,
+                                     const Tensor& v_weight, const Tensor& v_dynamic, Tensor& v_out,
+                                     Tensor& all_conv_states, std::int32_t visit,
+                                     const Tensor& slots, cudaStream_t stream);
 
 /**
  * Inkling-2 Block Attention Residuals (AttnRes) mix + optional per-branch RMSNorm.
@@ -168,6 +190,33 @@ void inkling2_dspark_rnn_step(const Tensor& prev_token, const Tensor& markov_w1,
                               const Tensor& hidden_out_weight, const Tensor& hidden_out_bias,
                               const Tensor& h_in, const Tensor& c_head, Tensor& state,
                               Tensor& h_out, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Pre-folds `output_head` (`Q6G64_F16S [P, 2304]`) with `markov_hidden_out_{weight,bias}` into
+ * `w_fold_q` (`I8 [256, P]`), `w_fold_scale` (`FP16 [4, P]`), and `b_fold` (`FP32 [P]`).
+ */
+void inkling2_dspark_fold_head(const Weight& output_head, const Tensor& hidden_out_weight,
+                               const Tensor& hidden_out_bias, Tensor& w_fold_q,
+                               Tensor& w_fold_scale, Tensor& b_fold, cudaStream_t stream);
+
+/**
+ * Workspace capacity in bytes for `inkling2_dspark_rnn_step_folded`.
+ */
+[[nodiscard]] std::size_t inkling2_dspark_rnn_step_folded_workspace_bytes();
+
+/**
+ * DSpark Markov RNN latent step + folded rank-256 head + full-vocab argmax:
+ *   state_next = tanh(u) + sigmoid(g) * (state - tanh(u))
+ *   m = tanh(z)
+ *   next_token = argmax_{v < valid_vocab} (base_logits_col[v] + b_fold[v] + dot(W_fold[v], m))
+ */
+void inkling2_dspark_rnn_step_folded(const Tensor& prev_token, const Tensor& markov_w1,
+                                     const Tensor& rnn_proj_weight, const Tensor& rnn_proj_bias,
+                                     const Tensor& h_in, const Tensor& c_head,
+                                     const Tensor& base_logits_col, const Tensor& w_fold_q,
+                                     const Tensor& w_fold_scale, const Tensor& b_fold,
+                                     std::int32_t valid_vocab, Tensor& state, Tensor& next_token,
+                                     WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
  * Restores and advances a slot's 48-visit 3-tap short-conv state `[6656*3, 48]` to `accepted`

@@ -2,7 +2,7 @@
 
 This reference records the `inkling2_mini` native target (`inkling2-mini / q3g128`,
 `inkling2_loop`) in NInfer: model semantics, artifact and converter contract, runtime and state
-ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–6 measurements.
+ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–8 measurements.
 
 ## 1. Model Identity and Architecture
 
@@ -250,11 +250,87 @@ Conditions: `--max-ctx 131072 --kv-dtype int8 -r 1 --warmup 0`, `bench/fixtures/
 | `pp65536+tg128` | `1,540.10 tok/s` | `1,530.06 tok/s` | **`48.34 tok/s`** | `43.13 tok/s` | `-10.8%` | `49.2%` (`60/2`) |
 | `pp100000+tg128` | `1,388.65 tok/s` | `1,375.20 tok/s` | **`40.47 tok/s`** | `28.30 tok/s` | `-30.1%` | `38.9%` (`70/0`) |
 
-*Note on `65K–100K` `W = 8` Full-Attention verification:* `attention_decode_kernel` currently uses `Tq = 2` for `2 <= T <= 15`, so `W = 8` verification launches `4` CTAs per KV head and scans the paged KV cache `4×` per Full-Attn visit (`8` visits × `4` scans). Extending `attention_decode_kernel` to `Tq = 8` (or multi-query Tensor Core FlashDecoding for `W = 8`) will collapse that `4×` KV scan to `1×` per visit.
+At verification width `W = 8`, the Phase 6 full-attention kernel grouped queries in pairs and
+scanned the paged KV cache four times per layer visit. Phase 7 uses one scan for all eight queries.
+
+### Phase 7 — Multi-Query Attention and Fused MoE Verification
+
+- **Full attention.** For `T=1..2`, decode resolves each 64-token physical page once and handles the
+  clamped relative bias separately for distances of 1,024 or more. For `T=3..16`, Tensor Core
+  verification uses one CTA per KV head and split to scan the split across all `3 × T` GQA rows.
+  Split-KV supports up to 128 splits, with four warps merging the partial results.
+- **MoE and state updates.** At `T=4..16`, a single CTA compacts the expert assignments and the
+  grouped MoE kernel uses 128-row by eight-token tiles. `inkling2_moe_post_sconv` combines top-8
+  reduction, post-convolution, and the residual add. Paired K/V convolution at `T=2..16` and
+  in-kernel trace writes remove 192 device copies and 48 MoE reduction launches per verify graph.
+- **Draft depth.** `--spec-adaptive` adds opt-in adaptation, with DFlash2 still accepting a maximum
+  depth from 1 to 15. [Speculative decoding options](../cli.md#speculative-decoding)
+
+The perplexity fixture `profiles/perplexity/inkling2-phase1/fixture.txt` (`--context 768 --stride
+256`, `rk4v4-e8`, 3,791 scored tokens) measured mean NLL **2.042875**, perplexity **7.712754**, and
+**326.9 tok/s**. The reported perplexity matches Phase 5.
+
+`ninfer_bench` used `inkling2_mini_q3g128_dflash2.ninfer`, `bench/fixtures/bench_corpus.ids`, and
+DFlash2 K=7 with one warmup and two measured repetitions. Phase 6 used a different corpus and the
+runs reported different speculative acceptance rates.
+
+| Case | KV dtype | Prefill (tok/s) | Decode (tok/s) | Acceptance |
+|---|---|---:|---:|---:|
+| `pp4096+tg128` | `rk4v4-e8` | 1,864.90 | 104.68 | 49.0% |
+| `pp32768+tg128` | `rk4v4-e8` | 1,720.59 | 66.58 | 29.5% |
+| `pp65536+tg128` | `rk4v4-e8` | 1,558.81 | 84.27 | 46.2% |
+| `pp65536+tg128` | `int8-group64` | 1,537.65 | 75.94 | 40.3% |
+
+Verification covered the relative-bias boundary at distances 1,023 and 1,024, full attention out to
+131,072 keys, MoE and fused convolution traces, state and program behavior, and CLI and server options.
+
+### Phase 8 — Folded DSpark Head, A8 Prefill, and Batched Decode
+
+1. **DSpark full-vocabulary proposals.** Startup folds `W_head @ W_hidden_out` into group-scaled
+   int8 coefficients and precomputes `W_head @ b_hidden_out`. Each draft round projects all base
+   logits in one output-head call, then computes the Markov correction and argmax per step over
+   all 200,058 valid token IDs. The int8 fold can change the winner when proposal logits are close.
+2. **Prefill.** Q4 attention projections and Q4 routed MoE use signed int8 Tensor Core MMA from
+   `T=64`. Attention builds the relative-bias table in BF16 for `T>16` and stages the prompt KV
+   tile in 48 KiB of dynamic shared memory with a two-CTA-per-SM launch target on Ada.
+3. **Batched decode and host checkpoints.** Non-speculative rounds with one input token per
+   request share one compact GPU forward pass for up to eight requests. CUDA Graphs are keyed by
+   batch width and context envelope. Host checkpoint slabs are pinned at `HostStatePin` during
+   startup and recycled as snapshots are released.
+
+The same `rk4v4-e8` perplexity fixture measured mean NLL **2.041193**, perplexity **7.699793**,
+and **315.6 tok/s** across 13 windows (3,791 scored tokens).
+
+The DSpark artifact generated 512 tokens on a greedy C++20 SPSC ring-buffer prompt with
+`rk4v4-e8`, a 4,096-token context, the full proposal vocabulary, and default n-gram chaining.
+The n-gram extensions contributed zero accepted tokens.
+
+| DSpark draft depth | Decode | Reported acceptance |
+|---|---:|---:|
+| `K=2` | **83.6 tok/s** | **52.7%** |
+| `K=4` | **71.3 tok/s** | **36.8%** |
+
+The DFlash2 `K=7` benchmark used the Phase 7 corpus, `rk4v4-e8`, a 131,072-token context
+limit, one warmup, and two measured repetitions.
+
+| Case | Prefill (tok/s) | Prefill gain vs Phase 7 | Decode (tok/s) | Acceptance |
+|---|---:|---:|---:|---:|
+| `pp4096+tg128` | 2,095.56 | +12.4% | 114.53 | 57.7% |
+| `pp32768+tg128` | 1,902.55 | +10.6% | 69.13 | 29.3% |
+| `pp65536+tg128` | 1,687.35 | +8.2% | 85.25 | 46.2% |
+
+In `ninfer-serve` with `rk4v4-e8` and CUDA Graphs, four prompts of 31–210 tokens each
+generated 128 greedy tokens. Aggregate completion throughput, including prefill and HTTP
+overhead, rose from **74.20 tok/s** serially to **119.56 tok/s** concurrently (**+61.1%**).
+All four concurrent response texts matched their serial counterparts exactly. Four additional
+32-token comparisons with a frequency penalty of 0.5 also matched exactly.
+
+Verification covered the Inkling2 attention and MoE oracles, fused operations, state and program
+suites, Q4 linear, and CLI and server options.
 
 ## 5. Follow-On Roadmap
 
-1. **Multi-query `Tq = 8` / Tensor Core Full-Attn verification (`W = 8`):** Collapse the `4×` KV scan in `attention_decode_kernel` (`Tq = 2`) to `1×` per visit for `DFlash2` `65K–100K` decode.
-2. **Frequency-calibrated DSpark shortlist:** Calibrate `mtp/draft_head_token_ids` by token frequency on a code+text corpus (instead of raw BPE rank) so `--lm-head-draft` preserves full-head `54%+` acceptance.
-3. **Quality upgrade option:** Add imatrix/AWQ calibration or `Q4G64_F16S` `ffn/routed_down` if closing the `8.71` vs `8.16` PPL gap is prioritized over `128K` VRAM headroom.
-4. **Vision:** Port Inkling-2's 23-layer ViT (`dim=1024`, `patch=20`, `merge=2`, axial RoPE `theta=10000`).
+- **DSpark shortlist.** Calibrate `mtp/draft_head_token_ids` using token frequencies from code and
+  text to improve `--lm-head-draft` acceptance.
+- **Quantization quality.** Evaluate imatrix/AWQ calibration or `Q4G64_F16S` `ffn/routed_down`.
+- **Vision.** Port Inkling-2's 23-layer ViT (`dim=1024`, `patch=20`, `merge=2`, axial RoPE `theta=10000`).

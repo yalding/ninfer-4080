@@ -60,7 +60,14 @@ int main() {
                       "--auto-long-anchors is not left to the anchor cap by default");
     const ServeOptions anchors =
         parse({"ninfer-serve", "model.ninfer", "--auto-long-anchors", "3"});
-    failures += check(anchors.auto_long_anchors == 3U, "--auto-long-anchors was not applied");
+    failures += check(anchors.auto_long_anchors == 3U && !anchors.speculative.adaptive_depth,
+                      "--auto-long-anchors was not applied");
+    {
+        const ServeOptions adaptive = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                             "--draft-tokens", "7", "--spec-adaptive"});
+        failures += check(adaptive.speculative.adaptive_depth,
+                          "serve options did not preserve --spec-adaptive");
+    }
     bool missing_anchor_value_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--auto-long-anchors"});

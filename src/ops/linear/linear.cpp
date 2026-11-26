@@ -83,7 +83,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q3_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::Q4G64_F16S:
-        detail::q4_dispatch(x, w, out, policy, stream);
+        detail::q4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::Q5G64_F16S:
         detail::q5_dispatch(x, w, out, policy, stream);
@@ -124,6 +124,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::Q4G64_F16S:
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);
+        if (detail::q4_uses_a8(output_rows, input_rows, input_rows, policy, max_tokens)) {
+            return detail::q4_a8_workspace_capacity_bytes(input_rows, max_tokens);
+        }
         return 0;
     case QType::Q3G128_F16S:
         // The padded-K extent is not visible here; both Q3 A16 routes need no workspace, so the

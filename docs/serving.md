@@ -37,6 +37,10 @@ head). DFlash2 accepts draft counts 1..15 and supports the same sampling, concur
 reuse, and (on Qwen3.8-27B) image/video request surfaces. It may remain combined with `--vision` on
 Qwen3.8-27B.
 
+On Inkling-2-Mini, `--spec-adaptive` can shorten or pause drafting based on recent acceptance.
+`--draft-tokens` sets the maximum depth. With `--spec mtp`, add `--ngram off` to enable adaptation
+because the default n-gram chain uses a fixed depth.
+
 When `--model-id` is omitted, the server advertises and accepts the loaded container's exact
 `identity.model_id`. An explicit `--model-id` remains a public HTTP alias override and does not
 select or alter the artifact.
@@ -834,6 +838,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8` | KV-cache storage; rotated and E8-lattice modes trade key/value precision for capacity; `nvfp4` and `k8v4` are upstream sm_120a modes, not available on the RTX 4090 | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
+| `--spec-adaptive` | Adapt the Inkling-2-Mini draft depth from recent acceptance | off |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--ngram off\|chain` | extend MTP proposals with host n-gram drafts, MTP only (see [cli.md](cli.md#speculative-decoding)) | `chain` |
 | `--ngram-max V` | n-gram chain bound, `draft-tokens + 3 .. 15` | `15` |
@@ -997,10 +1002,11 @@ raw counters and seconds over rounded stderr rates.
 ## Execution behavior
 
 The server owns one resident Engine with a startup-fixed capacity of `1..8` active generation
-requests. At each decode boundary, every decode-ready request is compacted into one batch and
-processed by one model traversal and, when graphs are enabled, one exact-batch CUDA Graph replay. A
-request joins that batch only after its single-request prefill finishes; when it completes or is
-cancelled, the next boundary rebuilds the batch without an empty row.
+requests. The scheduler groups decode-ready requests after their single-request prefill finishes.
+Completed and cancelled requests leave the next round. Batched target paths process the group in
+one model traversal and can replay a CUDA Graph for that batch size. Inkling-2-Mini batches
+non-speculative rounds with exactly one input token per request and executes speculative rounds
+per request.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in

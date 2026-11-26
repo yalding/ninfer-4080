@@ -87,7 +87,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8]\n"
-           "       [--spec mtp|dflash|dflash2 --draft-tokens N]\n"
+           "       [--spec mtp|dflash|dflash2 --draft-tokens N] [--spec-adaptive]\n"
            "       [--lm-head-draft]\n"
            "       [--ngram off|chain [--ngram-max V] [--ngram-n N] [--ngram-min N]\n"
            "        [--ngram-pool-mib M]]\n"
@@ -156,6 +156,8 @@ Options parse_options(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--spec-adaptive") {
+            options.speculative.adaptive_depth = true;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (product::is_ngram_cli_flag(arg)) {

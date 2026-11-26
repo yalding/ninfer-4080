@@ -86,7 +86,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--request-log-jsonl FILE] [--slot-save-path DIR] [--auto-save-evicted] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] "
-           "[--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--spec mtp|dflash|dflash2 --draft-tokens N] [--spec-adaptive] "
            "[--ngram off|chain [--ngram-max V] [--ngram-n N] [--ngram-min N] [--ngram-pool-mib M]] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
@@ -316,6 +316,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--spec-adaptive") {
+            options.speculative.adaptive_depth = true;
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");

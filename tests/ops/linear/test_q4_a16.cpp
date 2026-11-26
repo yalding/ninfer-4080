@@ -1,8 +1,15 @@
 #include "ops/linear/linear_test_common.h"
 
+#include "core/device.h"
+#include "core/decode_graph.h"
+#include "ops/a8_g64_reference.h"
+
+#include <algorithm>
 #include <array>
 #include <exception>
 #include <iostream>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -137,6 +144,79 @@ int q4_a16_conformance() {
     return failures;
 }
 
+int q4_a8_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    constexpr std::array kTokens{1, 16, 63, 64, 65, 128, 256, 300};
+    const std::int32_t max_t = 300;
+    std::vector<std::int32_t> rows;
+    if (n <= 1024) {
+        rows.resize(n);
+        for (std::int32_t r = 0; r < n; ++r) rows[r] = r;
+    } else {
+        for (int s = 0; s < 32; ++s) rows.push_back(static_cast<std::int32_t>(std::int64_t(n - 1) * s / 31));
+    }
+    const auto packed = make_q4g64_f16s_weight(n, k, seed);
+    const std::vector<float> oracle_w = ninfer::test::quantized_weight::materialize_rows_fp32(packed, rows);
+    std::vector<std::uint16_t> act_bits(std::size_t(k) * max_t);
+    for (std::size_t i = 0; i < act_bits.size(); ++i) {
+        std::uint32_t c = seed ^ (static_cast<std::uint32_t>(i) * 0x9e3779b9U);
+        c ^= c >> 16; c *= 0x7feb352dU; c ^= c >> 15; c *= 0x846ca68bU; c ^= c >> 16;
+        act_bits[i] = ninfer::test::f32_to_bf16(static_cast<float>(int(c & 0xffU) - 128) * (1.0f / 256.0f));
+        if (i % 64 == (i / 64) % 61) act_bits[i] = ninfer::test::f32_to_bf16(16.0f * ninfer::test::bf16_to_f32(act_bits[i]));
+    }
+    const auto quantized = ninfer::test::a8_g64_dequantized(act_bits, k, max_t);
+    DeviceBuffer dw(packed.payload.size()), dx(act_bits.size() * 2);
+    dw.copy_from_host(packed.payload.data(), dw.bytes);
+    dx.copy_from_host(act_bits.data(), dx.bytes);
+    const Weight w = packed.device_weight(dw.p);
+
+    DeviceContext ctx;
+    int failures = 0;
+    for (std::int32_t t : kTokens) {
+        const bool expect_a8 = (t >= 64);
+        ninfer::test::GuardedDeviceBuffer out(std::size_t(n) * t * 2);
+        Tensor tx(dx.p, DType::BF16, {k, t}), td(out.data(), DType::BF16, {n, t});
+        std::vector<float> oracle_x(std::size_t(k) * t);
+        for (std::size_t i = 0; i < oracle_x.size(); ++i)
+            oracle_x[i] = expect_a8 ? static_cast<float>(quantized[i]) : ninfer::test::bf16_to_f32(act_bits[i]);
+        std::vector<double> ref(rows.size() * t);
+        cpu_linear_gemm_fp64(oracle_w.data(), oracle_x.data(), ref.data(), static_cast<std::int32_t>(rows.size()), k, t);
+        const auto capacity = ops::linear_workspace_capacity_bytes(
+            QType::Q4G64_F16S, n, k, ops::LinearPolicy::AllowA8, t, t);
+        failures += (capacity != 0) != expect_a8;
+        WorkspaceArena ws(std::max<std::size_t>(capacity, 256));
+        const auto launch = [&] { ops::linear(tx, w, td, ops::LinearPolicy::AllowA8, ws, ctx.stream); };
+        if (t == 64 || t == 256) {
+            DecodeGraphDefinition definition;
+            DecodeGraphExecutable graph;
+            definition.capture(ctx.stream, launch);
+            graph.instantiate(definition);
+            graph.launch(ctx.stream);
+        } else {
+            launch();
+        }
+        std::vector<std::uint16_t> got_bits(std::size_t(n) * t);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        CUDA_CHECK(cudaMemcpy(got_bits.data(), out.data(), got_bits.size() * 2, cudaMemcpyDeviceToHost));
+        std::vector<double> actual(rows.size() * t);
+        for (std::int32_t tk = 0; tk < t; ++tk)
+            for (std::size_t ri = 0; ri < rows.size(); ++ri)
+                actual[tk * rows.size() + ri] = ninfer::test::bf16_to_f32(got_bits[std::size_t(tk) * n + rows[ri]]);
+        failures += ninfer::test::verify_reduction(
+            "Q4_A8 [" + std::to_string(n) + "," + std::to_string(k) + "] T=" + std::to_string(t),
+            actual, ref, ninfer::test::kDocumentedA8Criterion);
+        failures += out.verify_guards("Q4_A8 guards");
+    }
+    return failures;
+}
+
+int q4_a8_conformance() {
+    int failures = q4_a8_shape(1024, 2304, 201U);
+    failures += q4_a8_shape(3072, 2304, 203U);
+    failures += q4_a8_shape(6528, 2304, 205U);
+    failures += q4_a8_shape(2304, 3072, 207U);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -146,8 +226,8 @@ int main() {
     }
 
     try {
-        const int failures = q4_a16_conformance();
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " Q4_A16 Linear\n";
+        const int failures = q4_a16_conformance() + q4_a8_conformance();
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " Q4_A16/Q4_A8 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "Q4_A16 Linear: " << error.what() << '\n';

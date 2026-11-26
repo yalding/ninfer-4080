@@ -723,6 +723,239 @@ int dflash2_topk16_and_select_test(DeviceContext& dev, int k, float temp, bool g
     fail += check("dflash2 proposal_q", d_q, exp_q, true, &kFPMma);
     return fail;
 }
+
+int dspark_folded_head_test(DeviceContext& dev) {
+    const int n      = 512;
+    const int k      = 2304;
+    const int groups = k / 64;
+    const int steps  = 4;
+    std::vector<std::uint8_t> codes(std::size_t(n) * groups * 32);
+    std::vector<std::uint8_t> qhigh(std::size_t(n) * groups * 16);
+    std::vector<std::uint16_t> scales(std::size_t(n) * groups);
+    std::vector<float> decoded_head(std::size_t(n) * k);
+    for (int r = 0; r < n; ++r) {
+        for (int g = 0; g < groups; ++g) {
+            const std::uint16_t sb = 0x3400u + static_cast<std::uint16_t>((r + g) & 3);
+            const float sc         = __half2float(__ushort_as_half(sb));
+            scales[r * groups + g] = sb;
+            for (int i = 0; i < 32; ++i) {
+                const int q0 = ((r * 7 + g * 13 + i * 3) % 63) - 32;
+                const int q1 = ((r * 11 + g * 5 + i * 7) % 63) - 32;
+                const int u0 = q0 & 63;
+                const int u1 = q1 & 63;
+                codes[(r * groups + g) * 32 + i] =
+                    static_cast<std::uint8_t>((u0 & 0x0f) | ((u1 & 0x0f) << 4));
+                const int byte_idx = i >> 1;
+                const int shift    = (i & 1) * 4;
+                if ((i & 1) == 0) qhigh[(r * groups + g) * 16 + byte_idx] = 0;
+                qhigh[(r * groups + g) * 16 + byte_idx] |=
+                    static_cast<std::uint8_t>((((u0 >> 4) & 3) << shift) |
+                                              (((u1 >> 4) & 3) << (shift + 2)));
+                decoded_head[r * k + g * 64 + i * 2]     = static_cast<float>(q0) * sc;
+                decoded_head[r * k + g * 64 + i * 2 + 1] = static_cast<float>(q1) * sc;
+            }
+        }
+    }
+    DeviceBuffer d_codes(codes.size()), d_qhigh(qhigh.size()), d_scales(scales.size() * 2);
+    d_codes.copy_from_host(codes.data(), d_codes.bytes);
+    d_qhigh.copy_from_host(qhigh.data(), d_qhigh.bytes);
+    d_scales.copy_from_host(scales.data(), d_scales.bytes);
+    Weight head_w;
+    head_w.qtype          = QType::Q6G64_F16S;
+    head_w.layout         = QuantLayout::RowSplit;
+    head_w.group_size     = 64;
+    head_w.group          = 64;
+    head_w.scale_dtype    = DType::FP16;
+    head_w.n              = n;
+    head_w.k              = k;
+    head_w.padded_shape[0] = n;
+    head_w.padded_shape[1] = k;
+    head_w.qdata          = d_codes.p;
+    head_w.qhigh          = d_qhigh.p;
+    head_w.scales         = d_scales.p;
+
+    auto w1_h   = values(256 * 201024, 301, 0.12f);
+    auto rw_h   = values(5120 * 768, 302, 0.04f);
+    auto rb_h   = values(768, 303, 0.05f, false);
+    auto how_h  = values(256 * k, 304, 0.05f);
+    auto hob_h  = values(k, 305, 0.05f, false);
+    auto hin_h  = values(std::size_t(k) * steps, 306, 0.25f);
+    auto ch_h   = values(k, 307, 0.2f);
+    auto base_h = values(std::size_t(n) * steps, 308, 0.5f);
+    // Give two steps a large base-logit margin, and let the correction decide the others.
+    for (int s = 0; s < steps; ++s) {
+        const int target_id            = (s * 97 + 19) % 450;
+        if (s % 2 == 0) base_h[std::size_t(s) * n + target_id] = 64.0f;
+    }
+    auto dw1 = to_device_bf16(w1_h), drw = to_device_bf16(rw_h), dhow = to_device_bf16(how_h);
+    auto dhin = to_device_bf16(hin_h), dch = to_device_bf16(ch_h), dbase = to_device_bf16(base_h);
+    auto drb = to_device(rb_h), dhob = to_device(hob_h);
+    GuardedDeviceBuffer d_wq(std::size_t(256) * n), d_ws(std::size_t(4) * n * 2),
+        d_bf(std::size_t(n) * 4);
+    GuardedDeviceBuffer d_state(256 * 4), d_tok(4);
+    CUDA_CHECK(cudaMemset(d_state.data(), 0, 256 * 4));
+    std::vector<int> cur_tok_h{17};
+    auto d_cur_tok = to_device(cur_tok_h);
+
+    Tensor t_how(dhow.p, DType::BF16, {256, k}), t_hob(dhob.p, DType::FP32, {k});
+    Tensor t_wq(d_wq.data(), DType::I8, {256, n}), t_ws(d_ws.data(), DType::FP16, {4, n}),
+        t_bf(d_bf.data(), DType::FP32, {n});
+    ops::inkling2_dspark_fold_head(head_w, t_how, t_hob, t_wq, t_ws, t_bf, dev.stream);
+    dev.synchronize();
+    const auto folded_q = from_device<std::int8_t>(d_wq.data(), n * 256);
+    const auto folded_s = from_device<std::uint16_t>(d_ws.data(), n * 4);
+    const auto folded_b = from_device<float>(d_bf.data(), n);
+    std::vector<double> folded(n * 256), ideal_fold(n * 256), ideal_bias(n);
+    for (int row = 0; row < n; ++row) {
+        for (int c = 0; c < k; ++c) {
+            const double w = decoded_head[row * k + c];
+            ideal_bias[row] += w * hob_h[c];
+            for (int d = 0; d < 256; ++d)
+                ideal_fold[row * 256 + d] += w * how_h[c * 256 + d];
+        }
+        for (int d = 0; d < 256; ++d) {
+            const auto scale = __half2float(__ushort_as_half(folded_s[row * 4 + d / 64]));
+            folded[row * 256 + d] = folded_q[row * 256 + d] * scale;
+        }
+    }
+    int fail = verify_reduction("DSpark folded weights", folded, ideal_fold,
+                                ReductionCriterion{0.009, 0.001, 0.014});
+    fail += verify_reduction("DSpark folded bias", std::vector<double>(folded_b.begin(), folded_b.end()),
+                             ideal_bias, ReductionCriterion{0.005, 0.001, 0.009});
+
+    WorkspaceArena ws(ops::inkling2_dspark_rnn_step_folded_workspace_bytes());
+    Tensor t_w1(dw1.p, DType::BF16, {256, 201024}), t_rw(drw.p, DType::BF16, {5120, 768}),
+        t_rb(drb.p, DType::FP32, {768}), t_ch(dch.p, DType::BF16, {k});
+    Tensor t_state(d_state.data(), DType::FP32, {256}), t_next(d_tok.data(), DType::I32, {1});
+
+    std::vector<double> host_state(256, 0.0);
+    int tok  = cur_tok_h[0];
+    for (int s = 0; s < steps; ++s) {
+        Tensor t_hin(static_cast<std::byte*>(dhin.p) + std::size_t(s) * k * 2, DType::BF16, {k});
+        Tensor t_base(static_cast<std::byte*>(dbase.p) + std::size_t(s) * n * 2, DType::BF16, {n});
+        Tensor t_prev(d_cur_tok.p, DType::I32, {1});
+        ops::inkling2_dspark_rnn_step_folded(t_prev, t_w1, t_rw, t_rb, t_hin, t_ch, t_base, t_wq,
+                                             t_ws, t_bf, 450, t_state, t_next, ws, dev.stream);
+        CUDA_CHECK(cudaMemcpyAsync(d_cur_tok.p, d_tok.data(), 4, cudaMemcpyDeviceToDevice,
+                                   dev.stream));
+        dev.synchronize();
+        const int got = from_device<int>(d_tok.data(), 1)[0];
+
+        std::vector<double> x5120(5120, 0.0);
+        for (int i = 0; i < 256; ++i)
+            x5120[i] = bf16_to_f32(f32_to_bf16(static_cast<float>(host_state[i])));
+        for (int i = 0; i < 256; ++i) x5120[256 + i] = w1_h[std::size_t(tok) * 256 + i];
+        for (int i = 0; i < k; ++i) x5120[512 + i] = hin_h[std::size_t(s) * k + i];
+        for (int i = 0; i < k; ++i) x5120[2816 + i] = ch_h[i];
+        std::vector<double> guz(768, 0.0);
+        for (int r = 0; r < 768; ++r) {
+            double acc = rb_h[r];
+            for (int c = 0; c < 5120; ++c) acc += rw_h[std::size_t(r) * 5120 + c] * x5120[c];
+            guz[r] = acc;
+        }
+        std::vector<double> m_lat(256, 0.0);
+        for (int i = 0; i < 256; ++i) {
+            const double u_t = std::tanh(guz[256 + i]);
+            const double g_s = 1.0 / (1.0 + std::exp(-guz[i]));
+            host_state[i]    = u_t + g_s * (host_state[i] - u_t);
+            m_lat[i]         = std::tanh(guz[512 + i]);
+        }
+        std::vector<double> h_delta(k, 0.0);
+        for (int c = 0; c < k; ++c) {
+            double acc = hob_h[c];
+            for (int d = 0; d < 256; ++d) acc += how_h[std::size_t(c) * 256 + d] * m_lat[d];
+            h_delta[c] = acc;
+        }
+        std::vector<double> ideal_logits(450), represented_logits(450);
+        for (int v = 0; v < 450; ++v) {
+            const double base = base_h[std::size_t(s) * n + v];
+            ideal_logits[v] = base;
+            for (int c = 0; c < k; ++c) ideal_logits[v] += decoded_head[v * k + c] * h_delta[c];
+            represented_logits[v] = base + folded_b[v];
+            for (int d = 0; d < 256; ++d) represented_logits[v] += folded[v * 256 + d] * m_lat[d];
+        }
+        fail += verify_reduction("DSpark folded logits", represented_logits, ideal_logits,
+                                 ReductionCriterion{0.01, 0.001, 0.018});
+        fail += check("DSpark folded state", d_state, host_state, true);
+        const int ideal_id = static_cast<int>(std::max_element(ideal_logits.begin(), ideal_logits.end()) -
+                                              ideal_logits.begin());
+        const int represented_id = static_cast<int>(
+            std::max_element(represented_logits.begin(), represented_logits.end()) - represented_logits.begin());
+        if (got != represented_id || (s % 2 == 0 && got != ideal_id)) {
+            std::cerr << "FAIL dspark folded step " << s << " got=" << got << " represented="
+                      << represented_id << " ideal=" << ideal_id << '\n';
+            ++fail;
+        }
+        tok = got;
+    }
+    return fail + d_wq.verify_guards("dspark fold wq") + d_ws.verify_guards("dspark fold ws") +
+           d_bf.verify_guards("dspark fold bf");
+}
+
+int sconv_batched_test(DeviceContext& dev) {
+    const int total_slots = 6;
+    const int b           = 4;
+    const int visit       = 17;
+    std::vector<int> slots_h{3, 0, 5, 1};
+    auto x_h    = values(std::size_t(2304) * b, 401);
+    auto res_h  = values(std::size_t(2304) * b, 402);
+    auto w_h    = values(4 * 2304, 403, 0.25f, false);
+    auto st_h   = values(std::size_t(6656 * 3) * 48 * total_slots, 404, 0.2f);
+    auto kx_h   = values(std::size_t(1024) * b, 405);
+    auto vx_h   = values(std::size_t(1024) * b, 406);
+    auto kw_h   = values(4 * 1024, 407, 0.25f, false);
+    auto vw_h   = values(4 * 1024, 408, 0.25f, false);
+
+    auto dx = to_device_bf16(x_h), dres = to_device_bf16(res_h), dst = to_device_bf16(st_h);
+    auto dst_ref = to_device_bf16(st_h);
+    auto dw = to_device(w_h), dslots = to_device(slots_h);
+    auto dkx = to_device_bf16(kx_h), dvx = to_device_bf16(vx_h);
+    auto dkw = to_device(kw_h), dvw = to_device(vw_h);
+    GuardedDeviceBuffer dout(std::size_t(2304) * b * 2), dko(std::size_t(1024) * b * 2),
+        dvo(std::size_t(1024) * b * 2);
+    GuardedDeviceBuffer dout_ref(std::size_t(2304) * b * 2), dko_ref(std::size_t(1024) * b * 2),
+        dvo_ref(std::size_t(1024) * b * 2);
+
+    Tensor tx(dx.p, DType::BF16, {2304, b}), tres(dres.p, DType::BF16, {2304, b}),
+        tw(dw.p, DType::FP32, {4, 2304}), tslots(dslots.p, DType::I32, {b});
+    Tensor tall(dst.p, DType::BF16, {6656 * 3, 48, total_slots});
+    Tensor tout(dout.data(), DType::BF16, {2304, b});
+    Tensor tkx(dkx.p, DType::BF16, {1024, b}), tvx(dvx.p, DType::BF16, {1024, b}),
+        tkw(dkw.p, DType::FP32, {4, 1024}), tvw(dvw.p, DType::FP32, {4, 1024});
+    Tensor tko(dko.data(), DType::BF16, {1024, b}), tvo(dvo.data(), DType::BF16, {1024, b});
+
+    ops::inkling2_fused_sconv_kv_batched(tkx, tkw, {}, tko, tvx, tvw, {}, tvo, tall, visit, tslots,
+                                         dev.stream);
+    ops::inkling2_fused_sconv_batched(tx, tw, tall, visit, 3, tslots, tres, tout, dev.stream);
+
+    for (int i = 0; i < b; ++i) {
+        const int sl       = slots_h[i];
+        const auto s_off   = (std::size_t(sl) * 48 + visit) * (6656 * 3) * 2;
+        Tensor ks(static_cast<std::byte*>(dst_ref.p) + s_off, DType::BF16, {1024, 3});
+        Tensor vs(static_cast<std::byte*>(dst_ref.p) + s_off + 1024 * 3 * 2, DType::BF16, {1024, 3});
+        Tensor fs(static_cast<std::byte*>(dst_ref.p) + s_off + 4352 * 3 * 2, DType::BF16, {2304, 3});
+        Tensor kx_i(static_cast<std::byte*>(dkx.p) + std::size_t(i) * 1024 * 2, DType::BF16, {1024, 1});
+        Tensor vx_i(static_cast<std::byte*>(dvx.p) + std::size_t(i) * 1024 * 2, DType::BF16, {1024, 1});
+        Tensor ko_i(static_cast<std::byte*>(dko_ref.data()) + std::size_t(i) * 1024 * 2, DType::BF16, {1024, 1});
+        Tensor vo_i(static_cast<std::byte*>(dvo_ref.data()) + std::size_t(i) * 1024 * 2, DType::BF16, {1024, 1});
+        Tensor x_i(static_cast<std::byte*>(dx.p) + std::size_t(i) * 2304 * 2, DType::BF16, {2304, 1});
+        Tensor r_i(static_cast<std::byte*>(dres.p) + std::size_t(i) * 2304 * 2, DType::BF16, {2304, 1});
+        Tensor o_i(static_cast<std::byte*>(dout_ref.data()) + std::size_t(i) * 2304 * 2, DType::BF16, {2304, 1});
+        ops::inkling2_fused_sconv_kv(kx_i, tkw, {}, ks, ks, ko_i, vx_i, tvw, {}, vs, vs, vo_i,
+                                     dev.stream);
+        ops::inkling2_fused_sconv(x_i, tw, {}, fs, fs, r_i, o_i, dev.stream);
+    }
+    int fail = verify_exact("sconv_batched out", from_device<std::uint16_t>(dout.data(), 2304 * b),
+                            from_device<std::uint16_t>(dout_ref.data(), 2304 * b));
+    fail += verify_exact("sconv_kv_batched k", from_device<std::uint16_t>(dko.data(), 1024 * b),
+                         from_device<std::uint16_t>(dko_ref.data(), 1024 * b));
+    fail += verify_exact("sconv_kv_batched v", from_device<std::uint16_t>(dvo.data(), 1024 * b),
+                         from_device<std::uint16_t>(dvo_ref.data(), 1024 * b));
+    fail += verify_exact("sconv_batched states",
+                         from_device<std::uint16_t>(dst.p, std::size_t(6656 * 3) * 48 * total_slots),
+                         from_device<std::uint16_t>(dst_ref.p, std::size_t(6656 * 3) * 48 * total_slots));
+    return fail;
+}
 } // namespace
 
 int main() {
@@ -732,11 +965,51 @@ int main() {
         int failures = 0;
         for (int t : {1, 3, 8, 15, 16, 17, 64, 129}) for (int n : {1, 24, 32, 64})
             for (bool fp32 : {false, true}) failures += projection(device, t, n, fp32, t != 1);
-        for (int t : {1, 2, 3, 8, 15, 17, 1024}) for (int c : {1024, 2304})
+        for (int t : {1, 2, 3, 8, 15, 16, 17, 1024}) for (int c : {1024, 2304})
             for (bool alias : {false, true}) {
                 failures += convolution(device, c, t, 0, alias, true, t != 3);
                 if (c == 1024) for (int dt : {1, 2}) failures += convolution(device, c, t, dt, alias, false, true);
             }
+        {
+            for (int t : {1, 8, 16}) {
+                const int c = 1024;
+                auto kx = values(std::size_t(c) * t, 91 + t), vx = values(std::size_t(c) * t, 92 + t);
+                auto kw = values(4 * c, 93, 0.25f, false), vw = values(4 * c, 94, 0.25f, false);
+                auto kst = values(3 * c, 95), vst = values(3 * c, 96);
+                auto dkx = to_device_bf16(kx), dvx = to_device_bf16(vx);
+                auto dkw = to_device(kw), dvw = to_device(vw);
+                auto dkst = to_device_bf16(kst), dvst = to_device_bf16(vst);
+                GuardedDeviceBuffer kout(std::size_t(c) * t * 2), vout(std::size_t(c) * t * 2);
+                GuardedDeviceBuffer ktr(std::size_t(c) * t * 2), vtr(std::size_t(c) * t * 2);
+                GuardedDeviceBuffer kref(std::size_t(c) * t * 2), vref(std::size_t(c) * t * 2);
+                GuardedDeviceBuffer kst_ref(3 * c * 2), vst_ref(3 * c * 2);
+                cuda_synchronize();
+                CUDA_CHECK(cudaMemcpyAsync(kst_ref.data(), dkst.p, 3 * c * 2, cudaMemcpyDeviceToDevice, device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(vst_ref.data(), dvst.p, 3 * c * 2, cudaMemcpyDeviceToDevice, device.stream));
+                Tensor tkx(dkx.p, DType::BF16, {c, t}), tvx(dvx.p, DType::BF16, {c, t});
+                Tensor tkw(dkw.p, DType::FP32, {4, c}), tvw(dvw.p, DType::FP32, {4, c});
+                Tensor tkst(dkst.p, DType::BF16, {c, 3}), tvst(dvst.p, DType::BF16, {c, 3});
+                Tensor tkst_r(kst_ref.data(), DType::BF16, {c, 3}), tvst_r(vst_ref.data(), DType::BF16, {c, 3});
+                Tensor tkout(kout.data(), DType::BF16, {c, t}), tvout(vout.data(), DType::BF16, {c, t});
+                Tensor tktr(ktr.data(), DType::BF16, {c, t}), tvtr(vtr.data(), DType::BF16, {c, t});
+                Tensor tkref(kref.data(), DType::BF16, {c, t}), tvref(vref.data(), DType::BF16, {c, t});
+                ops::inkling2_fused_sconv(tkx, tkw, {}, tkst_r, tkst_r, {}, tkref, device.stream);
+                ops::inkling2_fused_sconv(tvx, tvw, {}, tvst_r, tvst_r, {}, tvref, device.stream);
+                graph_run(device, [&] {
+                    ops::inkling2_fused_sconv_kv(tkx, tkw, {}, tkst, tkst, tkout,
+                                                 tvx, tvw, {}, tvst, tvst, tvout,
+                                                 device.stream, tktr, tvtr);
+                }, true);
+                failures += verify_exact("sconv_kv k_out", from_device<std::uint16_t>(kout.data(), std::size_t(c) * t),
+                                         from_device<std::uint16_t>(kref.data(), std::size_t(c) * t));
+                failures += verify_exact("sconv_kv v_out", from_device<std::uint16_t>(vout.data(), std::size_t(c) * t),
+                                         from_device<std::uint16_t>(vref.data(), std::size_t(c) * t));
+                failures += verify_exact("sconv_kv k_trace", from_device<std::uint16_t>(ktr.data(), std::size_t(c) * t),
+                                         from_device<std::uint16_t>(dkx.p, std::size_t(c) * t));
+                failures += verify_exact("sconv_kv v_trace", from_device<std::uint16_t>(vtr.data(), std::size_t(c) * t),
+                                         from_device<std::uint16_t>(dvx.p, std::size_t(c) * t));
+            }
+        }
         for (int m : {1, 2, 5, 8}) for (int r : {1, 3, 4}) for (bool norm : {false, true})
             failures += mixing(device, 3, m, r, norm, true);
         failures += mixing(device, 1, 5, 4, true, false, 0);
@@ -756,6 +1029,8 @@ int main() {
         failures += dspark_feature_mix_test(device, 8, true);
         failures += dspark_rmsnorm_rope_test(device, 8, true);
         failures += dspark_rnn_step_test(device, false);
+        failures += dspark_folded_head_test(device);
+        failures += sconv_batched_test(device);
         for (int w : {1, 8, 16}) failures += dflash2_kv_materialize_test(device, w, w, 2043, 1, w != 1);
         failures += dflash2_kv_materialize_test(device, 8, 5, 2046, 0, true);
         for (int w : {2, 8, 16}) failures += dflash2_conv_test(device, w, w != 2);

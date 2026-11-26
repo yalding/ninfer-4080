@@ -1,5 +1,8 @@
 #include "ops/linear/q4/q4_dispatch.h"
 
+#include "core/layout.h"
+#include "ops/common/rowsplit_a8_quantize.h"
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -162,9 +165,37 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     throw std::invalid_argument("q4 linear: unsupported policy");
 }
 
+bool q4_uses_a8(std::int32_t n, std::int32_t k, std::int32_t padded_k, LinearPolicy policy,
+                std::int32_t tokens) noexcept {
+    return policy == LinearPolicy::AllowA8 && n > 0 && k > 0 && padded_k == k &&
+           (n % kQ4A8Rows) == 0 && (k % kQ4A8StepK) == 0 && tokens >= kQ4A8MinTokens;
+}
+
+std::size_t q4_a8_workspace_capacity_bytes(std::int32_t k, std::int32_t tokens) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_a8_g64_activation(layout, k, tokens);
+    return layout.peak_bytes(1);
+}
+
 void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 cudaStream_t stream) {
+                 WorkspaceArena* workspace, cudaStream_t stream) {
     const Q4Launch launch = select_q4_launch(w.n, w.k, x.ne[1], policy);
+    if (q4_uses_a8(w.n, w.k, static_cast<std::int32_t>(w.padded_shape[1]), policy, x.ne[1])) {
+        if (workspace == nullptr) {
+            throw std::invalid_argument("q4 A8 linear requires caller workspace");
+        }
+        auto scope = workspace->scope();
+        A8G64Activation act = allocate_a8_g64_activation(*workspace, w.k, x.ne[1]);
+        a8_g64_quantize(x, act, stream);
+        if (x.ne[1] >= kQ4A8WideMinTokens) {
+            launch_q4_mma_tall_a8_r128_c256(act, w, out, stream);
+        } else if (x.ne[1] >= 128) {
+            launch_q4_mma_tall_a8_r128_c128(act, w, out, stream);
+        } else {
+            launch_q4_mma_tall_a8_r128_c64(act, w, out, stream);
+        }
+        return;
+    }
     launch(x, w, out, stream);
 }
 

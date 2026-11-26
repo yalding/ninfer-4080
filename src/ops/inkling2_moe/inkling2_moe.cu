@@ -650,6 +650,125 @@ __global__ void inkling2_moe_index_kernel(const int* __restrict__ ids,
     packed_token[packed] = token;
 }
 
+template <int ExpertBN>
+__global__ void inkling2_moe_small_pack_kernel(const float* __restrict__ probs,
+                                               const float* __restrict__ bias,
+                                               int* __restrict__ ids, float* __restrict__ alpha,
+                                               int* __restrict__ local_rank,
+                                               int* __restrict__ packed_index,
+                                               int* __restrict__ packed_token,
+                                               int* __restrict__ expert_offsets,
+                                               int* __restrict__ route_job_experts,
+                                               int* __restrict__ route_job_columns,
+                                               int* __restrict__ route_job_count, int tokens) {
+    __shared__ int counts[128];
+    __shared__ int expert_base[128];
+    __shared__ int scan[128];
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (tid < 128) counts[tid] = 0;
+    __syncthreads();
+
+    for (int token = warp; token < tokens; token += 8) {
+        float p[4];
+        float s[4];
+        bool used[4] = {};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int e = lane + 32 * j;
+            p[j]        = probs[static_cast<std::int64_t>(token) * 128 + e];
+            s[j]        = p[j] + bias[e];
+        }
+        float sum = 0.0f;
+        int sel_ids[8];
+        float sel_p[8];
+        for (int i = 0; i < 8; ++i) {
+            float best_s = -CUDART_INF_F;
+            int best_e   = 128;
+            float best_p = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int e = lane + 32 * j;
+                if (!used[j] && (s[j] > best_s || (s[j] == best_s && e < best_e))) {
+                    best_s = s[j];
+                    best_e = e;
+                    best_p = p[j];
+                }
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const float os = __shfl_xor_sync(0xffffffffu, best_s, off);
+                const int oe   = __shfl_xor_sync(0xffffffffu, best_e, off);
+                const float op = __shfl_xor_sync(0xffffffffu, best_p, off);
+                if (os > best_s || (os == best_s && oe < best_e)) {
+                    best_s = os;
+                    best_e = oe;
+                    best_p = op;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (lane + 32 * j == best_e) used[j] = true;
+            }
+            sel_ids[i] = best_e;
+            sel_p[i]   = best_p;
+            sum += best_p;
+        }
+        if (lane == 0) {
+            const float inv = 8.0f / (sum + 1e-20f);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int assignment   = token * 8 + i;
+                ids[assignment]        = sel_ids[i];
+                alpha[assignment]      = sel_p[i] * inv;
+                local_rank[assignment] = atomicAdd(&counts[sel_ids[i]], 1);
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid < 128) scan[tid] = counts[tid];
+    __syncthreads();
+    for (int offset = 1; offset < 128; offset <<= 1) {
+        const int add = (tid < 128 && tid >= offset) ? scan[tid - offset] : 0;
+        __syncthreads();
+        if (tid < 128) scan[tid] += add;
+        __syncthreads();
+    }
+    if (tid < 128) {
+        const int base      = tid == 0 ? 0 : scan[tid - 1];
+        expert_base[tid]    = base;
+        expert_offsets[tid] = base;
+        if (tid == 127) expert_offsets[128] = scan[127];
+    }
+    __syncthreads();
+
+    const int jobs = tid < 128 ? (counts[tid] + ExpertBN - 1) / ExpertBN : 0;
+    if (tid < 128) scan[tid] = jobs;
+    __syncthreads();
+    for (int offset = 1; offset < 128; offset <<= 1) {
+        const int add = (tid < 128 && tid >= offset) ? scan[tid - offset] : 0;
+        __syncthreads();
+        if (tid < 128) scan[tid] += add;
+        __syncthreads();
+    }
+    if (tid < 128) {
+        const int job_begin = tid == 0 ? 0 : scan[tid - 1];
+        for (int j = 0; j < jobs; ++j) {
+            route_job_experts[job_begin + j] = tid;
+            route_job_columns[job_begin + j] = j * ExpertBN;
+        }
+        if (tid == 127) route_job_count[0] = scan[127];
+    }
+    if (tid < tokens * 8) {
+        const int expert = ids[tid];
+        const int packed = expert_base[expert] + local_rank[tid];
+        packed_index[tid]    = packed;
+        packed_token[packed] = tid >> 3;
+    }
+}
+
 template <bool Q3, bool GateUp, int ExpertBN>
 __global__ __launch_bounds__(256, 2) void inkling2_moe_grouped_mma_kernel(
     const BF* __restrict__ x, const int* __restrict__ packed_token,
@@ -922,7 +1041,251 @@ __global__ void inkling2_moe_reduce_kernel(const BF* __restrict__ grouped_output
                          *reinterpret_cast<const unsigned*>(&r3)));
 }
 
-template <bool GateUp, int ExpertBN>
+template <bool Q3, bool GateUp>
+__global__ __launch_bounds__(128, 2) void inkling2_moe_grouped_verify_mma_kernel(
+    const BF* __restrict__ x, const int* __restrict__ packed_token,
+    const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
+    const int* __restrict__ route_job_columns, const int* __restrict__ route_job_count,
+    const std::uint8_t* __restrict__ codes, const std::uint16_t* __restrict__ scales,
+    BF* __restrict__ out) {
+    constexpr int BM               = 128;
+    constexpr int BN               = 8;
+    constexpr int BK               = Q3 ? 128 : 64;
+    constexpr int K                = GateUp ? 2304 : 1152;
+    constexpr int KTiles           = K / BK;
+    constexpr int GroupsTotal      = K / (Q3 ? 128 : 64);
+    constexpr int CodeBytes        = Q3 ? 48 : 32;
+    constexpr int RowBlocks        = 18;
+    constexpr int StageChunks      = BK / 8; // 16 (Q3) or 8 (Q4)
+    constexpr int StageItems       = BN * StageChunks;
+    constexpr int CodeChunksPerRow = CodeBytes / 16; // 3 (Q3) or 2 (Q4)
+
+    __shared__ __align__(16) BF As[BM * BK];
+    __shared__ __align__(16) BF Bs[BN * BK];
+    __shared__ __align__(16) std::uint8_t Cr[BM * CodeBytes];
+    __shared__ __align__(16) std::uint16_t Sr[BM];
+
+    const int tid      = static_cast<int>(threadIdx.x);
+    const int warp     = tid >> 5;
+    const int lane     = tid & 31;
+    const int a_mat    = lane >> 3;
+    const int a_rin    = lane & 7;
+    const int a_rowoff = a_rin + ((a_mat & 1) << 3);
+    const int a_coloff = (a_mat >> 1) << 3;
+    const int b_rin    = lane & 7;
+    const int b_koff   = ((lane >> 3) & 1) << 3;
+    const int gid      = lane >> 2;
+    const int lid      = lane & 3;
+
+    const int total_work = route_job_count[0] * RowBlocks;
+    for (int work = static_cast<int>(blockIdx.x); work < total_work;
+         work += static_cast<int>(gridDim.x)) {
+        const int route_job   = work / RowBlocks;
+        const int row_block   = work - route_job * RowBlocks;
+        const int expert      = route_job_experts[route_job];
+        const int begin       = expert_offsets[expert];
+        const int count       = expert_offsets[expert + 1] - begin;
+        const int column_base = route_job_columns[route_job];
+        const int cols        = count - column_base < BN ? count - column_base : BN;
+
+        const int b_col    = tid / StageChunks;
+        const int b_k8     = tid - b_col * StageChunks;
+        const int b_swz    = Q3 ? moe_swz128(b_col, b_k8 * 8) : detail::gemm_swz64(b_col, b_k8 * 8);
+        const BF* src_row  = nullptr;
+        if (tid < StageItems) {
+            const int packed_col = b_col < cols ? (begin + column_base + b_col) : begin;
+            const int src_col    = GateUp ? packed_token[packed_col] : packed_col;
+            src_row              = x + static_cast<std::int64_t>(src_col) * K;
+        }
+
+        auto global_row = [&](int local_row) {
+            if constexpr (GateUp) {
+                const int warp_idx = local_row >> 5;
+                const int is_up    = (local_row >> 4) & 1;
+                const int logical  = row_block * 64 + warp_idx * 16 + (local_row & 15);
+                return expert * 2304 + logical + (is_up ? 1152 : 0);
+            } else {
+                return expert * 2304 + row_block * 128 + local_row;
+            }
+        };
+
+        float acc[2][4] = {};
+
+        for (int kt = 0; kt < KTiles; ++kt) {
+            const int k0 = kt * BK;
+            if (tid < StageItems) {
+                cp_async_zfill<16, Cache::cg>(&Bs[b_col * BK + b_swz], src_row + k0 + b_k8 * 8,
+                                              b_col < cols ? 16 : 0);
+            }
+#pragma unroll
+            for (int item = tid; item < BM * CodeChunksPerRow; item += 128) {
+                const int row         = item / CodeChunksPerRow;
+                const int chunk       = item - row * CodeChunksPerRow;
+                const std::int64_t gi = static_cast<std::int64_t>(global_row(row)) * GroupsTotal + kt;
+                cp_async<16, Cache::cg>(&Cr[row * CodeBytes + chunk * 16],
+                                        &codes[gi * CodeBytes + chunk * 16]);
+            }
+            Sr[tid] = scales[static_cast<std::int64_t>(global_row(tid)) * GroupsTotal + kt];
+            cp_commit();
+            cp_wait<0>();
+            __syncthreads();
+
+            if constexpr (Q3) {
+                const int half  = lane >> 4;
+                const int local = lane & 15;
+                const int byte0 = 3 * local;
+                for (int row_pair = warp * 2; row_pair < BM; row_pair += 8) {
+                    const int row            = row_pair + half;
+                    const float scale        = __half2float(__ushort_as_half(Sr[row]));
+                    const std::uint8_t* gc   = &Cr[row * 48];
+                    const std::uint32_t word = static_cast<std::uint32_t>(gc[byte0]) |
+                                               (static_cast<std::uint32_t>(gc[byte0 + 1]) << 8) |
+                                               (static_cast<std::uint32_t>(gc[byte0 + 2]) << 16);
+                    float vals[8];
+#pragma unroll
+                    for (int c = 0; c < 8; ++c) {
+                        vals[c] =
+                            static_cast<float>(detail::q3_signed_code((word >> (3 * c)) & 0x7u)) *
+                            scale;
+                    }
+                    const __nv_bfloat162 p0 = __floats2bfloat162_rn(vals[0], vals[1]);
+                    const __nv_bfloat162 p1 = __floats2bfloat162_rn(vals[2], vals[3]);
+                    const __nv_bfloat162 p2 = __floats2bfloat162_rn(vals[4], vals[5]);
+                    const __nv_bfloat162 p3 = __floats2bfloat162_rn(vals[6], vals[7]);
+                    store_vec(&As[row * 128 + moe_swz128(row, 8 * local)],
+                              make_uint4(*reinterpret_cast<const unsigned*>(&p0),
+                                         *reinterpret_cast<const unsigned*>(&p1),
+                                         *reinterpret_cast<const unsigned*>(&p2),
+                                         *reinterpret_cast<const unsigned*>(&p3)));
+                }
+            } else {
+#pragma unroll
+                for (int pass = 0; pass < 8; ++pass) {
+                    const int row            = pass * 16 + (tid >> 3);
+                    const int local          = tid & 7;
+                    const float scale        = __half2float(__ushort_as_half(Sr[row]));
+                    const std::uint32_t word = *reinterpret_cast<const std::uint32_t*>(
+                        &Cr[row * 32 + local * 4]);
+                    float vals[8];
+#pragma unroll
+                    for (int c = 0; c < 8; ++c) {
+                        const int nib = static_cast<int>((word >> (4 * c)) & 0xfu);
+                        vals[c]       = static_cast<float>((nib ^ 8) - 8) * scale;
+                    }
+                    const __nv_bfloat162 p0 = __floats2bfloat162_rn(vals[0], vals[1]);
+                    const __nv_bfloat162 p1 = __floats2bfloat162_rn(vals[2], vals[3]);
+                    const __nv_bfloat162 p2 = __floats2bfloat162_rn(vals[4], vals[5]);
+                    const __nv_bfloat162 p3 = __floats2bfloat162_rn(vals[6], vals[7]);
+                    store_vec(&As[row * 64 + detail::gemm_swz64(row, 8 * local)],
+                              make_uint4(*reinterpret_cast<const unsigned*>(&p0),
+                                         *reinterpret_cast<const unsigned*>(&p1),
+                                         *reinterpret_cast<const unsigned*>(&p2),
+                                         *reinterpret_cast<const unsigned*>(&p3)));
+                }
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (int k_step = 0; k_step < BK; k_step += 16) {
+                unsigned af[2][4];
+                unsigned bf[2];
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi) {
+                    const int arow  = warp * 32 + mi * 16 + a_rowoff;
+                    const int acol  = k_step + a_coloff;
+                    const int swz_a = Q3 ? moe_swz128(arow, acol) : detail::gemm_swz64(arow, acol);
+                    ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
+                                smem_addr(&As[arow * BK + swz_a]));
+                }
+                const int brow  = b_rin;
+                const int bcol  = k_step + b_koff;
+                const int swz_b = Q3 ? moe_swz128(brow, bcol) : detail::gemm_swz64(brow, bcol);
+                ldmatrix_x2(bf[0], bf[1], smem_addr(&Bs[brow * BK + swz_b]));
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi) {
+                    mma_bf16(acc[mi][0], acc[mi][1], acc[mi][2], acc[mi][3], af[mi][0], af[mi][1],
+                             af[mi][2], af[mi][3], bf[0], bf[1]);
+                }
+            }
+            __syncthreads();
+        }
+
+        const int c0 = 2 * lid;
+        const int c1 = c0 + 1;
+        const int p0 = begin + column_base + c0;
+        const int p1 = begin + column_base + c1;
+        if constexpr (GateUp) {
+            const int r0 = row_block * 64 + warp * 16 + gid;
+            const int r1 = r0 + 8;
+            if (c0 < cols) {
+                out[static_cast<std::int64_t>(p0) * 1152 + r0] =
+                    __float2bfloat16_rn(moe_situ(acc[0][0], acc[1][0]));
+                out[static_cast<std::int64_t>(p0) * 1152 + r1] =
+                    __float2bfloat16_rn(moe_situ(acc[0][2], acc[1][2]));
+            }
+            if (c1 < cols) {
+                out[static_cast<std::int64_t>(p1) * 1152 + r0] =
+                    __float2bfloat16_rn(moe_situ(acc[0][1], acc[1][1]));
+                out[static_cast<std::int64_t>(p1) * 1152 + r1] =
+                    __float2bfloat16_rn(moe_situ(acc[0][3], acc[1][3]));
+            }
+        } else {
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                const int r0 = row_block * 128 + warp * 32 + mi * 16 + gid;
+                const int r1 = r0 + 8;
+                if (c0 < cols) {
+                    out[static_cast<std::int64_t>(p0) * 2304 + r0] = __float2bfloat16_rn(acc[mi][0]);
+                    out[static_cast<std::int64_t>(p0) * 2304 + r1] = __float2bfloat16_rn(acc[mi][2]);
+                }
+                if (c1 < cols) {
+                    out[static_cast<std::int64_t>(p1) * 2304 + r0] = __float2bfloat16_rn(acc[mi][1]);
+                    out[static_cast<std::int64_t>(p1) * 2304 + r1] = __float2bfloat16_rn(acc[mi][3]);
+                }
+            }
+        }
+    }
+}
+
+__global__ void inkling2_moe_reduce_post_sconv_kernel(
+    const BF* __restrict__ grouped_output, const int* __restrict__ packed_index,
+    const float* __restrict__ alpha, const float* __restrict__ conv_weight,
+    const BF* __restrict__ old, BF* __restrict__ state, const BF* __restrict__ residual,
+    BF* __restrict__ out, BF* __restrict__ moe_trace, int tokens) {
+    const int c = static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x);
+    if (c >= 2304) return;
+    const float* wc = conv_weight + 4 * c;
+    const float4 w  = make_float4(wc[0], wc[1], wc[2], wc[3]);
+    float u3        = __bfloat162float(old[c]);
+    float u2        = __bfloat162float(old[2304 + c]);
+    float u1        = __bfloat162float(old[4608 + c]);
+    constexpr float kConvScale = 0.44721359549995794f;
+    for (int t = 0; t < tokens; ++t) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int p   = packed_index[t * 8 + r];
+            const float a = alpha[t * 8 + r];
+            sum = fmaf(a, __bfloat162float(grouped_output[static_cast<std::int64_t>(p) * 2304 + c]),
+                       sum);
+        }
+        const BF moe_bf = __float2bfloat16_rn(sum);
+        const auto idx  = static_cast<std::int64_t>(t) * 2304 + c;
+        if (moe_trace) moe_trace[idx] = moe_bf;
+        const float u0 = __bfloat162float(moe_bf);
+        float res      = (u0 + w.x * u3 + w.y * u2 + w.z * u1 + w.w * u0) * kConvScale;
+        if (residual) res += __bfloat162float(residual[idx]);
+        out[idx] = __float2bfloat16_rn(res);
+        u3       = u2;
+        u2       = u1;
+        u1       = u0;
+    }
+    state[c]        = __float2bfloat16_rn(u3);
+    state[2304 + c] = __float2bfloat16_rn(u2);
+    state[4608 + c] = __float2bfloat16_rn(u1);
+}
+
+template <bool IsQ3, bool GateUp, int ExpertBN>
 __global__ __launch_bounds__(256, 2) void inkling2_moe_grouped_a8_mma_kernel(
     const std::int8_t* __restrict__ qx, const float* __restrict__ x_scale, int x_stride_tokens,
     const int* __restrict__ packed_token, const int* __restrict__ expert_offsets,
@@ -930,78 +1293,135 @@ __global__ __launch_bounds__(256, 2) void inkling2_moe_grouped_a8_mma_kernel(
     const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
     const std::uint16_t* __restrict__ scales, BF* __restrict__ out);
 
-void moe_prefill_launch(const void* x, const Inkling2MoeWeights& w, void* out, int tokens,
-                        const Inkling2MoePrefillWorkspace& ws, cudaStream_t s) {
+static void moe_grouped_launch(const void* x, const Inkling2MoeWeights& w, int tokens,
+                               const Inkling2MoePrefillWorkspace& ws, cudaStream_t s) {
     const auto* x_bf = static_cast<const BF*>(x);
-    auto* out_bf = static_cast<BF*>(out);
-    auto* act_bf = static_cast<BF*>(ws.routed_activation);
+    auto* act_bf     = static_cast<BF*>(ws.routed_activation);
     auto* grouped_bf = static_cast<BF*>(ws.grouped_output);
-    const int route_tiles = (tokens + 7) / 8;
-
-    inkling2_moe_router_mma_kernel<<<dim3(128 / 16, (tokens + 63) / 64), 256, 0, s>>>(
-        x_bf, static_cast<const BF*>(w.router.qdata), ws.router_probs, tokens);
-    inkling2_moe_select_count_kernel<<<route_tiles, 256, 0, s>>>(
-        ws.router_probs, static_cast<const float*>(w.exp_probs_bias.qdata), ws.token_ids,
-        ws.token_alpha, ws.local_rank, ws.tile_counts, tokens);
     const auto* gu_codes  = static_cast<const std::uint8_t*>(w.routed_gate_up.qdata);
     const auto* gu_scales = static_cast<const std::uint16_t*>(w.routed_gate_up.scales);
     const auto* dn_codes  = static_cast<const std::uint8_t*>(w.routed_down.qdata);
     const auto* dn_scales = static_cast<const std::uint16_t*>(w.routed_down.scales);
 
-    const auto dispatch_bn = [&]<int ExpertBN>() {
-        inkling2_moe_scan_kernel<ExpertBN><<<1, 128, 0, s>>>(
-            ws.tile_counts, ws.tile_bases, ws.expert_offsets, ws.route_job_experts,
-            ws.route_job_columns, ws.route_job_count, route_tiles);
-        inkling2_moe_index_kernel<<<(tokens * 8 + 255) / 256, 256, 0, s>>>(
-            ws.token_ids, ws.local_rank, ws.packed_index, ws.tile_bases, ws.packed_token,
-            tokens * 8);
-        const int max_jobs    = (tokens * 8) / ExpertBN + 128;
-        const int grid_blocks = max_jobs * 36 < 2048 ? max_jobs * 36 : 2048;
-        if (w.routed_gate_up.qtype == QType::Q3G128_F16S) {
-            if (tokens >= 64) {
-                Tensor x_t(const_cast<void*>(x), DType::BF16, {2304, tokens});
-                detail::A8G64Activation x_a8{
-                    Tensor(ws.x_a8_q, DType::I8, {2304, tokens}),
-                    Tensor(ws.x_a8_scale, DType::FP32, {tokens, 36})};
-                detail::a8_g64_quantize(x_t, x_a8, s);
-                inkling2_moe_grouped_a8_mma_kernel<true, ExpertBN><<<grid_blocks, 256, 0, s>>>(
-                    ws.x_a8_q, ws.x_a8_scale, tokens, ws.packed_token, ws.expert_offsets,
-                    ws.route_job_experts, ws.route_job_columns, ws.route_job_count, gu_codes,
-                    gu_scales, act_bf);
+    inkling2_moe_router_mma_kernel<<<dim3(128 / 16, (tokens + 63) / 64), 256, 0, s>>>(
+        x_bf, static_cast<const BF*>(w.router.qdata), ws.router_probs, tokens);
 
-                Tensor act_t(ws.routed_activation, DType::BF16, {1152, tokens * 8});
-                detail::A8G64Activation act_a8{
-                    Tensor(ws.act_a8_q, DType::I8, {1152, tokens * 8}),
-                    Tensor(ws.act_a8_scale, DType::FP32, {tokens * 8, 18})};
-                detail::a8_g64_quantize(act_t, act_a8, s);
-                inkling2_moe_grouped_a8_mma_kernel<false, ExpertBN><<<grid_blocks, 256, 0, s>>>(
-                    ws.act_a8_q, ws.act_a8_scale, tokens * 8, ws.packed_token, ws.expert_offsets,
-                    ws.route_job_experts, ws.route_job_columns, ws.route_job_count, dn_codes,
-                    dn_scales, grouped_bf);
-            } else {
-                inkling2_moe_grouped_mma_kernel<true, true, ExpertBN><<<grid_blocks, 256, 0, s>>>(
-                    x_bf, ws.packed_token, ws.expert_offsets, ws.route_job_experts,
-                    ws.route_job_columns, ws.route_job_count, gu_codes, gu_scales, act_bf);
-                inkling2_moe_grouped_mma_kernel<true, false, ExpertBN><<<grid_blocks, 256, 0, s>>>(
-                    act_bf, ws.packed_token, ws.expert_offsets, ws.route_job_experts,
-                    ws.route_job_columns, ws.route_job_count, dn_codes, dn_scales, grouped_bf);
-            }
-        } else {
-            inkling2_moe_grouped_mma_kernel<false, true, ExpertBN><<<grid_blocks, 256, 0, s>>>(
+    if (tokens <= 16) {
+        inkling2_moe_small_pack_kernel<kInkling2MoeVerifyExpertBN><<<1, 256, 0, s>>>(
+            ws.router_probs, static_cast<const float*>(w.exp_probs_bias.qdata), ws.token_ids,
+            ws.token_alpha, ws.local_rank, ws.packed_index, ws.packed_token, ws.expert_offsets,
+            ws.route_job_experts, ws.route_job_columns, ws.route_job_count, tokens);
+        const int max_jobs    = (tokens * 8) / kInkling2MoeVerifyExpertBN + 128;
+        const int grid_blocks = max_jobs * 18 < 2048 ? max_jobs * 18 : 2048;
+        if (w.routed_gate_up.qtype == QType::Q3G128_F16S) {
+            inkling2_moe_grouped_verify_mma_kernel<true, true><<<grid_blocks, 128, 0, s>>>(
                 x_bf, ws.packed_token, ws.expert_offsets, ws.route_job_experts,
                 ws.route_job_columns, ws.route_job_count, gu_codes, gu_scales, act_bf);
-            inkling2_moe_grouped_mma_kernel<false, false, ExpertBN><<<grid_blocks, 256, 0, s>>>(
+            inkling2_moe_grouped_verify_mma_kernel<true, false><<<grid_blocks, 128, 0, s>>>(
+                act_bf, ws.packed_token, ws.expert_offsets, ws.route_job_experts,
+                ws.route_job_columns, ws.route_job_count, dn_codes, dn_scales, grouped_bf);
+        } else {
+            inkling2_moe_grouped_verify_mma_kernel<false, true><<<grid_blocks, 128, 0, s>>>(
+                x_bf, ws.packed_token, ws.expert_offsets, ws.route_job_experts,
+                ws.route_job_columns, ws.route_job_count, gu_codes, gu_scales, act_bf);
+            inkling2_moe_grouped_verify_mma_kernel<false, false><<<grid_blocks, 128, 0, s>>>(
                 act_bf, ws.packed_token, ws.expert_offsets, ws.route_job_experts,
                 ws.route_job_columns, ws.route_job_count, dn_codes, dn_scales, grouped_bf);
         }
-    };
-    if (tokens <= 16) {
-        dispatch_bn.template operator()<kInkling2MoeSmallExpertBN>();
-    } else {
-        dispatch_bn.template operator()<kInkling2MoeExpertBN>();
+        return;
     }
-    inkling2_moe_reduce_kernel<<<tokens, 288, 0, s>>>(grouped_bf, ws.packed_index, ws.token_alpha,
-                                                      out_bf);
+
+    const int route_tiles = (tokens + 7) / 8;
+    inkling2_moe_select_count_kernel<<<route_tiles, 256, 0, s>>>(
+        ws.router_probs, static_cast<const float*>(w.exp_probs_bias.qdata), ws.token_ids,
+        ws.token_alpha, ws.local_rank, ws.tile_counts, tokens);
+    inkling2_moe_scan_kernel<kInkling2MoeExpertBN><<<1, 128, 0, s>>>(
+        ws.tile_counts, ws.tile_bases, ws.expert_offsets, ws.route_job_experts,
+        ws.route_job_columns, ws.route_job_count, route_tiles);
+    inkling2_moe_index_kernel<<<(tokens * 8 + 255) / 256, 256, 0, s>>>(
+        ws.token_ids, ws.local_rank, ws.packed_index, ws.tile_bases, ws.packed_token, tokens * 8);
+    const int max_jobs    = (tokens * 8) / kInkling2MoeExpertBN + 128;
+    const int grid_blocks = max_jobs * 36 < 2048 ? max_jobs * 36 : 2048;
+    if (tokens >= 64) {
+        const bool is_q3 = (w.routed_gate_up.qtype == QType::Q3G128_F16S);
+        Tensor x_t(const_cast<void*>(x), DType::BF16, {2304, tokens});
+        detail::A8G64Activation x_a8{
+            Tensor(ws.x_a8_q, DType::I8, {2304, tokens}),
+            Tensor(ws.x_a8_scale, DType::FP32, {tokens, 36})};
+        detail::a8_g64_quantize(x_t, x_a8, s);
+        if (is_q3) {
+            inkling2_moe_grouped_a8_mma_kernel<true, true, kInkling2MoeExpertBN>
+                <<<grid_blocks, 256, 0, s>>>(ws.x_a8_q, ws.x_a8_scale, tokens, ws.packed_token,
+                                             ws.expert_offsets, ws.route_job_experts,
+                                             ws.route_job_columns, ws.route_job_count, gu_codes,
+                                             gu_scales, act_bf);
+        } else {
+            inkling2_moe_grouped_a8_mma_kernel<false, true, kInkling2MoeExpertBN>
+                <<<grid_blocks, 256, 0, s>>>(ws.x_a8_q, ws.x_a8_scale, tokens, ws.packed_token,
+                                             ws.expert_offsets, ws.route_job_experts,
+                                             ws.route_job_columns, ws.route_job_count, gu_codes,
+                                             gu_scales, act_bf);
+        }
+
+        Tensor act_t(ws.routed_activation, DType::BF16, {1152, tokens * 8});
+        detail::A8G64Activation act_a8{
+            Tensor(ws.act_a8_q, DType::I8, {1152, tokens * 8}),
+            Tensor(ws.act_a8_scale, DType::FP32, {tokens * 8, 18})};
+        detail::a8_g64_quantize(act_t, act_a8, s);
+        if (is_q3) {
+            inkling2_moe_grouped_a8_mma_kernel<true, false, kInkling2MoeExpertBN>
+                <<<grid_blocks, 256, 0, s>>>(ws.act_a8_q, ws.act_a8_scale, tokens * 8,
+                                             ws.packed_token, ws.expert_offsets,
+                                             ws.route_job_experts, ws.route_job_columns,
+                                             ws.route_job_count, dn_codes, dn_scales, grouped_bf);
+        } else {
+            inkling2_moe_grouped_a8_mma_kernel<false, false, kInkling2MoeExpertBN>
+                <<<grid_blocks, 256, 0, s>>>(ws.act_a8_q, ws.act_a8_scale, tokens * 8,
+                                             ws.packed_token, ws.expert_offsets,
+                                             ws.route_job_experts, ws.route_job_columns,
+                                             ws.route_job_count, dn_codes, dn_scales, grouped_bf);
+        }
+    } else if (w.routed_gate_up.qtype == QType::Q3G128_F16S) {
+        inkling2_moe_grouped_mma_kernel<true, true, kInkling2MoeExpertBN>
+            <<<grid_blocks, 256, 0, s>>>(x_bf, ws.packed_token, ws.expert_offsets,
+                                         ws.route_job_experts, ws.route_job_columns,
+                                         ws.route_job_count, gu_codes, gu_scales, act_bf);
+        inkling2_moe_grouped_mma_kernel<true, false, kInkling2MoeExpertBN>
+            <<<grid_blocks, 256, 0, s>>>(act_bf, ws.packed_token, ws.expert_offsets,
+                                         ws.route_job_experts, ws.route_job_columns,
+                                         ws.route_job_count, dn_codes, dn_scales, grouped_bf);
+    } else {
+        inkling2_moe_grouped_mma_kernel<false, true, kInkling2MoeExpertBN>
+            <<<grid_blocks, 256, 0, s>>>(x_bf, ws.packed_token, ws.expert_offsets,
+                                         ws.route_job_experts, ws.route_job_columns,
+                                         ws.route_job_count, gu_codes, gu_scales, act_bf);
+        inkling2_moe_grouped_mma_kernel<false, false, kInkling2MoeExpertBN>
+            <<<grid_blocks, 256, 0, s>>>(act_bf, ws.packed_token, ws.expert_offsets,
+                                         ws.route_job_experts, ws.route_job_columns,
+                                         ws.route_job_count, dn_codes, dn_scales, grouped_bf);
+    }
+}
+
+void moe_prefill_launch(const void* x, const Inkling2MoeWeights& w, void* out, int tokens,
+                        const Inkling2MoePrefillWorkspace& ws, cudaStream_t s) {
+    moe_grouped_launch(x, w, tokens, ws, s);
+    inkling2_moe_reduce_kernel<<<tokens, 288, 0, s>>>(
+        static_cast<const BF*>(ws.grouped_output), ws.packed_index, ws.token_alpha,
+        static_cast<BF*>(out));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void moe_prefill_post_sconv_launch(const void* x, const Inkling2MoeWeights& w,
+                                   const Tensor& post_conv_weight, const Tensor& state_in,
+                                   Tensor& state_out, const Tensor& residual_in, void* out,
+                                   void* moe_trace, int tokens,
+                                   const Inkling2MoePrefillWorkspace& ws, cudaStream_t s) {
+    moe_grouped_launch(x, w, tokens, ws, s);
+    inkling2_moe_reduce_post_sconv_kernel<<<9, 256, 0, s>>>(
+        static_cast<const BF*>(ws.grouped_output), ws.packed_index, ws.token_alpha,
+        static_cast<const float*>(post_conv_weight.data), static_cast<const BF*>(state_in.data),
+        static_cast<BF*>(state_out.data), static_cast<const BF*>(residual_in.data),
+        static_cast<BF*>(out), static_cast<BF*>(moe_trace), tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1017,7 +1437,16 @@ __device__ __forceinline__ std::uint32_t moe_q3_window(std::uint32_t w0, std::ui
     return w2 >> 8;
 }
 
-template <bool GateUp, int ExpertBN>
+__device__ __forceinline__ void moe_q4_unpack8_s8(std::uint32_t word, unsigned& out0,
+                                                unsigned& out1) {
+    word ^= 0x88888888u;
+    const unsigned lo = word & 0x0f0f0f0fu;
+    const unsigned hi = (word >> 4) & 0x0f0f0f0fu;
+    out0              = (__byte_perm(lo, hi, 0x5140) + 0x78787878u) ^ 0x80808080u;
+    out1              = (__byte_perm(lo, hi, 0x7362) + 0x78787878u) ^ 0x80808080u;
+}
+
+template <bool IsQ3, bool GateUp, int ExpertBN>
 __global__ __launch_bounds__(256, 2) void inkling2_moe_grouped_a8_mma_kernel(
     const std::int8_t* __restrict__ qx, const float* __restrict__ x_scale, int x_stride_tokens,
     const int* __restrict__ packed_token, const int* __restrict__ expert_offsets,
@@ -1029,7 +1458,7 @@ __global__ __launch_bounds__(256, 2) void inkling2_moe_grouped_a8_mma_kernel(
     constexpr int BK              = 64;
     constexpr int K               = GateUp ? 2304 : 1152;
     constexpr int KTiles          = K / BK;
-    constexpr int GroupsTotal     = K / 128;
+    constexpr int GroupsTotal     = IsQ3 ? (K / 128) : (K / 64);
     constexpr int Stages          = 2;
     constexpr int RowBlocks       = 36;
     constexpr int kFloatMagic     = 0x4B400000;
@@ -1097,37 +1526,62 @@ __global__ __launch_bounds__(256, 2) void inkling2_moe_grouped_a8_mma_kernel(
             }
         }
         const std::uint8_t* my_codes =
-            codes + static_cast<std::int64_t>(my_global_row) * GroupsTotal * 48;
+            codes + static_cast<std::int64_t>(my_global_row) * GroupsTotal * (IsQ3 ? 48 : 32);
         const std::uint16_t* my_scales =
             scales + static_cast<std::int64_t>(my_global_row) * GroupsTotal;
 
-        std::uint32_t raw0 = 0, raw1 = 0, raw2 = 0;
+        std::uint32_t raw0 = 0, raw1 = 0, raw2 = 0, raw3 = 0;
         std::uint16_t raw_scale = 0;
-        auto load_q3            = [&](int kt) {
+        auto load_q             = [&](int kt) {
             if (tid < 128) {
-                const std::uint8_t* ptr =
-                    my_codes + static_cast<std::int64_t>(kt >> 1) * 48 + (kt & 1) * 24 +
-                    my_half * 12;
-                asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
-                             : "=r"(raw0)
-                             : "l"(ptr));
-                asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
-                             : "=r"(raw1)
-                             : "l"(ptr + 4));
-                asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
-                             : "=r"(raw2)
-                             : "l"(ptr + 8));
-                if (my_half == 0) raw_scale = __ldg(my_scales + (kt >> 1));
+                if constexpr (IsQ3) {
+                    const std::uint8_t* ptr = my_codes +
+                                              static_cast<std::int64_t>(kt >> 1) * 48 +
+                                              (kt & 1) * 24 + my_half * 12;
+                    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
+                                 : "=r"(raw0)
+                                 : "l"(ptr));
+                    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
+                                 : "=r"(raw1)
+                                 : "l"(ptr + 4));
+                    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
+                                 : "=r"(raw2)
+                                 : "l"(ptr + 8));
+                    if (my_half == 0) raw_scale = __ldg(my_scales + (kt >> 1));
+                } else {
+                    const std::uint8_t* ptr =
+                        my_codes + static_cast<std::int64_t>(kt) * 32 + my_half * 16;
+                    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
+                                 : "=r"(raw0)
+                                 : "l"(ptr));
+                    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
+                                 : "=r"(raw1)
+                                 : "l"(ptr + 4));
+                    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
+                                 : "=r"(raw2)
+                                 : "l"(ptr + 8));
+                    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n"
+                                 : "=r"(raw3)
+                                 : "l"(ptr + 12));
+                    if (my_half == 0) raw_scale = __ldg(my_scales + kt);
+                }
             }
         };
-        auto decode_q3 = [&](Stage& s) {
+        auto decode_q = [&](Stage& s) {
             if (tid < 128) {
                 unsigned out[8];
+                if constexpr (IsQ3) {
 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const std::uint32_t win = moe_q3_window(raw0, raw1, raw2, j);
-                    out[2 * j]              = detail::q3_a8::spread4(win & 0x0fffu);
-                    out[2 * j + 1]          = detail::q3_a8::spread4(win >> 12);
+                    for (int j = 0; j < 4; ++j) {
+                        const std::uint32_t win = moe_q3_window(raw0, raw1, raw2, j);
+                        out[2 * j]              = detail::q3_a8::spread4(win & 0x0fffu);
+                        out[2 * j + 1]          = detail::q3_a8::spread4(win >> 12);
+                    }
+                } else {
+                    moe_q4_unpack8_s8(raw0, out[0], out[1]);
+                    moe_q4_unpack8_s8(raw1, out[2], out[3]);
+                    moe_q4_unpack8_s8(raw2, out[4], out[5]);
+                    moe_q4_unpack8_s8(raw3, out[6], out[7]);
                 }
                 *reinterpret_cast<uint4*>(s.a + moe_a8_swz(my_row, 2 * my_half)) =
                     make_uint4(out[0], out[1], out[2], out[3]);
@@ -1155,7 +1609,7 @@ __global__ __launch_bounds__(256, 2) void inkling2_moe_grouped_a8_mma_kernel(
             }
         };
 
-        load_q3(0);
+        load_q(0);
 #pragma unroll
         for (int stage = 0; stage < Stages; ++stage) {
             if (stage < KTiles) stage_x(stage, stage);
@@ -1167,8 +1621,8 @@ __global__ __launch_bounds__(256, 2) void inkling2_moe_grouped_a8_mma_kernel(
             const int stage = kt & 1;
             cp_wait<Stages - 1>();
             __syncthreads();
-            decode_q3(stages[stage]);
-            if (kt + 1 < KTiles) load_q3(kt + 1);
+            decode_q(stages[stage]);
+            if (kt + 1 < KTiles) load_q(kt + 1);
             __syncthreads();
 
             int g[2][4];

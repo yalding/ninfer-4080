@@ -111,7 +111,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext&, const En
 std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& model,
                                                           SequencePlan&& plan,
                                                           DeviceContext& device,
-                                                          const StartupObserver&) {
+                                                          const StartupObserver& observer) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     auto options = std::move(plan.options);
     if (options.speculative.backend == SpeculativeBackend::DFlash2) {
@@ -129,7 +129,7 @@ std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& mod
                 "Inkling-2-Mini --lm-head-draft requires an artifact with mtp/draft_head");
         if (options.speculative.draft_tokens == 0) options.speculative.draft_tokens = 2;
     }
-    return std::make_unique<Program>(model.impl_->view, device, std::move(options));
+    return std::make_unique<Program>(model.impl_->view, device, std::move(options), &observer);
 }
 
 } // namespace ninfer::targets::inkling2_mini

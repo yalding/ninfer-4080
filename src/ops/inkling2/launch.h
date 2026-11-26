@@ -10,10 +10,15 @@ struct Inkling2Branches {
 };
 void inkling2_proj_launch(const Tensor&, const Tensor&, Tensor&, cudaStream_t);
 void inkling2_sconv_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&, Tensor&,
-                          const Tensor&, Tensor&, cudaStream_t);
+                          const Tensor&, Tensor&, const Tensor&, cudaStream_t);
 void inkling2_sconv_kv_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&, Tensor&,
                              Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
-                             Tensor&, Tensor&, cudaStream_t);
+                             Tensor&, Tensor&, const Tensor&, const Tensor&, cudaStream_t);
+void inkling2_sconv_batched_launch(const Tensor&, const Tensor&, Tensor&, int, int, const Tensor&,
+                                   const Tensor&, Tensor&, cudaStream_t);
+void inkling2_sconv_kv_batched_launch(const Tensor&, const Tensor&, const Tensor&, Tensor&,
+                                      const Tensor&, const Tensor&, const Tensor&, Tensor&,
+                                      Tensor&, int, const Tensor&, cudaStream_t);
 void inkling2_mix_launch(Inkling2Branches, const Tensor&, Tensor&, cudaStream_t);
 void inkling2_control_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                             Inkling2Branches, Tensor&, float*, float*, float*, cudaStream_t);
@@ -27,6 +32,13 @@ void inkling2_dspark_rmsnorm_rope_launch(const Tensor&, const Tensor&, const Ten
 void inkling2_dspark_rnn_step_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                      const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                      Tensor&, Tensor&, void*, float*, cudaStream_t);
+void inkling2_dspark_fold_head_launch(const Weight&, const Tensor&, const Tensor&, Tensor&,
+                                      Tensor&, Tensor&, cudaStream_t);
+void inkling2_dspark_rnn_step_folded_launch(const Tensor&, const Tensor&, const Tensor&,
+                                            const Tensor&, const Tensor&, const Tensor&,
+                                            const Tensor&, const Tensor&, const Tensor&,
+                                            const Tensor&, int, Tensor&, Tensor&, void*, float*,
+                                            float*, float*, int*, cudaStream_t);
 void inkling2_dspark_commit_conv_launch(const Tensor&, const Tensor&, Tensor&, int, int,
                                         cudaStream_t);
 void inkling2_dflash2_kv_materialize_launch(

@@ -206,6 +206,10 @@ Both `groupwise-int` and `nvfp4` artifacts use the same Engine route, including 
 concurrent requests, sampling penalties, and prefix reuse. An artifact without the companion
 weights reports a missing DFlash2 capability when selected.
 
+On Inkling-2-Mini, `--spec-adaptive` can shorten or pause drafting based on recent acceptance.
+`--draft-tokens` sets the maximum depth. With `--spec mtp`, add `--ngram off` to enable adaptation
+because the default n-gram chain uses a fixed depth.
+
 Only one speculative backend can be enabled per Engine. The published [performance results](performance.md)
 use MTP with three draft tokens and DFlash with seven draft tokens (block length eight), both with
 the optimized proposal head. DFlash accepts one to fifteen draft tokens; seven forms the measured
@@ -225,6 +229,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8` | KV-cache storage; rotated and E8-lattice modes trade key/value precision for capacity; `nvfp4` and `k8v4` are upstream sm_120a modes, not available on the RTX 4090 | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
+| `--spec-adaptive` | Adapt the Inkling-2-Mini draft depth from recent acceptance | off |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--ngram off\|chain` | extend MTP proposals with host n-gram drafts (MTP only) | `chain` |
 | `--ngram-max V` | n-gram verify window, `draft-tokens + 3 .. 15` | `15` |

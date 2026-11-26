@@ -1,5 +1,6 @@
 #include "targets/inkling2_mini/impl/state/state_image.h"
 #include "core/device.h"
+#include "core/startup.h"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -264,6 +265,35 @@ void qualify(KvCacheStorage storage) {
     state.reset(1, device.stream);
 }
 
+void qualify_pinned_slab_pool() {
+    DeviceContext device;
+    EngineOptions options;
+    options.max_context                          = 256;
+    options.max_concurrency                      = 1;
+    options.context_cache.device_state_slots     = 1;
+    options.context_cache.host_state_slots       = 1;
+    options.context_cache.host_kv_capacity_bytes = 2ULL * 1024 * 1024;
+    options.kv_cache                             = KvCacheStorage::Int8Group64;
+    bool saw_host_state_pin                      = false;
+    StartupObserver observer;
+    observer.callback = [&](const StartupEvent& ev) {
+        if (ev.phase == StartupPhase::HostStatePin && ev.status == StartupStatus::Complete) {
+            saw_host_state_pin = ev.current > 0 && ev.current == ev.total &&
+                                 ev.progress_unit == StartupProgressUnit::Bytes;
+        }
+    };
+    ik::StateImage state(options, 256, &observer);
+    require(saw_host_state_pin, "StateImage emits StartupPhase::HostStatePin");
+    state.prepare_append(0, 0, 16, device.stream);
+    state.commit_append(0, 16);
+    auto h1        = state.snapshot_to_host(0, device.stream);
+    const void* p1 = h1->fixed.data();
+    h1.reset();
+    auto h2        = state.snapshot_to_host(0, device.stream);
+    const void* p2 = h2->fixed.data();
+    require(p1 != nullptr && p1 == p2, "pre-pinned HostStateImage slab is reused without cudaMallocHost");
+}
+
 void qualify_dflash2() {
     DeviceContext device;
     EngineOptions options;
@@ -326,6 +356,7 @@ int main() {
         qualify(KvCacheStorage::Int8Group64);
         qualify(KvCacheStorage::RK4V4E8);
         qualify_dflash2();
+        qualify_pinned_slab_pool();
         EngineOptions options;
         options.max_context                      = 131072;
         options.kv_cache                         = KvCacheStorage::Int8Group64;

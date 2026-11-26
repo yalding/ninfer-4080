@@ -46,10 +46,13 @@ def _build_writer_specs(
     *,
     include_mtp: bool = False,
     include_draft_head: bool = False,
+    include_dflash2: bool = False,
 ) -> list[ArtifactResourceSpec | ArtifactTensorSpec]:
     specs: list[ArtifactResourceSpec | ArtifactTensorSpec] = []
     for item in inventory.object_specs(
-        include_mtp=include_mtp, include_draft_head=include_draft_head
+        include_mtp=include_mtp,
+        include_draft_head=include_draft_head,
+        include_dflash2=include_dflash2,
     ):
         if isinstance(item, inventory.ResourceSpec):
             specs.append(ArtifactResourceSpec(item.name, item.encoding, len(resources[item.name])))
@@ -126,6 +129,8 @@ def convert(
     device: str | torch.device = "cuda",
     mtp_path: str | Path | None = None,
     use_mtp: bool = True,
+    dflash2_dir: str | Path | None = None,
+    use_dflash2: bool = False,
     base_artifact_path: str | Path | None = None,
 ) -> Path:
     started = time.perf_counter()
@@ -136,17 +141,30 @@ def convert(
         if use_mtp
         else None
     )
+    resolved_dflash2 = (
+        source.resolve_dflash2_dir(dflash2_dir, allow_missing=(dflash2_dir is None))
+        if (use_dflash2 or dflash2_dir is not None)
+        else None
+    )
     include_mtp = resolved_mtp is not None
     include_draft_head = include_mtp
+    include_dflash2 = resolved_dflash2 is not None
     resources = source.load_frontend_resources(sources.model_dir)
     writer_specs = _build_writer_specs(
-        resources, include_mtp=include_mtp, include_draft_head=include_draft_head
+        resources,
+        include_mtp=include_mtp,
+        include_draft_head=include_draft_head,
+        include_dflash2=include_dflash2,
     )
     t_specs = inventory.tensor_specs(
-        include_mtp=include_mtp, include_draft_head=include_draft_head
+        include_mtp=include_mtp,
+        include_draft_head=include_draft_head,
+        include_dflash2=include_dflash2,
     )
     obj_specs = inventory.object_specs(
-        include_mtp=include_mtp, include_draft_head=include_draft_head
+        include_mtp=include_mtp,
+        include_draft_head=include_draft_head,
+        include_dflash2=include_dflash2,
     )
     draft_head_ids = source.compute_dspark_draft_head_ids() if include_draft_head else None
 
@@ -155,7 +173,7 @@ def convert(
     tmp_output = output.with_suffix(output.suffix + ".tmp")
 
     print(
-        f"preflight complete: {len(writer_specs)} objects (mtp={include_mtp}), "
+        f"preflight complete: {len(writer_specs)} objects (mtp={include_mtp}, dflash2={include_dflash2}), "
         f"tensor_bytes={inventory.total_tensor_payload_bytes(t_specs)}, device={resolved_device}",
         flush=True,
     )
@@ -163,6 +181,9 @@ def convert(
     written_objects: tuple[ArtifactObject, ...]
     base_artifact = Artifact.open(base_artifact_path) if base_artifact_path is not None else None
     mtp_reader = source.MtpSourceReader(resolved_mtp) if resolved_mtp is not None else None
+    dflash2_reader = (
+        source.DFlash2SourceReader(resolved_dflash2) if resolved_dflash2 is not None else None
+    )
     try:
         with source.Inkling2SourceReader(sources.model_dir, sources.weight_map) as reader:
             with ArtifactWriter(
@@ -195,6 +216,13 @@ def convert(
                     elif t_spec.name.startswith("mtp/"):
                         assert mtp_reader is not None
                         tensor = source.load_mtp_tensor(t_spec, mtp_reader)
+                        payload = _encode_non_expert_tensor(t_spec, tensor, resolved_device)
+                        del tensor
+                        writer.write(t_spec.name, payload)
+                        del payload
+                    elif t_spec.name.startswith("dflash2/"):
+                        assert dflash2_reader is not None
+                        tensor = source.load_dflash2_tensor(t_spec, dflash2_reader)
                         payload = _encode_non_expert_tensor(t_spec, tensor, resolved_device)
                         del tensor
                         writer.write(t_spec.name, payload)
@@ -234,6 +262,8 @@ def convert(
                     ):
                         print(f"[{done}/{total}] {t_spec.name}", flush=True)
     finally:
+        if dflash2_reader is not None:
+            dflash2_reader.close()
         if mtp_reader is not None:
             mtp_reader.close()
         if base_artifact is not None:
@@ -251,6 +281,7 @@ def convert(
         "source": {
             "model_path": str(sources.model_dir.resolve()),
             "mtp_path": str(resolved_mtp.resolve()) if resolved_mtp is not None else None,
+            "dflash2_path": str(resolved_dflash2.resolve()) if resolved_dflash2 is not None else None,
         },
         "config_summary": sources.config_summary,
         "objects": {
@@ -278,6 +309,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--mtp", type=Path, default=None)
     parser.add_argument("--no-mtp", action="store_true")
+    parser.add_argument("--dflash2", type=Path, default=None)
+    parser.add_argument("--no-dflash2", action="store_true")
     parser.add_argument("--base-artifact", type=Path, default=None)
     args = parser.parse_args(argv)
     convert(
@@ -286,6 +319,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         device=args.device,
         mtp_path=args.mtp,
         use_mtp=not args.no_mtp,
+        dflash2_dir=args.dflash2,
+        use_dflash2=(not args.no_dflash2) and (args.dflash2 is not None),
         base_artifact_path=args.base_artifact,
     )
 

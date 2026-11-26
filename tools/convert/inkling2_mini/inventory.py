@@ -50,6 +50,15 @@ MTP_LAYERS = 3
 MTP_INTERMEDIATE = 9216
 MTP_MARKOV_RANK = 256
 MTP_DRAFT_HEAD_ROWS = 32768
+DFLASH2_LAYERS = 5
+DFLASH2_INTERMEDIATE = 6912
+DFLASH2_Q_HEADS = 32
+DFLASH2_Q_DIM = 4096
+DFLASH2_KV_DIM = 1024
+DFLASH2_CONV_GROUPS = 144
+DFLASH2_CONV_PROJ_ROWS = 576
+DFLASH2_SELECTOR_RANK = 256
+DFLASH2_FEATURE_WIDTH = 9216
 
 FULL_ATTENTION_LAYERS = frozenset((5, 11, 17, 23))
 SWA_LAYERS = frozenset(i for i in range(PHYS_LAYERS) if i not in FULL_ATTENTION_LAYERS)
@@ -243,29 +252,96 @@ def _build_mtp_tensor_specs() -> tuple[TensorSpec, ...]:
     return tuple(specs)
 
 
+def _build_dflash2_tensor_specs() -> tuple[TensorSpec, ...]:
+    specs: list[TensorSpec] = [
+        tensor_spec("dflash2/fc", (HIDDEN_SIZE, DFLASH2_FEATURE_WIDTH), Q4),
+        tensor_spec("dflash2/hidden_norm", (HIDDEN_SIZE,), BF16),
+    ]
+    for layer in range(DFLASH2_LAYERS):
+        prefix = f"dflash2/layers/{layer}/"
+        specs.extend(
+            (
+                tensor_spec(prefix + "input_norm", (HIDDEN_SIZE,), BF16),
+                tensor_spec(prefix + "post_attention_norm", (HIDDEN_SIZE,), BF16),
+                tensor_spec(prefix + "attention_conv/base_kernel", (2, 2, HIDDEN_SIZE), BF16),
+                tensor_spec(
+                    prefix + "attention_conv/kernel_projection",
+                    (DFLASH2_CONV_PROJ_ROWS, HIDDEN_SIZE),
+                    BF16,
+                ),
+                tensor_spec(prefix + "attention/q_norm", (HEAD_DIM,), BF16),
+                tensor_spec(prefix + "attention/k_norm", (HEAD_DIM,), BF16),
+                tensor_spec(prefix + "attention/q", (DFLASH2_Q_DIM, HIDDEN_SIZE), Q4),
+                tensor_spec(prefix + "attention/k", (DFLASH2_KV_DIM, HIDDEN_SIZE), Q4),
+                tensor_spec(prefix + "attention/v", (DFLASH2_KV_DIM, HIDDEN_SIZE), Q4),
+                tensor_spec(prefix + "attention/output", (HIDDEN_SIZE, DFLASH2_Q_DIM), Q4),
+                tensor_spec(prefix + "mlp_conv/base_kernel", (2, 2, HIDDEN_SIZE), BF16),
+                tensor_spec(
+                    prefix + "mlp_conv/kernel_projection",
+                    (DFLASH2_CONV_PROJ_ROWS, HIDDEN_SIZE),
+                    BF16,
+                ),
+                tensor_spec(prefix + "mlp/gate_up", (2 * DFLASH2_INTERMEDIATE, HIDDEN_SIZE), Q4),
+                tensor_spec(prefix + "mlp/down", (HIDDEN_SIZE, DFLASH2_INTERMEDIATE), Q4),
+            )
+        )
+    specs.extend(
+        (
+            tensor_spec("dflash2/final_norm", (HIDDEN_SIZE,), BF16),
+            tensor_spec(
+                "dflash2/selector/hidden_projection",
+                (DFLASH2_SELECTOR_RANK, HIDDEN_SIZE),
+                BF16,
+            ),
+            tensor_spec(
+                "dflash2/selector/predecessor_codebook",
+                (VOCAB_SIZE, DFLASH2_SELECTOR_RANK),
+                BF16,
+            ),
+            tensor_spec(
+                "dflash2/selector/successor_codebook",
+                (VOCAB_SIZE, DFLASH2_SELECTOR_RANK),
+                BF16,
+            ),
+        )
+    )
+    return tuple(specs)
+
+
 TENSOR_SPECS: tuple[TensorSpec, ...] = _build_tensor_specs()
 MTP_TENSOR_SPECS: tuple[TensorSpec, ...] = _build_mtp_tensor_specs()
 MTP_DRAFT_HEAD_SPECS: tuple[TensorSpec, ...] = (
     tensor_spec("mtp/draft_head", (MTP_DRAFT_HEAD_ROWS, HIDDEN_SIZE), Q4),
     tensor_spec("mtp/draft_head_token_ids", (MTP_DRAFT_HEAD_ROWS,), I32),
 )
+DFLASH2_TENSOR_SPECS: tuple[TensorSpec, ...] = _build_dflash2_tensor_specs()
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
 
 def tensor_specs(
-    *, include_mtp: bool = False, include_draft_head: bool = False
+    *,
+    include_mtp: bool = False,
+    include_draft_head: bool = False,
+    include_dflash2: bool = False,
 ) -> tuple[TensorSpec, ...]:
-    if not include_mtp:
-        return TENSOR_SPECS
-    extra = MTP_TENSOR_SPECS + (MTP_DRAFT_HEAD_SPECS if include_draft_head else ())
+    extra: tuple[TensorSpec, ...] = ()
+    if include_mtp:
+        extra += MTP_TENSOR_SPECS + (MTP_DRAFT_HEAD_SPECS if include_draft_head else ())
+    if include_dflash2:
+        extra += DFLASH2_TENSOR_SPECS
     return TENSOR_SPECS + extra
 
 
 def object_specs(
-    *, include_mtp: bool = False, include_draft_head: bool = False
+    *,
+    include_mtp: bool = False,
+    include_draft_head: bool = False,
+    include_dflash2: bool = False,
 ) -> tuple[StoredObjectSpec, ...]:
     return RESOURCE_SPECS + tensor_specs(
-        include_mtp=include_mtp, include_draft_head=include_draft_head
+        include_mtp=include_mtp,
+        include_draft_head=include_draft_head,
+        include_dflash2=include_dflash2,
     )
 
 

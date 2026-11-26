@@ -67,19 +67,26 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                      WeightsProfile) {
     if (options.enable_vision)
         throw std::invalid_argument("Inkling-2-Mini supports text-only execution");
-    if (options.speculative.backend != SpeculativeBackend::None &&
-        options.speculative.backend != SpeculativeBackend::DFlash &&
-        options.speculative.backend != SpeculativeBackend::Mtp)
+    const auto backend = options.speculative.backend;
+    if (backend != SpeculativeBackend::None && backend != SpeculativeBackend::DFlash &&
+        backend != SpeculativeBackend::Mtp && backend != SpeculativeBackend::DFlash2)
         throw std::invalid_argument(
-            "Inkling-2-Mini supports DSpark (dflash/mtp) speculative decoding");
-    if (options.speculative.backend != SpeculativeBackend::None &&
-        options.speculative.draft_tokens > 7)
+            "Inkling-2-Mini supports DSpark (dflash/mtp) and DFlash 2 (dflash2) speculative decoding");
+    if (backend == SpeculativeBackend::DFlash2) {
+        if (options.speculative.draft_tokens > 15)
+            throw std::invalid_argument("Inkling-2-Mini DFlash 2 supports draft_tokens in [0..15]");
+        if (options.speculative.proposal_head == ProposalHead::Optimized)
+            throw std::invalid_argument("Inkling-2-Mini DFlash 2 does not support --lm-head-draft");
+    } else if (backend != SpeculativeBackend::None && options.speculative.draft_tokens > 7) {
         throw std::invalid_argument("Inkling-2-Mini DSpark supports draft_tokens in [0..7]");
-    const bool load_mtp        = options.speculative.backend != SpeculativeBackend::None;
+    }
+    const bool load_mtp =
+        backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::Mtp;
     const bool load_draft_head =
         load_mtp && options.speculative.proposal_head == ProposalHead::Optimized;
+    const bool load_dflash2 = backend == SpeculativeBackend::DFlash2;
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        detail::bind_artifact(binder, load_mtp, load_draft_head), options));
+        detail::bind_artifact(binder, load_mtp, load_draft_head, load_dflash2), options));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -107,7 +114,12 @@ std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& mod
                                                           const StartupObserver&) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     auto options = std::move(plan.options);
-    if (options.speculative.backend != SpeculativeBackend::None) {
+    if (options.speculative.backend == SpeculativeBackend::DFlash2) {
+        if (!model.impl_->view.has_dflash2)
+            throw std::invalid_argument(
+                "Inkling-2-Mini --spec dflash2 requires an artifact with dflash2/ weights");
+        if (options.speculative.draft_tokens == 0) options.speculative.draft_tokens = 7;
+    } else if (options.speculative.backend != SpeculativeBackend::None) {
         if (!model.impl_->view.has_mtp)
             throw std::invalid_argument(
                 "Inkling-2-Mini speculative decoding requires an artifact with mtp/ DSpark weights");

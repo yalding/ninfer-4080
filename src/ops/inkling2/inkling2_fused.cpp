@@ -272,4 +272,164 @@ void inkling2_dspark_commit_conv_state(const Tensor& pre_state, const Tensor& co
                                                accepted, s);
 }
 
+namespace {
+std::size_t align256(std::size_t bytes) {
+    return (bytes + 255U) & ~std::size_t(255);
+}
+
+void require_q4_kv_weight(const Weight& weight, const char* name) {
+    constexpr std::uint64_t kCodeBytes  = static_cast<std::uint64_t>(1024) * 2304U / 2U;
+    constexpr std::uint64_t kScaleBytes = static_cast<std::uint64_t>(1024) * (2304U / 64U) * 2U;
+    require(weight.qtype == QType::Q4G64_F16S && weight.layout == QuantLayout::RowSplit &&
+                weight.scale_dtype == DType::FP16 && weight.group == 64 &&
+                weight.group_size == 64 && weight.ndim == 2 && weight.n == 1024 &&
+                weight.k == 2304 && weight.shape[0] == 1024 && weight.shape[1] == 2304 &&
+                weight.padded_shape[0] == 1024 && weight.padded_shape[1] == 2304 &&
+                weight.qhigh == nullptr && weight.high_plane_bytes == 0 &&
+                weight.payload_bytes >= kCodeBytes + kScaleBytes && weight.qdata != nullptr &&
+                weight.scales != nullptr,
+            name);
+}
+} // namespace
+
+std::size_t inkling2_dflash2_kv_materialize_workspace_bytes(std::int32_t max_width) {
+    require(max_width >= 1 && max_width <= 2048, "dflash2 kv materialize max_width must be 1..2048");
+    return align256(static_cast<std::size_t>(1024) * static_cast<std::size_t>(max_width) * 2U);
+}
+
+void inkling2_dflash2_kv_materialize(
+    const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
+    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
+    ContextKVMaterializeExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t s) {
+    const int w = context.ne[1];
+    require(w >= 1 && w <= 2048, "dflash2 kv materialize W must be 1..2048");
+    shape(context, DType::BF16, {2304, w, 1});
+    shape(positions, DType::I32, {w, 1});
+    shape(counts, DType::I32, {1});
+    shape(state_slots, DType::I32, {1});
+    require(envelope.min_count <= envelope.max_count &&
+                envelope.max_count <= static_cast<std::uint32_t>(w),
+            "dflash2 kv materialize invalid envelope");
+
+    const std::int32_t padded        = layers[0].cache.padded_capacity;
+    const std::int32_t lane_capacity = layers[0].cache.lane_capacity;
+    require(padded >= 2048 && lane_capacity > 0, "dflash2 kv materialize invalid cyclic cache");
+    for (std::size_t i = 0; i < kContextKVMaterializeLayers; ++i) {
+        const auto& l = layers[i];
+        require_q4_kv_weight(l.key_weight, "dflash2 kv materialize key_weight");
+        require_q4_kv_weight(l.value_weight, "dflash2 kv materialize value_weight");
+        shape(l.key_norm_weight, DType::BF16, {128});
+        require(l.cache.capacity == 2048 && l.cache.padded_capacity == padded &&
+                    l.cache.num_kv_heads == 8 && l.cache.head_dim == 128 &&
+                    l.cache.lane_capacity == lane_capacity,
+                "dflash2 kv materialize cyclic cache mismatch");
+        shape(l.cache.k, DType::BF16, {128, padded, 8, lane_capacity});
+        shape(l.cache.v, DType::FP16, {128, padded, 8, lane_capacity});
+        disjoint(context, l.cache.k);
+        disjoint(context, l.cache.v);
+        disjoint(positions, l.cache.k);
+        disjoint(positions, l.cache.v);
+    }
+
+    auto scope         = workspace.scope();
+    Tensor scratch     = workspace.alloc(DType::BF16, {1024, w}, 256);
+    detail::inkling2_dflash2_kv_materialize_launch(context, positions, counts, state_slots, layers,
+                                                   envelope, scratch, s);
+}
+
+std::size_t inkling2_dflash2_conv_prepare_workspace_bytes(std::int32_t max_width) {
+    require(max_width >= 1 && max_width <= 16, "dflash2 conv prepare max_width must be 1..16");
+    return align256(static_cast<std::size_t>(2304) * static_cast<std::size_t>(max_width) * 2U) +
+           align256(static_cast<std::size_t>(576) * static_cast<std::size_t>(max_width) *
+                    sizeof(float));
+}
+
+void inkling2_dflash2_conv_prepare(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                   const Tensor& base_kernel, const Tensor& kernel_proj,
+                                   Tensor& prepared, Tensor& finish_delta,
+                                   WorkspaceArena& workspace, cudaStream_t s) {
+    const int w = residual.ne[1];
+    require(w >= 1 && w <= 16 && std::isfinite(eps) && eps > 0.0f,
+            "dflash2 conv prepare geometry/eps");
+    shape(residual, DType::BF16, {2304, w});
+    shape(norm_weight, DType::BF16, {2304});
+    shape(base_kernel, DType::BF16, {2304, 2, 2});
+    shape(kernel_proj, DType::BF16, {2304, 576});
+    shape(prepared, DType::BF16, {2304, w});
+    shape(finish_delta, DType::BF16, {144, 2, w});
+    disjoint(prepared, residual);
+    disjoint(prepared, finish_delta);
+    disjoint(finish_delta, residual);
+    disjoint(prepared, base_kernel);
+    disjoint(prepared, kernel_proj);
+
+    auto scope      = workspace.scope();
+    void* normed    = workspace.alloc_bytes(align256(2304ULL * w * 2ULL)).data;
+    auto* delta_buf = static_cast<float*>(
+        workspace.alloc_bytes(align256(576ULL * w * sizeof(float))).data);
+    detail::inkling2_dflash2_conv_prepare_launch(residual, norm_weight, eps, base_kernel,
+                                                 kernel_proj, prepared, finish_delta, normed,
+                                                 delta_buf, s);
+}
+
+void inkling2_dflash2_conv_finish_add(const Tensor& proj_out, const Tensor& base_kernel,
+                                      const Tensor& finish_delta, Tensor& residual,
+                                      cudaStream_t s) {
+    const int w = proj_out.ne[1];
+    require(w >= 1 && w <= 16, "dflash2 conv finish W must be 1..16");
+    shape(proj_out, DType::BF16, {2304, w});
+    shape(base_kernel, DType::BF16, {2304, 2, 2});
+    shape(finish_delta, DType::BF16, {144, 2, w});
+    shape(residual, DType::BF16, {2304, w});
+    disjoint(residual, proj_out);
+    disjoint(residual, base_kernel);
+    disjoint(residual, finish_delta);
+    detail::inkling2_dflash2_conv_finish_add_launch(proj_out, base_kernel, finish_delta, residual,
+                                                    s);
+}
+
+std::size_t inkling2_dflash2_topk16_and_select_workspace_bytes(std::int32_t max_k) {
+    require(max_k >= 1 && max_k <= 15, "dflash2 topk16_and_select max_k must be 1..15");
+    return align256(256ULL * static_cast<std::size_t>(max_k) * 2ULL) +
+           align256(16ULL * 128ULL * static_cast<std::size_t>(max_k) * sizeof(std::int32_t)) +
+           align256(16ULL * 128ULL * static_cast<std::size_t>(max_k) * sizeof(float)) +
+           align256(16ULL * static_cast<std::size_t>(max_k) * sizeof(float));
+}
+
+void inkling2_dflash2_topk16_and_select(const Tensor& mask_hidden, const Tensor& unary_logits,
+                                        const Tensor& hidden_projection, const Tensor& anchors,
+                                        const Tensor& predecessor_codebook,
+                                        const Tensor& successor_codebook,
+                                        const Tensor& base_positions,
+                                        const SamplingConfig* configs, Tensor& candidate_ids,
+                                        Tensor& drafts, Tensor& proposal_q,
+                                        WorkspaceArena& workspace, cudaStream_t s) {
+    const int k = mask_hidden.ne[1];
+    require(k >= 1 && k <= 15 && configs != nullptr, "dflash2 topk16_and_select K/configs");
+    shape(mask_hidden, DType::BF16, {2304, k});
+    shape(unary_logits, DType::BF16, {201024, k});
+    shape(hidden_projection, DType::BF16, {2304, 256});
+    shape(anchors, DType::I32, {1});
+    shape(predecessor_codebook, DType::BF16, {256, 201024});
+    shape(successor_codebook, DType::BF16, {256, 201024});
+    shape(base_positions, DType::I32, {1});
+    shape(candidate_ids, DType::I32, {16, k, 1});
+    shape(drafts, DType::I32, {k, 1});
+    shape(proposal_q, DType::FP32, {16, k, 1});
+
+    auto scope               = workspace.scope();
+    void* projected_hidden   = workspace.alloc_bytes(align256(256ULL * k * 2ULL)).data;
+    auto* partial_ids        = static_cast<std::int32_t*>(
+        workspace.alloc_bytes(align256(16ULL * 128ULL * k * sizeof(std::int32_t))).data);
+    auto* partial_vals       = static_cast<float*>(
+        workspace.alloc_bytes(align256(16ULL * 128ULL * k * sizeof(float))).data);
+    auto* unary_scores       = static_cast<float*>(
+        workspace.alloc_bytes(align256(16ULL * k * sizeof(float))).data);
+
+    detail::inkling2_dflash2_topk16_and_select_launch(
+        mask_hidden, unary_logits, hidden_projection, anchors, predecessor_codebook,
+        successor_codebook, base_positions, configs, candidate_ids, drafts, proposal_q,
+        projected_hidden, partial_ids, partial_vals, unary_scores, s);
+}
+
 } // namespace ninfer::ops

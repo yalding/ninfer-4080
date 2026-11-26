@@ -564,3 +564,222 @@ def compute_dspark_draft_head_ids() -> torch.Tensor:
 def load_mtp_draft_head(reader: Inkling2SourceReader, ids: torch.Tensor) -> torch.Tensor:
     unembed = reader.get("model.llm.unembed.weight")
     return unembed.index_select(0, ids.to(torch.long)).contiguous()
+
+
+DEFAULT_WORKSPACE_DFLASH2 = Path(r"D:\Users\yaldi\gits\ninfer-4080\models\Inkling-2-Mini-DFlash2")
+
+_EXPECTED_DFLASH2_CONFIG = {
+    "hidden_size": inventory.HIDDEN_SIZE,
+    "intermediate_size": inventory.DFLASH2_INTERMEDIATE,
+    "num_hidden_layers": inventory.DFLASH2_LAYERS,
+    "num_attention_heads": inventory.DFLASH2_Q_HEADS,
+    "num_key_value_heads": inventory.NUM_KV_HEADS,
+    "head_dim": inventory.HEAD_DIM,
+    "sliding_window": 2048,
+    "rms_norm_eps": 1e-6,
+    "vocab_size": inventory.VOCAB_SIZE,
+}
+
+_EXPECTED_DFLASH2_SUBCONFIG = {
+    "target_layer_ids": [5, 23, 41, 48],
+    "mask_token_id": 200056,
+    "conv_group_size": 16,
+    "conv_kernel_size": 2,
+    "selector_rank": inventory.DFLASH2_SELECTOR_RANK,
+    "selector_top_k": 16,
+    "selector_softcap_mode": "after_correction",
+    "final_logit_softcapping": 30.0,
+}
+
+
+def resolve_dflash2_dir(
+    dflash2_dir: str | Path | None = None,
+    *,
+    allow_missing: bool = False,
+) -> Path | None:
+    if dflash2_dir is not None:
+        resolved = Path(dflash2_dir)
+        if not resolved.is_dir():
+            raise FileNotFoundError(f"DFlash2 directory not found: {resolved}")
+        return resolved
+    if DEFAULT_WORKSPACE_DFLASH2.is_dir():
+        return DEFAULT_WORKSPACE_DFLASH2
+    if allow_missing:
+        return None
+    raise FileNotFoundError(f"DFlash2 directory not found: {DEFAULT_WORKSPACE_DFLASH2}")
+
+
+def validate_dflash2_checkpoint(dflash2_dir: str | Path) -> Path:
+    root = Path(dflash2_dir)
+    config_path = root / "config.json"
+    weights_path = root / "model.safetensors"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"missing DFlash2 config.json: {config_path}")
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"missing DFlash2 model.safetensors: {weights_path}")
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    architectures = config.get("architectures") or []
+    if "DFlash2DraftModel" not in architectures:
+        raise ValueError(f"expected DFlash2DraftModel in architectures, got {architectures!r}")
+    for key, expected in _EXPECTED_DFLASH2_CONFIG.items():
+        actual = config.get(key)
+        if isinstance(expected, float):
+            if actual is None or abs(float(actual) - expected) > 1e-5:
+                raise ValueError(f"DFlash2 config.{key}: expected {expected!r}, got {actual!r}")
+        elif actual != expected:
+            raise ValueError(f"DFlash2 config.{key}: expected {expected!r}, got {actual!r}")
+
+    rope_theta = config.get("rope_theta")
+    if rope_theta is None:
+        rope_theta = (config.get("rope_parameters") or {}).get("rope_theta")
+    if rope_theta is None or abs(float(rope_theta) - 10000.0) > 1e-5:
+        raise ValueError(f"DFlash2 config.rope_theta: expected 10000.0, got {rope_theta!r}")
+
+    dflash_cfg = config.get("dflash_config") or {}
+    for key, expected in _EXPECTED_DFLASH2_SUBCONFIG.items():
+        actual = dflash_cfg.get(key)
+        if isinstance(expected, float):
+            if actual is None or abs(float(actual) - expected) > 1e-5:
+                raise ValueError(
+                    f"DFlash2 config.dflash_config.{key}: expected {expected!r}, got {actual!r}"
+                )
+        elif actual != expected:
+            raise ValueError(
+                f"DFlash2 config.dflash_config.{key}: expected {expected!r}, got {actual!r}"
+            )
+
+    expected_shapes: dict[str, tuple[int, ...]] = {
+        "fc.weight": (inventory.HIDDEN_SIZE, inventory.DFLASH2_FEATURE_WIDTH),
+        "hidden_norm.weight": (inventory.HIDDEN_SIZE,),
+        "norm.weight": (inventory.HIDDEN_SIZE,),
+        "candidate_selector.hidden_projection.weight": (
+            inventory.DFLASH2_SELECTOR_RANK,
+            inventory.HIDDEN_SIZE,
+        ),
+        "candidate_selector.predecessor_codebook": (
+            inventory.VOCAB_SIZE,
+            inventory.DFLASH2_SELECTOR_RANK,
+        ),
+        "candidate_selector.successor_codebook": (
+            inventory.VOCAB_SIZE,
+            inventory.DFLASH2_SELECTOR_RANK,
+        ),
+    }
+    for layer in range(inventory.DFLASH2_LAYERS):
+        lp = f"layers.{layer}."
+        expected_shapes.update(
+            {
+                lp + "input_layernorm.weight": (inventory.HIDDEN_SIZE,),
+                lp + "post_attention_layernorm.weight": (inventory.HIDDEN_SIZE,),
+                lp + "attention_conv.base_kernel": (2, 2, inventory.HIDDEN_SIZE),
+                lp + "attention_conv.kernel_projection.weight": (
+                    inventory.DFLASH2_CONV_PROJ_ROWS,
+                    inventory.HIDDEN_SIZE,
+                ),
+                lp + "self_attn.q_norm.weight": (inventory.HEAD_DIM,),
+                lp + "self_attn.k_norm.weight": (inventory.HEAD_DIM,),
+                lp + "self_attn.q_proj.weight": (inventory.DFLASH2_Q_DIM, inventory.HIDDEN_SIZE),
+                lp + "self_attn.k_proj.weight": (inventory.DFLASH2_KV_DIM, inventory.HIDDEN_SIZE),
+                lp + "self_attn.v_proj.weight": (inventory.DFLASH2_KV_DIM, inventory.HIDDEN_SIZE),
+                lp + "self_attn.o_proj.weight": (inventory.HIDDEN_SIZE, inventory.DFLASH2_Q_DIM),
+                lp + "mlp_conv.base_kernel": (2, 2, inventory.HIDDEN_SIZE),
+                lp + "mlp_conv.kernel_projection.weight": (
+                    inventory.DFLASH2_CONV_PROJ_ROWS,
+                    inventory.HIDDEN_SIZE,
+                ),
+                lp + "mlp.gate_proj.weight": (inventory.DFLASH2_INTERMEDIATE, inventory.HIDDEN_SIZE),
+                lp + "mlp.up_proj.weight": (inventory.DFLASH2_INTERMEDIATE, inventory.HIDDEN_SIZE),
+                lp + "mlp.down_proj.weight": (inventory.HIDDEN_SIZE, inventory.DFLASH2_INTERMEDIATE),
+            }
+        )
+
+    with safe_open(str(weights_path), framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+        if keys != set(expected_shapes):
+            missing = sorted(set(expected_shapes) - keys)
+            extra = sorted(keys - set(expected_shapes))
+            raise ValueError(
+                f"DFlash2 safetensors inventory mismatch: missing={missing[:4]}, extra={extra[:4]}"
+            )
+        for name, shape in expected_shapes.items():
+            actual_shape = tuple(handle.get_slice(name).get_shape())
+            if actual_shape != shape:
+                raise ValueError(f"DFlash2 {name}: shape {actual_shape} != {shape}")
+    return weights_path
+
+
+class DFlash2SourceReader:
+    """Safetensors reader for Inkling-2-Mini-DFlash2 model.safetensors."""
+
+    def __init__(self, dflash2_dir: str | Path) -> None:
+        self.dflash2_dir = Path(dflash2_dir)
+        self.weights_path = validate_dflash2_checkpoint(self.dflash2_dir)
+        self._context = safe_open(str(self.weights_path), framework="pt", device="cpu")
+        self._handle = self._context.__enter__()
+
+    def get(self, name: str) -> torch.Tensor:
+        return self._handle.get_tensor(name)
+
+    def close(self) -> None:
+        if self._context is not None:
+            self._context.__exit__(None, None, None)
+            self._context = None
+            self._handle = None
+
+    def __enter__(self) -> "DFlash2SourceReader":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+
+def load_dflash2_tensor(spec: inventory.TensorSpec, reader: DFlash2SourceReader) -> torch.Tensor:
+    name = spec.name
+    direct_top = {
+        "dflash2/fc": "fc.weight",
+        "dflash2/hidden_norm": "hidden_norm.weight",
+        "dflash2/final_norm": "norm.weight",
+        "dflash2/selector/hidden_projection": "candidate_selector.hidden_projection.weight",
+        "dflash2/selector/predecessor_codebook": "candidate_selector.predecessor_codebook",
+        "dflash2/selector/successor_codebook": "candidate_selector.successor_codebook",
+    }
+    if name in direct_top:
+        t = reader.get(direct_top[name]).to(torch.bfloat16).contiguous()
+        if tuple(t.shape) != spec.shape:
+            raise ValueError(f"{name}: shape {tuple(t.shape)} != {spec.shape}")
+        return t
+
+    parts = name.split("/")
+    if len(parts) < 4 or parts[0] != "dflash2" or parts[1] != "layers":
+        raise ValueError(f"unexpected DFlash2 tensor name: {name}")
+    layer = int(parts[2])
+    suffix = "/".join(parts[3:])
+    hp = f"layers.{layer}."
+    mapping = {
+        "input_norm": "input_layernorm.weight",
+        "post_attention_norm": "post_attention_layernorm.weight",
+        "attention_conv/base_kernel": "attention_conv.base_kernel",
+        "attention_conv/kernel_projection": "attention_conv.kernel_projection.weight",
+        "attention/q_norm": "self_attn.q_norm.weight",
+        "attention/k_norm": "self_attn.k_norm.weight",
+        "attention/q": "self_attn.q_proj.weight",
+        "attention/k": "self_attn.k_proj.weight",
+        "attention/v": "self_attn.v_proj.weight",
+        "attention/output": "self_attn.o_proj.weight",
+        "mlp_conv/base_kernel": "mlp_conv.base_kernel",
+        "mlp_conv/kernel_projection": "mlp_conv.kernel_projection.weight",
+        "mlp/down": "mlp.down_proj.weight",
+    }
+    if suffix == "mlp/gate_up":
+        gate = reader.get(hp + "mlp.gate_proj.weight")
+        up = reader.get(hp + "mlp.up_proj.weight")
+        t = torch.cat((gate, up), dim=0).to(torch.bfloat16).contiguous()
+    elif suffix in mapping:
+        t = reader.get(hp + mapping[suffix]).to(torch.bfloat16).contiguous()
+    else:
+        raise ValueError(f"unhandled DFlash2 tensor {name}")
+
+    if tuple(t.shape) != spec.shape:
+        raise ValueError(f"{name}: shape {tuple(t.shape)} != {spec.shape}")
+    return t

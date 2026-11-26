@@ -8,6 +8,7 @@
 namespace ninfer::targets::inkling2_mini::detail {
 inline constexpr std::size_t kPhysicalLayers = 24;
 inline constexpr std::size_t kMtpLayers      = 3;
+inline constexpr std::size_t kDFlash2Layers  = 5;
 
 inline constexpr bool is_full_attention_layer(std::size_t i) noexcept { return i % 6 == 5; }
 
@@ -77,6 +78,33 @@ struct MtpPlan {
     artifact::ObjectHandle draft_head_token_ids;
 };
 
+struct DFlash2LayerPlan {
+    artifact::ObjectHandle input_norm;
+    artifact::ObjectHandle post_attention_norm;
+    artifact::ObjectHandle attn_conv_base;
+    artifact::ObjectHandle attn_conv_proj;
+    artifact::ObjectHandle q_norm;
+    artifact::ObjectHandle k_norm;
+    artifact::ObjectHandle q;
+    artifact::ObjectHandle k;
+    artifact::ObjectHandle v;
+    artifact::ObjectHandle output;
+    artifact::ObjectHandle mlp_conv_base;
+    artifact::ObjectHandle mlp_conv_proj;
+    artifact::ObjectHandle gate_up;
+    artifact::ObjectHandle down;
+};
+
+struct DFlash2Plan {
+    artifact::ObjectHandle fc;
+    artifact::ObjectHandle hidden_norm;
+    std::array<DFlash2LayerPlan, kDFlash2Layers> layers;
+    artifact::ObjectHandle final_norm;
+    artifact::ObjectHandle selector_hidden_proj;
+    artifact::ObjectHandle predecessor_codebook;
+    artifact::ObjectHandle successor_codebook;
+};
+
 struct BindingPlan {
     FrontendResourcePlan frontend;
     artifact::ObjectHandle token_embedding;
@@ -85,8 +113,10 @@ struct BindingPlan {
     artifact::ObjectHandle output_res_query;
     artifact::ObjectHandle final_norm;
     artifact::ObjectHandle output_head;
-    bool has_mtp = false;
+    bool has_mtp     = false;
     MtpPlan mtp;
+    bool has_dflash2 = false;
+    DFlash2Plan dflash2;
 };
 
 struct ArtifactLoadPlan {
@@ -159,6 +189,33 @@ struct MtpWeights {
     Tensor draft_head_token_ids;
 };
 
+struct DFlash2LayerWeights {
+    Tensor input_norm;
+    Tensor post_attention_norm;
+    Tensor attn_conv_base;
+    Tensor attn_conv_proj;
+    Tensor q_norm;
+    Tensor k_norm;
+    Weight q;
+    Weight k;
+    Weight v;
+    Weight output;
+    Tensor mlp_conv_base;
+    Tensor mlp_conv_proj;
+    Weight gate_up;
+    Weight down;
+};
+
+struct DFlash2Weights {
+    Weight fc;
+    Tensor hidden_norm;
+    std::array<DFlash2LayerWeights, kDFlash2Layers> layers;
+    Tensor final_norm;
+    Tensor selector_hidden_proj;
+    Tensor predecessor_codebook;
+    Tensor successor_codebook;
+};
+
 struct RuntimeModelView {
     const DeviceArena* weights_arena = nullptr;
     Weight token_embedding;
@@ -170,10 +227,13 @@ struct RuntimeModelView {
     bool has_mtp        = false;
     bool has_draft_head = false;
     MtpWeights mtp;
+    bool has_dflash2    = false;
+    DFlash2Weights dflash2;
 };
 
 [[nodiscard]] ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp = false,
-                                             bool load_draft_head = false);
+                                             bool load_draft_head = false,
+                                             bool load_dflash2 = false);
 [[nodiscard]] RuntimeModelView materialize_model(artifact::MaterializedArtifact& materialized,
                                                  const BindingPlan& plan);
 } // namespace ninfer::targets::inkling2_mini::detail

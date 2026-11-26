@@ -1,7 +1,13 @@
 #include "ninfer/ops/inkling2_fused.h"
+#include "core/cyclic_kv_cache.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/dtype.h"
+#include "core/layout.h"
 #include "ops/op_tester.h"
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <array>
@@ -377,6 +383,346 @@ int dspark_rnn_step_test(DeviceContext& dev, bool graph) {
     if (ws.used() != 0) ++fail;
     return fail;
 }
+
+struct OwnedQ4Weight {
+    DeviceBuffer buf;
+    Weight weight{};
+    std::vector<double> decoded;
+};
+
+OwnedQ4Weight make_q4_weight(int n, int k, int seed) {
+    OwnedQ4Weight out;
+    const std::size_t qbytes = static_cast<std::size_t>(n) * k / 2U;
+    const std::size_t sbytes = static_cast<std::size_t>(n) * (k / 64) * 2U;
+    std::vector<std::uint8_t> raw(qbytes + sbytes, 0);
+    out.decoded.resize(static_cast<std::size_t>(n) * k);
+    for (int r = 0; r < n; ++r) {
+        for (int g = 0; g < k / 64; ++g) {
+            const float s_f32     = ((r + g + seed) % 7 + 1) * 0.03125f;
+            const __half s_f16    = __float2half_rn(s_f32);
+            const double s_d      = __half2float(s_f16);
+            std::uint16_t s_bits  = 0;
+            std::memcpy(&s_bits, &s_f16, 2);
+            const std::size_t s_idx = (static_cast<std::size_t>(r) * (k / 64) + g) * 2U;
+            raw[qbytes + s_idx]     = static_cast<std::uint8_t>(s_bits & 0xFF);
+            raw[qbytes + s_idx + 1] = static_cast<std::uint8_t>(s_bits >> 8);
+            for (int c = 0; c < 64; c += 2) {
+                const int q0 = ((r * 13 + g * 5 + c + seed) % 15) - 7;
+                const int q1 = ((r * 7 + g * 11 + c + 1 + seed) % 15) - 7;
+                const std::uint8_t lo = static_cast<std::uint8_t>(q0 & 0x0F);
+                const std::uint8_t hi = static_cast<std::uint8_t>(q1 & 0x0F);
+                raw[(static_cast<std::size_t>(r) * k + g * 64 + c) / 2U] =
+                    static_cast<std::uint8_t>(lo | (hi << 4));
+                out.decoded[static_cast<std::size_t>(r) * k + g * 64 + c]     = q0 * s_d;
+                out.decoded[static_cast<std::size_t>(r) * k + g * 64 + c + 1] = q1 * s_d;
+            }
+        }
+    }
+    out.buf = to_device(raw);
+    out.weight.qtype = QType::Q4G64_F16S;
+    out.weight.layout = QuantLayout::RowSplit;
+    out.weight.scale_dtype = DType::FP16;
+    out.weight.group = 64;
+    out.weight.group_size = 64;
+    out.weight.ndim = 2;
+    out.weight.n = n;
+    out.weight.k = k;
+    out.weight.shape[0] = n;
+    out.weight.shape[1] = k;
+    out.weight.padded_shape[0] = n;
+    out.weight.padded_shape[1] = k;
+    out.weight.qdata = out.buf.p;
+    out.weight.scales = static_cast<std::uint8_t*>(out.buf.p) + qbytes;
+    out.weight.payload_bytes = qbytes + sbytes;
+    return out;
+}
+
+int dflash2_kv_materialize_test(DeviceContext& dev, int w, int count, int base_pos, int slot,
+                                bool graph) {
+    auto ctx = values(2304 * w, 701 + w, 0.25f);
+    std::vector<std::int32_t> pos(w), cnt{count}, sl{slot};
+    for (int i = 0; i < w; ++i) pos[i] = base_pos + i;
+    auto d_ctx = to_device_bf16(ctx);
+    auto d_pos = to_device(pos);
+    auto d_cnt = to_device(cnt);
+    auto d_sl  = to_device(sl);
+
+    LayoutBuilder lb;
+    const auto kv_layout = plan_cyclic_kv_cache(lb, 5, 2048, 8, 128, 2);
+    const std::size_t kv_bytes = lb.finish(256);
+    DeviceBuffer kv_buf(kv_bytes);
+    kv_buf.fill(0);
+    CyclicKVCache kv(DeviceSpan{kv_buf.p, kv_bytes}, kv_layout);
+
+    std::vector<OwnedQ4Weight> kw(5), vw(5);
+    std::vector<std::vector<float>> kn_h(5);
+    std::vector<DeviceBuffer> kn_d(5);
+    std::array<ops::ContextKVMaterializeLayerView, 5> layers{};
+    for (int l = 0; l < 5; ++l) {
+        kw[l] = make_q4_weight(1024, 2304, 10 + l);
+        vw[l] = make_q4_weight(1024, 2304, 20 + l);
+        kn_h[l] = values(128, 30 + l, 0.5f);
+        kn_d[l] = to_device_bf16(kn_h[l]);
+        layers[l].key_weight = kw[l].weight;
+        layers[l].value_weight = vw[l].weight;
+        layers[l].key_norm_weight = Tensor(kn_d[l].p, DType::BF16, {128});
+        layers[l].cache = kv.layer_view(l);
+    }
+
+    Tensor t_ctx(d_ctx.p, DType::BF16, {2304, w, 1});
+    Tensor t_pos(d_pos.p, DType::I32, {w, 1});
+    Tensor t_cnt(d_cnt.p, DType::I32, {1});
+    Tensor t_sl(d_sl.p, DType::I32, {1});
+    WorkspaceArena ws(ops::inkling2_dflash2_kv_materialize_workspace_bytes(w));
+    ops::ContextKVMaterializeExecutionEnvelope env{0U, static_cast<std::uint32_t>(w)};
+    graph_run(dev, [&] {
+        ops::inkling2_dflash2_kv_materialize(t_ctx, t_pos, t_cnt, t_sl, layers, env, ws,
+                                             dev.stream);
+    }, graph);
+
+    int fail = 0;
+    for (int l = 0; l < 5; ++l) {
+        const auto view = kv.layer_view(l);
+        const std::size_t k_elems =
+            128ULL * view.padded_capacity * 8U * static_cast<std::size_t>(view.lane_capacity);
+        const auto got_k = from_device_bf16(view.k.data, k_elems);
+        const auto got_v_raw = from_device<std::uint16_t>(view.v.data, k_elems);
+        for (int i = 0; i < count; ++i) {
+            const int ring = (pos[i]) & 2047;
+            std::vector<double> k_raw(1024, 0.0), v_raw(1024, 0.0);
+            for (int r = 0; r < 1024; ++r) {
+                double sk = 0.0, sv = 0.0;
+                for (int c = 0; c < 2304; ++c) {
+                    const double x = ctx[static_cast<std::size_t>(i) * 2304 + c];
+                    sk += kw[l].decoded[static_cast<std::size_t>(r) * 2304 + c] * x;
+                    sv += vw[l].decoded[static_cast<std::size_t>(r) * 2304 + c] * x;
+                }
+                k_raw[r] = sk;
+                v_raw[r] = sv;
+            }
+            for (int h = 0; h < 8; ++h) {
+                double ss = 0.0;
+                for (int d = 0; d < 128; ++d) ss += k_raw[h * 128 + d] * k_raw[h * 128 + d];
+                const double inv = 1.0 / std::sqrt(ss / 128.0 + 1e-6);
+                std::vector<double> exp_k(128), act_k(128), exp_v(128), act_v(128);
+                for (int d = 0; d < 64; ++d) {
+                    const double a = static_cast<double>(pos[i]) *
+                                     std::pow(10000.0, -2.0 * static_cast<double>(d) / 128.0);
+                    const double co = std::cos(a), si = std::sin(a);
+                    const double x0 = k_raw[h * 128 + d] * inv * kn_h[l][d];
+                    const double x1 = k_raw[h * 128 + d + 64] * inv * kn_h[l][d + 64];
+                    exp_k[d]      = x0 * co - x1 * si;
+                    exp_k[d + 64] = x1 * co + x0 * si;
+                }
+                for (int d = 0; d < 128; ++d) {
+                    const std::size_t idx =
+                        static_cast<std::size_t>(d) +
+                        128ULL * (ring + static_cast<std::size_t>(view.padded_capacity) *
+                                             (h + 8ULL * slot));
+                    act_k[d] = got_k[idx];
+                    __half vh;
+                    std::memcpy(&vh, &got_v_raw[idx], 2);
+                    act_v[d] = __half2float(vh);
+                    exp_v[d] = v_raw[h * 128 + d];
+                }
+                constexpr ReductionCriterion kBFComposed{4.0e-3, 1e-4, 8.0e-3};
+                fail += verify_reduction("dflash2 kv K", act_k, exp_k, kBFComposed);
+                fail += verify_reduction("dflash2 kv V", act_v, exp_v, kBFComposed);
+                if (fail > 0) return fail;
+            }
+        }
+    }
+    return fail;
+}
+
+int dflash2_conv_test(DeviceContext& dev, int w, bool graph) {
+    auto res_h = values(2304 * w, 801 + w, 0.5f);
+    auto nw_h  = values(2304, 802 + w, 0.5f);
+    auto bk_h  = values(2304 * 4, 803 + w, 0.25f);
+    auto kp_h  = values(2304 * 576, 804 + w, 0.05f);
+    auto po_h  = values(2304 * w, 805 + w, 0.5f);
+    auto d_res = to_device_bf16(res_h);
+    auto d_nw  = to_device_bf16(nw_h);
+    auto d_bk  = to_device_bf16(bk_h);
+    auto d_kp  = to_device_bf16(kp_h);
+    auto d_po  = to_device_bf16(po_h);
+    GuardedDeviceBuffer d_prep(2304ULL * w * 2U), d_delta(144ULL * 2U * w * 2U);
+    Tensor t_res(d_res.p, DType::BF16, {2304, w});
+    Tensor t_nw(d_nw.p, DType::BF16, {2304});
+    Tensor t_bk(d_bk.p, DType::BF16, {2304, 2, 2});
+    Tensor t_kp(d_kp.p, DType::BF16, {2304, 576});
+    Tensor t_po(d_po.p, DType::BF16, {2304, w});
+    Tensor t_prep(d_prep.data(), DType::BF16, {2304, w});
+    Tensor t_delta(d_delta.data(), DType::BF16, {144, 2, w});
+
+    std::vector<double> norm_d(2304 * w);
+    for (int i = 0; i < w; ++i) {
+        const double inv = invnorm(&res_h[i * 2304], 2304);
+        for (int h = 0; h < 2304; ++h) {
+            norm_d[i * 2304 + h] =
+                static_cast<double>(__bfloat162float(__float2bfloat16_rn(
+                    static_cast<float>(res_h[i * 2304 + h] * inv * nw_h[h]))));
+        }
+    }
+    std::vector<double> d_mat(576 * w, 0.0);
+    for (int i = 0; i < w; ++i)
+        for (int r = 0; r < 576; ++r)
+            for (int h = 0; h < 2304; ++h)
+                d_mat[i * 576 + r] += kp_h[r * 2304 + h] * norm_d[i * 2304 + h];
+
+    std::vector<double> exp_prep(2304 * w), exp_delta(144 * 2 * w), exp_res(2304 * w);
+    for (int i = 0; i < w; ++i) {
+        for (int g = 0; g < 144; ++g) {
+            exp_delta[i * 288 + g]       = d_mat[i * 576 + 2 * 144 + g];
+            exp_delta[i * 288 + 144 + g] = d_mat[i * 576 + 3 * 144 + g];
+        }
+        for (int h = 0; h < 2304; ++h) {
+            const int g = h >> 4;
+            double v = (bk_h[h] + d_mat[i * 576 + g]) * norm_d[i * 2304 + h];
+            if (i > 0) v += (bk_h[2304 + h] + d_mat[i * 576 + 144 + g]) * norm_d[(i - 1) * 2304 + h];
+            exp_prep[i * 2304 + h] = v;
+
+            const double fd0 = __bfloat162float(__float2bfloat16_rn(
+                static_cast<float>(d_mat[i * 576 + 2 * 144 + g])));
+            const double fd1 = __bfloat162float(__float2bfloat16_rn(
+                static_cast<float>(d_mat[i * 576 + 3 * 144 + g])));
+            double r = res_h[i * 2304 + h] + (bk_h[2 * 2304 + h] + fd0) * po_h[i * 2304 + h];
+            if (i > 0) r += (bk_h[3 * 2304 + h] + fd1) * po_h[(i - 1) * 2304 + h];
+            exp_res[i * 2304 + h] = r;
+        }
+    }
+
+    WorkspaceArena ws(ops::inkling2_dflash2_conv_prepare_workspace_bytes(w));
+    graph_run(dev, [&] {
+        ops::inkling2_dflash2_conv_prepare(t_res, t_nw, 1e-6f, t_bk, t_kp, t_prep, t_delta, ws,
+                                           dev.stream);
+        ops::inkling2_dflash2_conv_finish_add(t_po, t_bk, t_delta, t_res, dev.stream);
+    }, graph);
+    int fail = check("dflash2 conv_prepare", d_prep, exp_prep);
+    fail += check("dflash2 conv_finish_delta", d_delta, exp_delta);
+    fail += verify_reduction("dflash2 conv_finish_add", from_device_bf16(d_res.p, 2304 * w),
+                             exp_res, kBF);
+    return fail;
+}
+
+int dflash2_topk16_and_select_test(DeviceContext& dev, int k, float temp, bool graph) {
+    auto mh_h  = values(2304 * k, 901 + k, 0.25f);
+    auto hp_h  = values(2304 * 256, 902 + k, 0.05f);
+    auto lg_h  = values(201024 * k, 903 + k, 5.0f);
+    // Poison padded region [200058..201024) to verify exclusion.
+    for (int i = 0; i < k; ++i)
+        for (int v = 200058; v < 201024; ++v) lg_h[static_cast<std::size_t>(i) * 201024 + v] = 500.0f;
+    // Plant ties on column 0.
+    lg_h[100] = 20.0f;
+    lg_h[50]  = 20.0f;
+
+    auto pcb_h = values(256 * 201024, 904 + k, 0.1f);
+    auto scb_h = values(256 * 201024, 905 + k, 0.1f);
+    std::vector<std::int32_t> anc_h{42}, bpos_h{1000};
+    ops::SamplingConfig cfg{};
+    cfg.temperature = temp;
+    cfg.seed        = 12345ULL;
+
+    auto d_mh  = to_device_bf16(mh_h);
+    auto d_lg  = to_device_bf16(lg_h);
+    auto d_hp  = to_device_bf16(hp_h);
+    auto d_anc = to_device(anc_h);
+    auto d_pcb = to_device_bf16(pcb_h);
+    auto d_scb = to_device_bf16(scb_h);
+    auto d_bp  = to_device(bpos_h);
+    auto d_cfg = to_device(std::vector<ops::SamplingConfig>{cfg});
+    GuardedDeviceBuffer d_cids(16ULL * k * 4U), d_drafts(k * 4ULL), d_q(16ULL * k * 4U);
+
+    Tensor t_mh(d_mh.p, DType::BF16, {2304, k});
+    Tensor t_lg(d_lg.p, DType::BF16, {201024, k});
+    Tensor t_hp(d_hp.p, DType::BF16, {2304, 256});
+    Tensor t_anc(d_anc.p, DType::I32, {1});
+    Tensor t_pcb(d_pcb.p, DType::BF16, {256, 201024});
+    Tensor t_scb(d_scb.p, DType::BF16, {256, 201024});
+    Tensor t_bp(d_bp.p, DType::I32, {1});
+    Tensor t_cids(d_cids.data(), DType::I32, {16, k, 1});
+    Tensor t_drafts(d_drafts.data(), DType::I32, {k, 1});
+    Tensor t_q(d_q.data(), DType::FP32, {16, k, 1});
+
+    WorkspaceArena ws(ops::inkling2_dflash2_topk16_and_select_workspace_bytes(k));
+    graph_run(dev, [&] {
+        ops::inkling2_dflash2_topk16_and_select(
+            t_mh, t_lg, t_hp, t_anc, t_pcb, t_scb, t_bp,
+            static_cast<const ops::SamplingConfig*>(d_cfg.p), t_cids, t_drafts, t_q, ws,
+            dev.stream);
+    }, graph);
+
+    std::vector<std::int32_t> exp_cids(16 * k), exp_drafts(k);
+    std::vector<double> exp_q(16 * k, 0.0);
+    int pred = anc_h[0];
+    for (int i = 0; i < k; ++i) {
+        std::vector<std::pair<float, int>> items(200058);
+        for (int v = 0; v < 200058; ++v)
+            items[v] = {lg_h[static_cast<std::size_t>(i) * 201024 + v], v};
+        std::partial_sort(items.begin(), items.begin() + 16, items.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.first > b.first || (a.first == b.first && a.second < b.second);
+                          });
+        std::vector<double> sel_h(256, 0.0);
+        for (int r = 0; r < 256; ++r) {
+            double s = 0.0;
+            for (int h = 0; h < 2304; ++h) s += hp_h[r * 2304 + h] * mh_h[i * 2304 + h];
+            sel_h[r] = __bfloat162float(__float2bfloat16_rn(static_cast<float>(s)));
+        }
+        std::vector<double> edges(16);
+        double max_e = -1e30;
+        for (int c = 0; c < 16; ++c) {
+            exp_cids[i * 16 + c] = items[c].second;
+            double corr          = 0.0;
+            for (int r = 0; r < 256; ++r)
+                corr += pcb_h[static_cast<std::size_t>(pred) * 256 + r] * sel_h[r] *
+                        scb_h[static_cast<std::size_t>(items[c].second) * 256 + r];
+            edges[c] = 30.0 * std::tanh((items[c].first + corr) / 30.0);
+            max_e    = std::max(max_e, edges[c]);
+        }
+        int best_c = 0;
+        if (temp <= 0.0f) {
+            for (int c = 1; c < 16; ++c)
+                if (edges[c] > edges[best_c]) best_c = c;
+            exp_q[i * 16 + best_c] = 1.0;
+        } else {
+            double sum_w = 0.0;
+            for (int c = 0; c < 16; ++c) {
+                exp_q[i * 16 + c] = std::exp((edges[c] - max_e) / temp);
+                sum_w += exp_q[i * 16 + c];
+            }
+            for (int c = 0; c < 16; ++c) exp_q[i * 16 + c] /= sum_w;
+            auto splitmix64 = [](std::uint64_t x) {
+                x += 0x9E3779B97F4A7C15ull;
+                x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+                x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+                return x ^ (x >> 31);
+            };
+            std::uint64_t key = cfg.seed;
+            key = splitmix64(key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(bpos_h[0] + i)) * 0xD1B54A32D192ED03ull));
+            key = splitmix64(key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(ops::kSamplePurposeDFlash2Proposal)) << 21));
+            const float u = static_cast<float>(static_cast<std::uint32_t>(key >> 40)) * (1.0f / 16777216.0f);
+            double cdf = 0.0;
+            best_c     = 15;
+            for (int c = 0; c < 16; ++c) {
+                cdf += exp_q[i * 16 + c];
+                if (u < cdf) {
+                    best_c = c;
+                    break;
+                }
+            }
+        }
+        exp_drafts[i] = exp_cids[i * 16 + best_c];
+        pred          = exp_drafts[i];
+    }
+
+    int fail = verify_exact("dflash2 topk16 candidate_ids",
+                            from_device<std::int32_t>(d_cids.data(), 16 * k), exp_cids);
+    fail += verify_exact("dflash2 drafts", from_device<std::int32_t>(d_drafts.data(), k),
+                         exp_drafts);
+    fail += check("dflash2 proposal_q", d_q, exp_q, true, &kFPMma);
+    return fail;
+}
 } // namespace
 
 int main() {
@@ -410,6 +756,13 @@ int main() {
         failures += dspark_feature_mix_test(device, 8, true);
         failures += dspark_rmsnorm_rope_test(device, 8, true);
         failures += dspark_rnn_step_test(device, false);
+        for (int w : {1, 8, 16}) failures += dflash2_kv_materialize_test(device, w, w, 2043, 1, w != 1);
+        failures += dflash2_kv_materialize_test(device, 8, 5, 2046, 0, true);
+        for (int w : {2, 8, 16}) failures += dflash2_conv_test(device, w, w != 2);
+        for (int k : {1, 7, 15}) {
+            failures += dflash2_topk16_and_select_test(device, k, 0.0f, k != 1);
+            failures += dflash2_topk16_and_select_test(device, k, 0.8f, true);
+        }
         std::cout << (failures ? "FAIL" : "PASS") << " Inkling2 fused ops (" << failures << " failures)\n";
         return failures ? 1 : 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

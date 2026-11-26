@@ -7,6 +7,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace ninfer::targets::inkling2_mini::detail {
@@ -15,6 +16,7 @@ struct StateLayout {
     DeviceKVPagePoolLayout pages;
     KVExecutionTableLayout tables;
     CyclicKVCacheLayout cyclic;
+    CyclicKVCacheLayout dflash2_cyclic;
     TensorRegion convolution;
     std::size_t bytes = 0;
 };
@@ -23,7 +25,9 @@ struct StateLayout {
 struct HostStateImage {
     HostKVAllocation pages;
     PinnedHostBuffer fixed;
-    std::uint32_t depth = 0;
+    std::uint32_t depth         = 0;
+    std::uint32_t dspark_depth  = 0;
+    std::uint32_t dflash2_depth = 0;
 
     explicit HostStateImage(std::size_t fixed_bytes) : fixed(fixed_bytes) {}
 };
@@ -50,6 +54,10 @@ public:
     std::uint32_t dspark_depth(std::uint32_t slot) const;
     void commit_dspark_append(std::uint32_t slot, std::uint32_t depth);
     bool has_dspark() const noexcept { return has_dspark_; }
+    CyclicKVCacheLayerView dflash2_swa(int layer) const;
+    std::uint32_t dflash2_depth(std::uint32_t slot) const;
+    void commit_dflash2_append(std::uint32_t slot, std::uint32_t depth);
+    bool has_dflash2() const noexcept { return has_dflash2_; }
     std::size_t dflash_kv_bytes() const noexcept;
     std::uint32_t depth(std::uint32_t slot) const;
     std::uint32_t free_pages() const noexcept;
@@ -76,19 +84,22 @@ private:
     struct Slot {
         std::vector<std::shared_ptr<DeviceKVPageLease>> pages;
         KVExecutionRowLease row;
-        std::uint32_t depth        = 0;
-        std::uint32_t dspark_depth = 0;
+        std::uint32_t depth         = 0;
+        std::uint32_t dspark_depth  = 0;
+        std::uint32_t dflash2_depth = 0;
     };
 
     void publish(std::uint32_t slot, cudaStream_t stream);
-    bool has_dspark_ = false;
-    int full_layers_ = 8;
-    int swa_layers_  = 40;
+    bool has_dspark_  = false;
+    bool has_dflash2_ = false;
+    int full_layers_  = 8;
+    int swa_layers_   = 40;
     StateLayout layout_;
     DeviceBuffer backing_;
     DeviceKVPagePool pages_;
     KVExecutionTablePool tables_;
     CyclicKVCache cyclic_;
+    std::optional<CyclicKVCache> dflash2_cyclic_;
     Tensor convolution_;
     KvCacheStorage storage_;
     std::uint32_t max_context_;

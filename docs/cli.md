@@ -79,7 +79,7 @@ output capacity for the inserted suffix and the answer:
 GPU residency is frozen when the Engine starts:
 
 - no `--spec` omits MTP/DFlash/DFlash2 weights and state and the optimized proposal head;
-- `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B) load only
+- `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B / Inkling-2-Mini) load only
   the selected speculative backend;
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
@@ -198,8 +198,9 @@ For DFlash:
   --spec dflash --draft-tokens 7 --lm-head-draft
 ```
 
-For Qwen3.8-27B artifacts containing the DFlash2 companion weights, select
-`--spec dflash2 --draft-tokens 7`, optionally with `--lm-head-draft` and `--vision`.
+For Qwen3.8-27B and Inkling-2-Mini artifacts containing the DFlash2 companion weights, select
+`--spec dflash2 --draft-tokens 7`, optionally with `--lm-head-draft` and `--vision` (Qwen3.8-27B;
+Inkling-2-Mini is text-only and uses the full proposal head).
 DFlash2 accepts every draft count from 1 through 15; seven is the checkpoint recommendation.
 Both `groupwise-int` and `nvfp4` artifacts use the same Engine route, including CUDA Graph,
 concurrent requests, sampling penalties, and prefix reuse. An artifact without the companion

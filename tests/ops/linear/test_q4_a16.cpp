@@ -123,6 +123,16 @@ int q4_a16_conformance() {
                           {201024, 2304, 147U, Comparison::Sampled, false, kN201024K2304});
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
                           {2304, 3072, 149U, Comparison::Sampled, false, kInklingK2304});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {4096, 2304, 153U, Comparison::Sampled, false, kInklingK2304});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {6912, 2304, 155U, Comparison::Sampled, false, kInklingK2304});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {13824, 2304, 157U, Comparison::Sampled, false, kInklingK2304});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {2304, 4096, 159U, Comparison::Sampled, false, kInklingK2304});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {2304, 6912, 161U, Comparison::Sampled, false, kInklingK2304});
 
     return failures;
 }

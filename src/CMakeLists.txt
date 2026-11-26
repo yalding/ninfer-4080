@@ -72,6 +72,7 @@ endif()
 add_library(ninfer_ops STATIC
   ops/inkling2/inkling2_fused.cpp
   ops/inkling2/fused.cu
+  ops/inkling2/dflash2.cu
   ops/inkling2_moe/inkling2_moe.cpp
   ops/inkling2_moe/inkling2_moe.cu
   ops/softmax_attention/inkling2/inkling2_attention.cpp

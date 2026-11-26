@@ -2,7 +2,7 @@
 
 This reference records the `inkling2_mini` native target (`inkling2-mini / q3g128`,
 `inkling2_loop`) in NInfer: model semantics, artifact and converter contract, runtime and state
-ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–5 measurements.
+ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–6 measurements.
 
 ## 1. Model Identity and Architecture
 
@@ -37,6 +37,7 @@ ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–5 measurements
   - `text/output_head` (`[201024, 2304]`): `Q6G64_F16S` (`345 MiB`)
   - Norms, `sconv`, dynamic conv projections, sinks, relative biases, clips, routers, loop rank-64 tensors: `BF16` / `FP32` (`~49 MiB`)
   - Optional DSpark `mtp/` tensors (`--mtp`, `53` stored tensors -> `593` total objects, `11,476,532,736` bytes total: `10.63 GiB` device weights with full proposal head, `10.66 GiB` when `mtp/draft_head` `Q4G64_F16S [32768, 2304]` + `mtp/draft_head_token_ids` `I32 [32768]` are active under `--lm-head-draft`): `fuse_weight` (`FP32` `[4, 4]`), `mask_embed` & `final_norm` (`BF16`), `3` draft layers (`Q4G64_F16S` `q`/`k`/`v`/`k_ctx`/`v_ctx`/`output`/`gate_up`/`down` + `BF16` norms), and Markov RNN head (`markov/dflare_norm`, `w1`, `rnn_proj_*`, `hidden_out_*`). Bound with `TensorPlacement::ValidateOnly` when speculative decoding is disabled.
+  - Optional DFlash 2 `dflash2/` companion tensors (`--dflash2 <dir>` + `--base-artifact <base.ninfer>`, `76` stored tensors -> `616` total objects on base `540`, `11,619,800,576` bytes total / `10.80 GiB` resident device arena): `dflash2/fc` (`Q4G64_F16S [2304, 9216]`), `5` non-causal SWA draft layers (`Q4G64_F16S` `q`/`k`/`v`/`output` + fused `gate_up`/`down`, `BF16` `input_norm`/`post_attention_norm`/`q_norm`/`k_norm`, and `BF16` dynamic grouped width-2 `attention_conv`/`mlp_conv` `base_kernel` + `kernel_projection`), `dflash2/{hidden_norm,final_norm}` (`BF16`), and rank-256 `dflash2/selector/{hidden_projection,predecessor_codebook,successor_codebook}` (`BF16`). Bound with `TensorPlacement::ValidateOnly` when `--spec dflash2` is not selected.
   - Frontend resources: `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`
 
 ## 3. Runtime, StateImage, Prefix Reuse, and Frontend
@@ -47,6 +48,7 @@ ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–5 measurements
   - `40` cyclic SWA KV caches (`capacity = 1024`, `D = 128`, `Hkv = 8`, BF16 K + FP16 V = `160 MiB`)
   - `8` Full-Attn layers backed by `PagedKVCache` (`RK4V4E8` default in `scripts/run-ninfer-4060ti-inkling2.bat` at `1.06 GiB` @ `131,072` tokens; `Int8Group64` `2.06 GiB`; or `BFloat16`)
   - Optional DSpark state (when `--spec dflash|mtp` is enabled): `9th` `PagedKVCache` Full-Attn layer (`mtp/layers/1`) + `2` cyclic SWA caches (`mtp/layers/{0, 2}`, `1024` window) + `dspark_c_head` and `3`-tap `1.83 MiB` `conv_trace` rollback buffer
+  - Optional DFlash 2 state (when `--spec dflash2` is enabled): `5` cyclic SWA KV caches (`capacity = 2048`, `D = 128`, `Hkv = 8`, `BF16` K + `FP16` V = `40.0 MiB` fixed per slot, orthogonal to target Full-Attn KV dtype), `dflash2_depth` frontier, and `3`-tap `conv_trace` rollback buffer; participates in `reset`, `copy`, and host spill/restore
 - **Prefix reuse & pressure handling:**
   - `Program::inspect_admission` emits exact `PrefixReusePath` (`SharedStablePrefix`, `PrivateEndpoint`, `PrivateTurnClosure`, `PrivateResponseReplay`, `PrivateLongAnchor`) and H2D/D2D transfer estimates (`169,689,088` B / `81` slices per StateImage).
   - `CapturePressurePlanningSession` and `Program::progress_context_transaction` implement single-owner host spill and eviction under pressure.
@@ -200,8 +202,59 @@ Conditions: `--max-ctx 131072 --kv-dtype int8 -r 1 --warmup 0`, `bench/fixtures/
 
 *Note on DSpark vs `MTP0`:* Because Sparse MoE verification (`W=3`) expands active experts from `8` to `~20–22` per visit across 48 visits, a graphed `K=2` round takes `~2.05×` an `MTP0` step. Consequently, **DSpark `K=2` (full head) beats `MTP0` when acceptance exceeds `~52%` (`> 2.05 tok/round`)** — e.g. code/structured generation (`79.9` vs `78.1 tok/s` at `54.1%`) — whereas `MTP0` (`79.27 tok/s`) remains much faster on dense prose (`5.7%–16.1%` acceptance). The current BPE-rank `[0..32709]` shortlist for `--lm-head-draft` drops acceptance from `54.1%` to `23.4%` because common tokens sit above ID `32710`, so leave `--lm-head-draft` off until shortlist calibration is added.
 
+### Phase 6: DFlash 2 (`--spec dflash2`) Speculative Decoding
+
+1. **Artifact & Converter (`tools/convert/inkling2_mini/`):** Added `--dflash2` (`76` stored `dflash2/*` tensors) and `--base-artifact` fast repack (`models/inkling2_mini_q3g128_dflash2.ninfer`, `616` objects, `11,619,800,576` bytes / `10.80 GiB` device weights). Verified `435` exact direct tensors, `min_q4_cosine = 0.991429`, `min_q6_cosine = 0.999642`, and `tests.convert.inkling2_mini.test_verify` (`3` cases, `OK`).
+   - Repack command: `python -m tools.convert.inkling2_mini.convert --model models/Inkling-2-Mini --base-artifact models/inkling2_mini_q3g128.ninfer --dflash2 models/Inkling-2-Mini-DFlash2 --no-mtp --out models/inkling2_mini_q3g128_dflash2.ninfer`
+   - CLI / Server flags: `--spec dflash2 --draft-tokens 7` (`1..15` supported, text-only, full proposal head)
+2. **Closed `H = 2304` CUDA Ops (`src/ops/inkling2/`):** Added `inkling2_dflash2_{kv_materialize,conv_prepare,conv_finish_add,topk16_and_select}` in `include/ninfer/ops/inkling2_fused.h`, `src/ops/inkling2/{launch.h,inkling2_fused.cpp,dflash2.cu}`, plus `2304 <-> {4096, 6912, 13824}` dispatch in `q4_dispatch.cpp` and `(201024, 200058)` support in `speculative_accept_sparse_drafts`. Qualified all new ops against independent FP64 host oracles (`test_inkling2_fused`, `ninfer_linear_q4_a16_test`, `ninfer_speculative_round_test`: `0` failures).
+3. **Single-Sync Graphed Runtime & StateImage (`src/targets/inkling2_mini/`):** Wired `--spec dflash2` (default `draft_tokens = 7`, `W = 8`, `1..15` supported) with `[5, 23, 41, 48]` `[9216, T]` feature capture, `rmsnorm(token_embedding, token_norm)` query embedding, `rope_theta = 10000.0`, post-correction `30 * tanh((u + corr) / 30)` rank-256 candidate selector, `5 × 2048` cyclic KV ring (`40.0 MiB` per slot), and single-sync CUDA-graphed `speculative_step_dflash2`.
+
+**512-Token C++20 SPSC Ring-Buffer `K` Sweep (`ninfer.exe`, `--greedy --max-new 512 --max-context 4096 --kv-capacity 4096 --kv-dtype rk4v4-e8 --no-thinking`):**
+
+| Config | Decode Speed | Rounds | Acceptance Rate | Mean Length | Accepted by Pos |
+|---|---:|---:|---:|---:|---|
+| `MTP0` (`K=0`) | `78.8 tok/s` | `—` | `—` | `1.00 tok/step` | `—` |
+| `DFlash2 K=4` (`W=5`) | `80.5 tok/s` | `172` | `49.4%` | `2.97 tok/round` | `125,92,71,51` |
+| `DFlash2 K=5` (`W=6`) | `79.5 tok/s` | `161` | `43.6%` | `3.17 tok/round` | `113,86,67,47,37` |
+| `DFlash2 K=6` (`W=7`) | `75.9 tok/s` | `156` | `37.9%` | `3.27 tok/round` | `113,78,57,46,34,26` |
+| **`DFlash2 K=7` (`W=8`, default)** | **`86.0 tok/s`** | `135` | `39.8%` | **`3.79 tok/round`** | `107,74,61,45,39,29,21` |
+
+**Short-Context Workloads (`ninfer.exe`, `DFlash2 K=7`, `rk4v4-e8` unless noted):**
+
+| Workload | `MTP0` Decode | `DFlash2 K=7` Decode | Speedup | Acceptance | Notes |
+|---|---:|---:|---:|---:|---|
+| Math reasoning (`512` tok, greedy) | `78.7 tok/s` | **`116.7 tok/s`** | **`+48.3%`** | `52.9%` (`4.65 tok/round`) | `110` rounds (`90,78,74,59,47,31,22`) |
+| C++20 `gcd` (`64` tok, greedy) | `82.0 tok/s` | **`102.1 tok/s`** | **`+24.5%`** | `51.6%` (`4.43 tok/round`) | `60/64` exact prefix match |
+| C++20 SPSC (`512` tok, `int8`, greedy) | `—` | `72.9 tok/s` | `—` | `31.5%` (`3.19 tok/round`) | `160` rounds |
+| >2048 ring-wrap (`2,150` tok, `rk4v4-e8`) | `—` | `60.8 tok/s` | `—` | `26.9%` (`2.88 tok/round`) | `745` rounds, `0` fallbacks (`2,228` total pos) |
+| Stochastic (`--temperature 1.0 --seed 42`, `128` tok) | `—` | `59.7 tok/s` | `—` | `23.6%` (`2.62 tok/round`) | `48` rounds, `57.5 MiB` KV (`17.5 + 40.0`) |
+
+**Long-Context `ninfer_bench` (`110,000`-token in-distribution Inkling corpus, `r=2, warmup=1`):**
+
+*`rk4v4-e8` KV (`--max-ctx 131072`, `10.80 GiB` weights + `1.53 GiB` sequence (`1.10 GiB` KV = `1.06 GiB` paged + `40 MiB` DFlash2) + `66.7 MiB` workspace = `~12.40 GiB` total):*
+
+| Depth (`pp + tg128`) | `MTP0` Prefill | `DFlash2` Prefill | `MTP0` Decode | `DFlash2 K=7` Decode | Decode Delta | Spec Acc (`rounds/fb`) |
+|---|---:|---:|---:|---:|---:|---:|
+| `pp4096+tg128` | `1,919.58 tok/s` | `1,903.35 tok/s` | **`71.86 tok/s`** | `61.96 tok/s` | `-13.8%` | `32.6%` (`78/2`) |
+| `pp32768+tg128` | `1,732.08 tok/s` | `1,716.00 tok/s` | `59.37 tok/s` | **`68.02 tok/s`** | **`+14.6%`** | `64.2%` (`48/0`) |
+| `pp65536+tg128` | `1,562.63 tok/s` | `1,550.24 tok/s` | **`49.72 tok/s`** | `44.52 tok/s` | `-10.5%` | `54.6%` (`54/0`) |
+| `pp100000+tg128` | `1,412.18 tok/s` | `1,403.21 tok/s` | `43.21 tok/s` | **`43.84 tok/s`** | **`+1.5%`** | `70.2%` (`44/0`) |
+
+*`int8-group64` KV (`--max-ctx 102400`, `10.80 GiB` weights + `2.08 GiB` sequence (`1.65 GiB` KV = `1.61 GiB` paged + `40 MiB` DFlash2) + `66.7 MiB` workspace = `~12.95 GiB` total):*
+
+| Depth (`pp + tg128`) | `MTP0` Prefill | `DFlash2` Prefill | `MTP0` Decode | `DFlash2 K=7` Decode | Decode Delta | Spec Acc (`rounds/fb`) |
+|---|---:|---:|---:|---:|---:|---:|
+| `pp4096+tg128` | `1,918.84 tok/s` | `1,900.71 tok/s` | **`71.90 tok/s`** | `68.57 tok/s` | `-4.6%` | `36.9%` (`72/0`) |
+| `pp32768+tg128` | `1,717.49 tok/s` | `1,702.82 tok/s` | `58.00 tok/s` | **`63.45 tok/s`** | **`+9.4%`** | `58.3%` (`50/2`) |
+| `pp65536+tg128` | `1,540.10 tok/s` | `1,530.06 tok/s` | **`48.34 tok/s`** | `43.13 tok/s` | `-10.8%` | `49.2%` (`60/2`) |
+| `pp100000+tg128` | `1,388.65 tok/s` | `1,375.20 tok/s` | **`40.47 tok/s`** | `28.30 tok/s` | `-30.1%` | `38.9%` (`70/0`) |
+
+*Note on `65K–100K` `W = 8` Full-Attention verification:* `attention_decode_kernel` currently uses `Tq = 2` for `2 <= T <= 15`, so `W = 8` verification launches `4` CTAs per KV head and scans the paged KV cache `4×` per Full-Attn visit (`8` visits × `4` scans). Extending `attention_decode_kernel` to `Tq = 8` (or multi-query Tensor Core FlashDecoding for `W = 8`) will collapse that `4×` KV scan to `1×` per visit.
+
 ## 5. Follow-On Roadmap
 
-1. **Frequency-calibrated DSpark shortlist:** Calibrate `mtp/draft_head_token_ids` by token frequency on a code+text corpus (instead of raw BPE rank) so `--lm-head-draft` preserves full-head `54%+` acceptance.
-2. **Quality upgrade option:** Add imatrix/AWQ calibration or `Q4G64_F16S` `ffn/routed_down` if closing the `8.71` vs `8.16` PPL gap is prioritized over `128K` VRAM headroom.
-3. **Vision:** Port Inkling-2's 23-layer ViT (`dim=1024`, `patch=20`, `merge=2`, axial RoPE `theta=10000`).
+1. **Multi-query `Tq = 8` / Tensor Core Full-Attn verification (`W = 8`):** Collapse the `4×` KV scan in `attention_decode_kernel` (`Tq = 2`) to `1×` per visit for `DFlash2` `65K–100K` decode.
+2. **Frequency-calibrated DSpark shortlist:** Calibrate `mtp/draft_head_token_ids` by token frequency on a code+text corpus (instead of raw BPE rank) so `--lm-head-draft` preserves full-head `54%+` acceptance.
+3. **Quality upgrade option:** Add imatrix/AWQ calibration or `Q4G64_F16S` `ffn/routed_down` if closing the `8.71` vs `8.16` PPL gap is prioritized over `128K` VRAM headroom.
+4. **Vision:** Port Inkling-2's 23-layer ViT (`dim=1024`, `patch=20`, `merge=2`, axial RoPE `theta=10000`).

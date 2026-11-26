@@ -263,6 +263,59 @@ void qualify(KvCacheStorage storage) {
             "expired host image releases state slot and KV arena allocation");
     state.reset(1, device.stream);
 }
+
+void qualify_dflash2() {
+    DeviceContext device;
+    EngineOptions options;
+    options.max_context                          = 256;
+    options.max_concurrency                      = 1;
+    options.kv_cache                             = KvCacheStorage::RK4V4E8;
+    options.speculative.backend                  = SpeculativeBackend::DFlash2;
+    options.speculative.draft_tokens             = 7;
+    options.context_cache.device_state_slots     = 1;
+    options.context_cache.host_state_slots       = 1;
+    options.context_cache.host_kv_capacity_bytes = 2ULL * 1024 * 1024;
+    ik::StateImage state(options, 256);
+    require(state.has_dflash2() && !state.has_dspark(), "DFlash2 state mode");
+    require(state.dflash_kv_bytes() == 5ULL * 2ULL * 128ULL * 2048ULL * 8ULL * 2ULL * 2ULL,
+            "DFlash2 2048-ring KV byte accounting");
+    state.prepare_append(0, 0, 16, device.stream);
+    state.commit_append(0, 16);
+    state.commit_dflash2_append(0, 16);
+    for (int l = 0; l < 5; ++l) {
+        const auto view = state.dflash2_swa(l);
+        CUDA_CHECK(cudaMemsetAsync(view.k.data, 0x40 + l,
+                                   static_cast<std::size_t>(view.k.nb[3]), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(view.v.data, 0x50 + l,
+                                   static_cast<std::size_t>(view.v.nb[3]), device.stream));
+    }
+    auto host = state.snapshot_to_host(0, device.stream);
+    require(host->dflash2_depth == 16, "DFlash2 host snapshot depth");
+    state.copy(0, 1, device.stream);
+    require(state.dflash2_depth(1) == 16, "DFlash2 device copy depth");
+    for (int l = 0; l < 5; ++l) {
+        const auto view = state.dflash2_swa(l);
+        require_bytes(static_cast<std::byte*>(view.k.data) + view.k.nb[3],
+                      static_cast<std::size_t>(view.k.nb[3]), static_cast<unsigned char>(0x40 + l),
+                      "DFlash2 copy preserves K ring");
+        require_bytes(static_cast<std::byte*>(view.v.data) + view.v.nb[3],
+                      static_cast<std::size_t>(view.v.nb[3]), static_cast<unsigned char>(0x50 + l),
+                      "DFlash2 copy preserves V ring");
+    }
+    state.reset(1, device.stream);
+    require(state.dflash2_depth(1) == 0, "DFlash2 reset clears depth");
+    state.restore_from_host(1, *host, device.stream);
+    require(state.dflash2_depth(1) == 16, "DFlash2 host restore restores depth");
+    for (int l = 0; l < 5; ++l) {
+        const auto view = state.dflash2_swa(l);
+        require_bytes(static_cast<std::byte*>(view.k.data) + view.k.nb[3],
+                      static_cast<std::size_t>(view.k.nb[3]), static_cast<unsigned char>(0x40 + l),
+                      "DFlash2 host restore preserves K ring");
+        require_bytes(static_cast<std::byte*>(view.v.data) + view.v.nb[3],
+                      static_cast<std::size_t>(view.v.nb[3]), static_cast<unsigned char>(0x50 + l),
+                      "DFlash2 host restore preserves V ring");
+    }
+}
 } // namespace
 
 int main() {
@@ -272,6 +325,7 @@ int main() {
         qualify(KvCacheStorage::BFloat16);
         qualify(KvCacheStorage::Int8Group64);
         qualify(KvCacheStorage::RK4V4E8);
+        qualify_dflash2();
         EngineOptions options;
         options.max_context                      = 131072;
         options.kv_cache                         = KvCacheStorage::Int8Group64;
@@ -284,7 +338,7 @@ int main() {
         require(rk4_layout.bytes < 1450ULL * 1024 * 1024,
                 "128K RK4V4E8 state/KV allocation fits planned 128K VRAM budget");
         std::cout << "PASS: Inkling BF16/int8/rk4v4-e8 KV page sharing/COW, device/host convolution and SWA "
-                     "snapshots, reset and 128K budget\n";
+                     "snapshots, DFlash2 ring, reset and 128K budget\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

@@ -1,10 +1,14 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/cyclic_kv_cache.h"
 #include "core/tensor.h"
+#include "ninfer/ops/context_kv_materialize.h"
+#include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -172,5 +176,64 @@ void inkling2_dspark_rnn_step(const Tensor& prev_token, const Tensor& markov_w1,
 void inkling2_dspark_commit_conv_state(const Tensor& pre_state, const Tensor& conv_trace,
                                        Tensor& slot_conv_state, std::int32_t width,
                                        std::int32_t accepted, cudaStream_t stream);
+
+/**
+ * Workspace capacity in bytes for `inkling2_dflash2_kv_materialize` up to `max_width` (`1..2048`).
+ */
+[[nodiscard]] std::size_t inkling2_dflash2_kv_materialize_workspace_bytes(std::int32_t max_width);
+
+/**
+ * Materialize normalized DFlash2 context features `BF16 [2304, W, 1]` (`W in 1..2048`) into 5
+ * capacity-2048 cyclic KV layers (`Hq=32, Hkv=8, D=128`, `rope_theta = 10000.0`, `eps = 1e-6`).
+ */
+void inkling2_dflash2_kv_materialize(
+    const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
+    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
+    ContextKVMaterializeExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Workspace capacity in bytes for `inkling2_dflash2_conv_prepare` up to `max_width` (`1..16`).
+ */
+[[nodiscard]] std::size_t inkling2_dflash2_conv_prepare_workspace_bytes(std::int32_t max_width);
+
+/**
+ * Fused RMSNorm + dynamic grouped width-2 convolution prepare (`H = 2304`, `G = 144`, `W in 1..16`):
+ * normalizes `residual [2304, W]` with `norm_weight [2304]` and `eps`, projects through
+ * `kernel_proj [2304, 576]`, emits `prepared [2304, W]` (side 0) and `finish_delta [144, 2, W]`
+ * (side 1).
+ */
+void inkling2_dflash2_conv_prepare(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                   const Tensor& base_kernel, const Tensor& kernel_proj,
+                                   Tensor& prepared, Tensor& finish_delta,
+                                   WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Finish side of DFlash2 dynamic grouped width-2 convolution + residual add (`H = 2304`, `G = 144`):
+ * `residual += (base_kernel[:, 0, 1] + finish_delta[:, 0, :]) * proj_out[:, i]`
+ * `          + (base_kernel[:, 1, 1] + finish_delta[:, 1, :]) * proj_out[:, i - 1]`.
+ */
+void inkling2_dflash2_conv_finish_add(const Tensor& proj_out, const Tensor& base_kernel,
+                                      const Tensor& finish_delta, Tensor& residual,
+                                      cudaStream_t stream);
+
+/**
+ * Workspace capacity in bytes for `inkling2_dflash2_topk16_and_select` up to `max_k` (`1..15`).
+ */
+[[nodiscard]] std::size_t inkling2_dflash2_topk16_and_select_workspace_bytes(std::int32_t max_k);
+
+/**
+ * Fused hidden projection (`[2304, 256]`), exact stable top-16 over `[0, 200058)` from
+ * un-softcapped `unary_logits [201024, K]`, and rank-256 bilinear path selection with post-correction
+ * `30 * tanh((u + corr) / 30)` softcap. Outputs `candidate_ids [16, K, 1]`, `drafts [K, 1]`, and
+ * `proposal_q [16, K, 1]`.
+ */
+void inkling2_dflash2_topk16_and_select(const Tensor& mask_hidden, const Tensor& unary_logits,
+                                        const Tensor& hidden_projection, const Tensor& anchors,
+                                        const Tensor& predecessor_codebook,
+                                        const Tensor& successor_codebook,
+                                        const Tensor& base_positions,
+                                        const SamplingConfig* configs, Tensor& candidate_ids,
+                                        Tensor& drafts, Tensor& proposal_q,
+                                        WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

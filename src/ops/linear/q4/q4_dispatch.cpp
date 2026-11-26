@@ -67,6 +67,19 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     case 4096:
+        if (n == 5120) {
+            if (t == 1) { return launch_q4_gemv_r1_w8_dynamic; }
+            if (t <= 7) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        }
+        if (n == 2304) {
+            if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+            if (t <= 7) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        }
+        break;
     case 17408:
     case 25600:
         // DFlash2 companion matrices: feature projection [5120,25600], attention output
@@ -100,7 +113,10 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         switch (n) {
         case 1024:
         case 3072:
+        case 4096:
         case 6528:
+        case 6912:
+        case 13824:
         case 18432:
         case 32768:
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
@@ -119,6 +135,7 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     case 3072:
+    case 6912:
     case 9216:
         if (n == 2304) {
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }

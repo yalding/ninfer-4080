@@ -39,11 +39,13 @@ StateLayout plan_state(const EngineOptions& options, std::uint32_t kv_tokens) {
         throw std::invalid_argument("Inkling-2 supports --kv-dtype bf16, int8, or rk4v4-e8");
     if (!kv_tokens || !options.max_context || options.max_context > 131072)
         throw std::invalid_argument("Inkling-2 context must be in [1,131072]");
-    const auto slots       = state_slot_count(options);
-    const auto storage     = paged_kv_storage_layout(options.kv_cache, 128);
-    const bool has_dspark  = options.speculative.backend != SpeculativeBackend::None;
-    const int full_layers  = has_dspark ? 9 : 8;
-    const int swa_layers   = has_dspark ? 42 : 40;
+    const auto slots        = state_slot_count(options);
+    const auto storage      = paged_kv_storage_layout(options.kv_cache, 128);
+    const bool has_dspark   = options.speculative.backend == SpeculativeBackend::DFlash ||
+                              options.speculative.backend == SpeculativeBackend::Mtp;
+    const bool has_dflash2  = options.speculative.backend == SpeculativeBackend::DFlash2;
+    const int full_layers   = has_dspark ? 9 : 8;
+    const int swa_layers    = has_dspark ? 42 : 40;
     DeviceKVPagePoolSpec spec;
     // One private partial page per state slot avoids capacity loss when a shared endpoint forks.
     spec.page_group_count = (kv_tokens + 63) / 64 + slots;
@@ -66,6 +68,10 @@ StateLayout plan_state(const EngineOptions& options, std::uint32_t kv_tokens) {
         builder, {(options.max_context + 63) / 64, static_cast<int>(slots)});
     out.cyclic =
         plan_cyclic_kv_cache(builder, swa_layers, 1024, 8, 128, static_cast<int>(slots));
+    if (has_dflash2) {
+        out.dflash2_cyclic =
+            plan_cyclic_kv_cache(builder, 5, 2048, 8, 128, static_cast<int>(slots));
+    }
     out.convolution = builder.add_tensor(DType::BF16, {kConvElements, 48, static_cast<int>(slots)},
                                          256, "Inkling convolution states");
     out.bytes       = builder.finish(256);
@@ -73,7 +79,9 @@ StateLayout plan_state(const EngineOptions& options, std::uint32_t kv_tokens) {
 }
 
 StateImage::StateImage(const EngineOptions& options, std::uint32_t tokens)
-    : has_dspark_(options.speculative.backend != SpeculativeBackend::None),
+    : has_dspark_(options.speculative.backend == SpeculativeBackend::DFlash ||
+                  options.speculative.backend == SpeculativeBackend::Mtp),
+      has_dflash2_(options.speculative.backend == SpeculativeBackend::DFlash2),
       full_layers_(has_dspark_ ? 9 : 8), swa_layers_(has_dspark_ ? 42 : 40),
       layout_(plan_state(options, tokens)), backing_(layout_.bytes),
       pages_({backing_.p, backing_.bytes}, layout_.pages),
@@ -85,6 +93,9 @@ StateImage::StateImage(const EngineOptions& options, std::uint32_t tokens)
       host_layout_(plan_host_kv_page_layout(layout_.pages.spec.geometry)),
       host_state_capacity_(options.context_cache.enabled ? options.context_cache.host_state_slots
                                                          : 0) {
+    if (has_dflash2_) {
+        dflash2_cyclic_.emplace(DeviceSpan{backing_.p, backing_.bytes}, layout_.dflash2_cyclic);
+    }
     backing_.fill();
     // The compute stream is nonblocking, so it does not wait for this default-stream fill.
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -102,8 +113,9 @@ void StateImage::reset(std::uint32_t slot, cudaStream_t stream) {
     auto& state = slots_.at(slot);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     state.pages.clear();
-    state.depth        = 0;
-    state.dspark_depth = 0;
+    state.depth         = 0;
+    state.dspark_depth  = 0;
+    state.dflash2_depth = 0;
     auto* conv  = static_cast<std::byte*>(convolution_.data) + convolution_.nb[2] * slot;
     CUDA_CHECK(cudaMemsetAsync(conv, 0, kConvElements * 48ULL * 2, stream));
     // Old ring cells are not visible at frontier zero; causal reads establish their validity.
@@ -123,22 +135,26 @@ void StateImage::copy(std::uint32_t source, std::uint32_t destination, cudaStrea
     auto& dst = slots_.at(destination);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const auto begin = Clock::now();
-    dst.pages        = src.pages;
-    dst.depth        = src.depth;
-    dst.dspark_depth = src.dspark_depth;
+    dst.pages         = src.pages;
+    dst.depth         = src.depth;
+    dst.dspark_depth  = src.dspark_depth;
+    dst.dflash2_depth = src.dflash2_depth;
     const auto bytes = std::size_t(kConvElements) * 48 * 2;
     CUDA_CHECK(cudaMemcpyAsync(
         static_cast<std::byte*>(convolution_.data) + convolution_.nb[2] * destination,
         static_cast<std::byte*>(convolution_.data) + convolution_.nb[2] * source, bytes,
         cudaMemcpyDeviceToDevice, stream));
     cyclic_.copy_slot_from(cyclic_, source, destination, stream);
+    if (dflash2_cyclic_) {
+        dflash2_cyclic_->copy_slot_from(*dflash2_cyclic_, source, destination, stream);
+    }
     publish(destination, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     transfers_.push_back({runtime::ContextResourceClass::State,
                           runtime::ContextTransferDirection::DeviceToDevice,
                           1,
                           0,
-                          {fixed_state_bytes, 81},
+                          fixed_state_transfer_work(),
                           elapsed(begin)});
 }
 
@@ -228,7 +244,25 @@ void StateImage::commit_dspark_append(std::uint32_t slot, std::uint32_t depth) {
     slots_.at(slot).dspark_depth = depth;
 }
 
+CyclicKVCacheLayerView StateImage::dflash2_swa(int layer) const {
+    if (!dflash2_cyclic_ || layer < 0 || layer >= 5)
+        throw std::out_of_range("Inkling DFlash2 SWA layer");
+    return dflash2_cyclic_->layer_view(layer);
+}
+
+std::uint32_t StateImage::dflash2_depth(std::uint32_t slot) const {
+    return slots_.at(slot).dflash2_depth;
+}
+
+void StateImage::commit_dflash2_append(std::uint32_t slot, std::uint32_t depth) {
+    slots_.at(slot).dflash2_depth = depth;
+}
+
 std::size_t StateImage::dflash_kv_bytes() const noexcept {
+    if (has_dflash2_ && dflash2_cyclic_) {
+        const auto view = dflash2_cyclic_->layer_view(0);
+        return 5ULL * 2ULL * static_cast<std::size_t>(view.k.nb[3]) * slots_.size();
+    }
     if (!has_dspark_) return 0;
     const std::size_t paged = layout_.pages.payload_bytes() / static_cast<std::size_t>(full_layers_);
     const std::size_t swa   = 2ULL * 2 * 128 * 1024 * 8 * 2 * slots_.size();
@@ -294,13 +328,20 @@ std::shared_ptr<HostStateImage> StateImage::snapshot_to_host(std::uint32_t slot,
     auto allocation =
         host_arena_->allocate(host_layout_, static_cast<unsigned>(state.pages.size()));
     if (!allocation) throw std::runtime_error("Inkling host KV capacity exhausted");
-    const auto conv_bytes = std::size_t(kConvElements) * 48 * 2;
-    const auto ring_bytes = std::size_t(128) * 1024 * 8 * 2;
-    auto image            = std::make_shared<HostStateImage>(conv_bytes + static_cast<std::size_t>(swa_layers_) * 2 * ring_bytes);
-    image->pages          = std::move(*allocation);
-    image->depth          = state.depth;
-    auto* fixed           = static_cast<std::byte*>(image->fixed.data());
-    const auto begin      = Clock::now();
+    const auto conv_bytes  = std::size_t(kConvElements) * 48 * 2;
+    const auto ring_bytes  = std::size_t(128) * 1024 * 8 * 2;
+    const auto d2_bytes    = dflash2_cyclic_
+                                 ? static_cast<std::size_t>(dflash2_cyclic_->layer_view(0).k.nb[3])
+                                 : std::size_t(0);
+    auto image             = std::make_shared<HostStateImage>(
+        conv_bytes + static_cast<std::size_t>(swa_layers_) * 2 * ring_bytes +
+        (dflash2_cyclic_ ? 5ULL * 2ULL * d2_bytes : 0ULL));
+    image->pages         = std::move(*allocation);
+    image->depth         = state.depth;
+    image->dspark_depth  = state.dspark_depth;
+    image->dflash2_depth = state.dflash2_depth;
+    auto* fixed          = static_cast<std::byte*>(image->fixed.data());
+    const auto begin     = Clock::now();
     CUDA_CHECK(cudaMemcpyAsync(
         fixed, static_cast<std::byte*>(convolution_.data) + slot * convolution_.nb[2], conv_bytes,
         cudaMemcpyDeviceToHost, stream));
@@ -312,6 +353,17 @@ std::shared_ptr<HostStateImage> StateImage::snapshot_to_host(std::uint32_t slot,
                                        static_cast<std::byte*>(plane->data) + slot * plane->nb[3],
                                        ring_bytes, cudaMemcpyDeviceToHost, stream));
             offset += ring_bytes;
+        }
+    }
+    if (dflash2_cyclic_) {
+        for (int layer = 0; layer < 5; ++layer) {
+            const auto ring = dflash2_cyclic_->layer_view(layer);
+            for (const auto* plane : {&ring.k, &ring.v}) {
+                CUDA_CHECK(cudaMemcpyAsync(fixed + offset,
+                                           static_cast<std::byte*>(plane->data) + slot * plane->nb[3],
+                                           d2_bytes, cudaMemcpyDeviceToHost, stream));
+                offset += d2_bytes;
+            }
         }
     }
     std::vector<DeviceKVPageHandle> handles;
@@ -329,7 +381,7 @@ std::shared_ptr<HostStateImage> StateImage::snapshot_to_host(std::uint32_t slot,
                           runtime::ContextTransferDirection::DeviceToHost,
                           1,
                           0,
-                          {fixed_state_bytes, 81},
+                          fixed_state_transfer_work(),
                           0});
     std::erase_if(host_images_, [](const auto& item) { return item.expired(); });
     host_images_.push_back(image);
@@ -372,6 +424,18 @@ void StateImage::restore_from_host(std::uint32_t slot, const HostStateImage& ima
             offset += ring_bytes;
         }
     }
+    if (dflash2_cyclic_) {
+        const auto d2_bytes =
+            static_cast<std::size_t>(dflash2_cyclic_->layer_view(0).k.nb[3]);
+        for (int layer = 0; layer < 5; ++layer) {
+            const auto ring = dflash2_cyclic_->layer_view(layer);
+            for (const auto* plane : {&ring.k, &ring.v}) {
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(plane->data) + slot * plane->nb[3],
+                                           fixed + offset, d2_bytes, cudaMemcpyHostToDevice, stream));
+                offset += d2_bytes;
+            }
+        }
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const auto work = plan_host_kv_transfer_work(
         host_layout_, static_cast<unsigned>(handles.size()), pages_.contiguous_run_count(handles));
@@ -383,15 +447,25 @@ void StateImage::restore_from_host(std::uint32_t slot, const HostStateImage& ima
                           runtime::ContextTransferDirection::HostToDevice,
                           1,
                           0,
-                          {fixed_state_bytes, 81},
+                          fixed_state_transfer_work(),
                           0});
-    state.pages = std::move(restored);
-    state.depth = image.depth;
+    state.pages         = std::move(restored);
+    state.depth         = image.depth;
+    state.dspark_depth  = image.dspark_depth;
+    state.dflash2_depth = image.dflash2_depth;
     publish(slot, stream);
 }
 
 TransferWork StateImage::fixed_state_transfer_work() const noexcept {
-    return {fixed_state_bytes, 81};
+    const auto conv_bytes = std::size_t(kConvElements) * 48 * 2;
+    const auto ring_bytes = std::size_t(128) * 1024 * 8 * 2;
+    std::size_t bytes     = conv_bytes + static_cast<std::size_t>(swa_layers_) * 2 * ring_bytes;
+    std::uint32_t ops     = 1U + static_cast<std::uint32_t>(swa_layers_) * 2U;
+    if (dflash2_cyclic_) {
+        bytes += 5ULL * 2ULL * static_cast<std::size_t>(dflash2_cyclic_->layer_view(0).k.nb[3]);
+        ops += 10U;
+    }
+    return {bytes, ops};
 }
 
 TransferWork StateImage::host_kv_transfer_work(std::uint32_t page_count) const {

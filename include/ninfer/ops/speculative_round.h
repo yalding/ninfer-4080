@@ -120,10 +120,11 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *
  * Logical shapes and registered profile:
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B].
- *   logits is BF16 [248320,K+1,B]; drafts is I32 [K,B]; candidate_ids is I32 [16,K,B];
+ *   logits is BF16 [physical_rows,K+1,B]; drafts is I32 [K,B]; candidate_ids is I32 [16,K,B];
  *   proposal_q is FP32 [16,K,B]. current_extents, round_lengths, round_anchors,
  *   licensed_counts, and accepted_drafts are I32 [B].
- *   The registered domain is token_domain=248077, K=1..15, B=1..8. Each live draft
+ *   Registered profiles are (physical_rows=248320, token_domain=248077) and
+ *   (physical_rows=201024, token_domain=200058), with K=1..15, B=1..8. Each live draft
  *   position has distinct global candidate ids in [0,token_domain). proposal_q is the
  *   normalized FP32 distribution used to draw that draft; the draft occurs with positive q.
  *   For greedy rows without penalties, live target_tokens are the unpenalized target argmax

@@ -31,6 +31,12 @@ public:
                                                  const ResolvedSamplingParameters& sampling,
                                                  std::uint32_t logical_position,
                                                  std::span<const TokenId> generated_history);
+    std::vector<TokenId> speculative_step_dflash2(std::uint32_t state_slot, TokenId anchor,
+                                                  std::uint32_t draft_tokens, std::uint32_t start,
+                                                  const ResolvedSamplingParameters& sampling,
+                                                  std::uint32_t logical_position,
+                                                  std::span<const TokenId> generated_history);
+    void truncate_speculative_commit(std::uint32_t state_slot, std::uint32_t accepted_tokens);
     TokenId sample(const Tensor& logits, const ResolvedSamplingParameters& sampling,
                    std::uint32_t logical_position, std::span<const TokenId> generated_history);
     void reset(std::uint32_t slot);

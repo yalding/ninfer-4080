@@ -1079,9 +1079,13 @@ __global__ void dspark_rmsnorm_rope_kernel(const int* __restrict__ positions,
     const float n1a = x1a * inv * __bfloat162float(norm[i1]);
     const float n1b = x1b * inv * __bfloat162float(norm[i1 + 64]);
 
-    const float fpos = static_cast<float>(pos);
-    const float a0   = fpos * powf(theta, -static_cast<float>(2 * i0) / 128.0f);
-    const float a1   = fpos * powf(theta, -static_cast<float>(2 * i1) / 128.0f);
+    constexpr double kTwoPi = 6.283185307179586476925286766559;
+    const double dpos     = static_cast<double>(pos);
+    const double dtheta   = static_cast<double>(theta);
+    const double inv0     = pow(dtheta, -static_cast<double>(2 * i0) / 128.0);
+    const double inv1     = pow(dtheta, -static_cast<double>(2 * i1) / 128.0);
+    const float a0        = static_cast<float>(fmod(dpos * inv0, kTwoPi));
+    const float a1        = static_cast<float>(fmod(dpos * inv1, kTwoPi));
     float s0, c0, s1, c1;
     __sincosf(a0, &s0, &c0);
     __sincosf(a1, &s1, &c1);

@@ -10,14 +10,17 @@
 #include "ninfer/ops/inkling2_moe.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/prepare_masked_block.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/silu_mul.h"
+#include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -62,7 +65,23 @@ std::size_t op_workspace(const EngineOptions& options) {
     for (const auto [n, k] : {std::pair{6528, 2304}, {1024, 2304}, {2304, 3072}})
         bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
                                     QType::Q4G64_F16S, n, k, ops::LinearPolicy::A16Only, 1, t));
-    if (options.speculative.backend != SpeculativeBackend::None) {
+    if (options.speculative.backend == SpeculativeBackend::DFlash2) {
+        const int w_max = head_columns(options);
+        const int k_max = std::max(1, w_max - 1);
+        bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
+                                    QType::Q4G64_F16S, C, 9216, ops::LinearPolicy::A16Only, 1, t));
+        for (const auto [n, k] : {std::pair{4096, C}, {1024, C}, {C, 4096}, {13824, C}, {C, 6912}})
+            bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
+                                        QType::Q4G64_F16S, n, k, ops::LinearPolicy::A16Only, 1,
+                                        w_max));
+        bytes = std::max(bytes, ops::sliding_window_attention_workspace_capacity_bytes(
+                                    {128, 32, 8}, 2048U, {0U, options.max_context}, 1, w_max, 1));
+        bytes = std::max(bytes, ops::inkling2_dflash2_kv_materialize_workspace_bytes(t));
+        bytes = std::max(bytes, ops::inkling2_dflash2_conv_prepare_workspace_bytes(w_max));
+        bytes = std::max(bytes, ops::inkling2_dflash2_topk16_and_select_workspace_bytes(k_max));
+        bytes = std::max(bytes, ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                                    V, {false}, 1, k_max, 1, 1));
+    } else if (options.speculative.backend != SpeculativeBackend::None) {
         bytes = std::max(bytes, ops::inkling2_dspark_rnn_step_workspace_bytes());
         bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
                                     QType::Q4G64_F16S, 18432, 2304, ops::LinearPolicy::A16Only, 1, 8));
@@ -89,6 +108,11 @@ struct ScratchLayout {
     TensorRegion dspark_h_prime, dspark_rnn_state, dspark_pos, dspark_draft_tok, dspark_draft_logits;
     TensorRegion dspark_pre_conv, dspark_conv_trace, dspark_target_toks, dspark_extents;
     TensorRegion dspark_lengths, dspark_anchors, dspark_licensed, dspark_licensed_cnt, dspark_accepted;
+    TensorRegion dflash2_features, dflash2_ctx_proj, dflash2_ctx, dflash2_ids, dflash2_pos;
+    TensorRegion dflash2_valid_cols, dflash2_res, dflash2_prep, dflash2_delta;
+    TensorRegion dflash2_q, dflash2_k, dflash2_v, dflash2_attn, dflash2_proj, dflash2_gu, dflash2_act;
+    TensorRegion dflash2_mask_h, dflash2_unary_logits, dflash2_cand_ids, dflash2_proposal_q;
+    TensorRegion dflash2_drafts;
     LayoutRegion config;
     std::size_t bytes;
 };
@@ -143,34 +167,59 @@ ScratchLayout scratch_layout(const EngineOptions& options) {
     s.score_targets   = i32({head_columns(options)});
     s.score_result    = fp({head_columns(options)});
     if (options.speculative.backend != SpeculativeBackend::None) {
-        const int slots     = static_cast<int>(state_slot_count(options));
-        s.dspark_features   = bf({C, t, 4});
-        s.dspark_mixed      = bf({C, t, 4});
-        s.dspark_c_head     = bf({C, slots});
-        s.dspark_block      = bf({C, 8});
-        s.dspark_res        = bf({C, 8});
-        s.dspark_norm       = bf({C, 8});
-        s.dspark_q          = bf({128, 24, 8});
-        s.dspark_k          = bf({128, 8, t});
-        s.dspark_v          = bf({128, 8, t});
-        s.dspark_attn       = bf({128, 24, 8});
-        s.dspark_proj       = bf({C, 8});
-        s.dspark_mlp_gu     = bf({18432, 8});
-        s.dspark_mlp_act    = bf({9216, 8});
-        s.dspark_h_prime    = bf({C});
-        s.dspark_rnn_state  = fp({256});
-        s.dspark_pos        = i32({8});
-        s.dspark_draft_tok  = i32({8});
-        s.dspark_draft_logits = bf({P, 1});
-        s.dspark_pre_conv   = bf({6656 * 3, 48});
-        s.dspark_conv_trace = bf({6656 * 8, 48});
-        s.dspark_target_toks = i32({8});
-        s.dspark_extents    = i32({1});
-        s.dspark_lengths    = i32({1});
-        s.dspark_anchors    = i32({1});
-        s.dspark_licensed   = i32({8});
+        const int max_w = std::max(8, head_columns(options));
+        if (options.speculative.backend == SpeculativeBackend::DFlash2) {
+            s.dflash2_features     = bf({9216, t});
+            s.dflash2_ctx_proj     = bf({C, t});
+            s.dflash2_ctx          = bf({C, t});
+            s.dflash2_ids          = i32({16, 1});
+            s.dflash2_pos          = i32({16, 1});
+            s.dflash2_valid_cols   = i32({1});
+            s.dflash2_res          = bf({C, 16});
+            s.dflash2_prep         = bf({C, 16});
+            s.dflash2_delta        = bf({144, 2, 16});
+            s.dflash2_q            = bf({128, 32, 16, 1});
+            s.dflash2_k            = bf({128, 8, 16, 1});
+            s.dflash2_v            = bf({128, 8, 16, 1});
+            s.dflash2_attn         = bf({128, 32, 16, 1});
+            s.dflash2_proj         = bf({C, 16});
+            s.dflash2_gu           = bf({13824, 16});
+            s.dflash2_act          = bf({6912, 16});
+            s.dflash2_mask_h       = bf({C, 15});
+            s.dflash2_unary_logits = bf({P, 15});
+            s.dflash2_cand_ids     = i32({16, 15, 1});
+            s.dflash2_proposal_q   = fp({16, 15, 1});
+            s.dflash2_drafts       = i32({15, 1});
+        } else {
+            const int slots     = static_cast<int>(state_slot_count(options));
+            s.dspark_features   = bf({C, t, 4});
+            s.dspark_mixed      = bf({C, t, 4});
+            s.dspark_c_head     = bf({C, slots});
+            s.dspark_block      = bf({C, 8});
+            s.dspark_res        = bf({C, 8});
+            s.dspark_norm       = bf({C, 8});
+            s.dspark_q          = bf({128, 24, 8});
+            s.dspark_k          = bf({128, 8, t});
+            s.dspark_v          = bf({128, 8, t});
+            s.dspark_attn       = bf({128, 24, 8});
+            s.dspark_proj       = bf({C, 8});
+            s.dspark_mlp_gu     = bf({18432, 8});
+            s.dspark_mlp_act    = bf({9216, 8});
+            s.dspark_h_prime    = bf({C});
+            s.dspark_rnn_state  = fp({256});
+            s.dspark_pos        = i32({8});
+            s.dspark_draft_tok  = i32({8});
+            s.dspark_draft_logits = bf({P, 1});
+        }
+        s.dspark_pre_conv     = bf({6656 * 3, 48});
+        s.dspark_conv_trace   = bf({6656 * max_w, 48});
+        s.dspark_target_toks  = i32({max_w});
+        s.dspark_extents      = i32({1});
+        s.dspark_lengths      = i32({1});
+        s.dspark_anchors      = i32({1});
+        s.dspark_licensed     = i32({max_w});
         s.dspark_licensed_cnt = i32({1});
-        s.dspark_accepted   = i32({1});
+        s.dspark_accepted     = i32({1});
     }
     s.config          = b.add(sizeof(ops::SamplingConfig), 256, "Inkling sampling config");
     s.bytes           = b.finish(256);
@@ -227,19 +276,28 @@ public:
         std::int32_t sample_position;
         TokenId sampled;
         ops::SamplingConfig config;
-        std::int32_t dspark_pos[8];
-        TokenId dspark_drafts[8];
-        TokenId dspark_licensed[8];
+        std::int32_t dspark_pos[16];
+        TokenId dspark_drafts[16];
+        TokenId dspark_licensed[16];
         std::int32_t dspark_licensed_count;
+        std::int32_t dflash2_frontier;
+        std::int32_t dflash2_valid_cols;
+        std::int32_t dflash2_base_pos;
     };
 
     std::map<std::pair<std::uint32_t, std::uint32_t>, Graph> graphs;
     std::map<std::tuple<std::uint32_t, std::uint32_t, int>, Graph> draft_graphs;
+    std::map<std::tuple<std::uint32_t, std::uint32_t, int>, Graph> dflash2_draft_graphs;
     std::map<std::tuple<std::uint32_t, std::uint32_t, int>, Graph> verify_graphs;
     PinnedHostBuffer pinned_step;
     PinnedHostBuffer pinned_ids;
     PinnedHostBuffer pinned_positions;
     std::vector<std::int32_t> host_counts;
+    bool last_spec_active          = false;
+    std::uint32_t last_spec_slot   = 0;
+    std::uint32_t last_spec_start  = 0;
+    int last_spec_w                = 0;
+    int last_spec_accepted         = 0;
 
     Impl(const RuntimeModelView& m, DeviceContext& d, const EngineOptions& o)
         : model(m), device(d), options(o), states(o, kv_tokens(o)), layout(scratch_layout(o)),
@@ -253,7 +311,8 @@ public:
     }
 
     void schedule(int t, std::uint32_t slot, std::uint32_t envelope, bool all,
-                  bool capture_dspark = false, bool record_conv = false) {
+                  bool capture_dspark = false, bool record_conv = false,
+                  bool capture_dflash2 = false) {
         auto stream = device.stream;
         Tensor cur = bf(layout.cur, C, t), residual = bf(layout.residual, C, t);
         Tensor ids = bf(layout.ids, t), positions = bf(layout.positions, t);
@@ -278,13 +337,20 @@ public:
         Tensor projection = bf(layout.projection, C, t), moe = bf(layout.moe, C, t),
                ffn          = bf(layout.ffn_mix, C, t);
         auto capture_feat = [&](int slice, const Tensor& src) {
-            auto* dst = static_cast<std::byte*>(bf(layout.dspark_features, C, t, 4).data) +
-                        static_cast<std::size_t>(slice) * C * t * 2;
-            CUDA_CHECK(cudaMemcpyAsync(dst, src.data, static_cast<std::size_t>(C) * t * 2,
-                                       cudaMemcpyDeviceToDevice, stream));
+            if (capture_dflash2) {
+                auto* dst = static_cast<std::byte*>(bf(layout.dflash2_features, 9216, t).data) +
+                            static_cast<std::size_t>(slice) * C * 2;
+                CUDA_CHECK(cudaMemcpy2DAsync(dst, 9216 * 2, src.data, C * 2, C * 2, t,
+                                             cudaMemcpyDeviceToDevice, stream));
+            } else {
+                auto* dst = static_cast<std::byte*>(bf(layout.dspark_features, C, t, 4).data) +
+                            static_cast<std::size_t>(slice) * C * t * 2;
+                CUDA_CHECK(cudaMemcpyAsync(dst, src.data, static_cast<std::size_t>(C) * t * 2,
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
         };
         auto record_conv_comp = [&](int visit_idx, int comp_off, const Tensor& src) {
-            auto* dst = static_cast<std::byte*>(bf(layout.dspark_conv_trace, 6656 * 8, 48).data) +
+            auto* dst = static_cast<std::byte*>(bf(layout.dspark_conv_trace, 6656 * t, 48).data) +
                         (static_cast<std::size_t>(visit_idx) * 6656 + comp_off) * t * 2;
             CUDA_CHECK(cudaMemcpyAsync(dst, src.data, src.bytes(), cudaMemcpyDeviceToDevice, stream));
         };
@@ -295,7 +361,7 @@ public:
             return values;
         };
         auto layer = [&](int physical, int visit, bool loop) {
-            if (capture_dspark) {
+            if (capture_dspark || capture_dflash2) {
                 if (visit == 5) capture_feat(0, cur);
                 else if (visit == 23) capture_feat(1, cur);
                 else if (visit == 41) capture_feat(2, cur);
@@ -434,7 +500,7 @@ public:
         const std::array<Tensor, 1> final_norm{model.final_norm};
         ops::inkling2_attn_res_mix(std::span(values.data(), block_count + 1),
                                    model.output_res_query, final_norm, ffn, stream);
-        if (capture_dspark) capture_feat(3, ffn);
+        if (capture_dspark || capture_dflash2) capture_feat(3, ffn);
         const int cols    = all ? t : 1;
         Tensor head_input = all ? ffn
                                 : Tensor(static_cast<std::byte*>(ffn.data) + (t - 1) * ffn.nb[1],
@@ -619,6 +685,134 @@ public:
             }
         }
     }
+
+    void append_dflash2_context(int append_count, std::uint32_t start, std::uint32_t slot) {
+        if (append_count <= 0) return;
+        auto stream    = device.stream;
+        Tensor feats   = bf(layout.dflash2_features, 9216, append_count);
+        Tensor ctx_p   = bf(layout.dflash2_ctx_proj, C, append_count);
+        Tensor ctx     = bf(layout.dflash2_ctx, C, append_count);
+        ops::linear(feats, model.dflash2.fc, ctx_p, ops::LinearPolicy::A16Only, workspace, stream);
+        ops::rmsnorm(ctx_p, model.dflash2.hidden_norm, 1e-6f, false, ctx, stream);
+
+        auto* step     = static_cast<HostStepStaging*>(pinned_step.data());
+        step->count    = append_count;
+        step->lane     = static_cast<int>(slot);
+        auto count_t   = bf(layout.count, 1);
+        auto lane_t    = bf(layout.lane, 1);
+        CUDA_CHECK(cudaMemcpyAsync(count_t.data, &step->count, sizeof(int), cudaMemcpyHostToDevice,
+                                   stream));
+        CUDA_CHECK(cudaMemcpyAsync(lane_t.data, &step->lane, sizeof(int), cudaMemcpyHostToDevice,
+                                   stream));
+        auto* host_pos = static_cast<std::int32_t*>(pinned_positions.data());
+        for (int i = 0; i < append_count; ++i) host_pos[i] = static_cast<int>(start) + i;
+        auto pos_2d = bf(layout.positions, append_count, 1);
+        CUDA_CHECK(cudaMemcpyAsync(pos_2d.data, host_pos, append_count * sizeof(int),
+                                   cudaMemcpyHostToDevice, stream));
+
+        std::array<ops::ContextKVMaterializeLayerView, 5> layers{};
+        for (std::size_t l = 0; l < 5; ++l) {
+            const auto& dl            = model.dflash2.layers[l];
+            layers[l].key_weight      = dl.k;
+            layers[l].value_weight    = dl.v;
+            layers[l].key_norm_weight = dl.k_norm;
+            layers[l].cache           = states.dflash2_swa(static_cast<int>(l));
+        }
+        Tensor ctx_3d(ctx.data, DType::BF16, {C, append_count, 1});
+        const ops::ContextKVMaterializeExecutionEnvelope env{
+            static_cast<std::uint32_t>(append_count), static_cast<std::uint32_t>(append_count)};
+        ops::inkling2_dflash2_kv_materialize(ctx_3d, pos_2d, count_t, lane_t, layers, env,
+                                             workspace, stream);
+        states.commit_dflash2_append(slot, start + static_cast<std::uint32_t>(append_count));
+    }
+
+    void draft_dflash2_body(std::uint32_t, int K, std::uint32_t dflash_envelope,
+                            const ops::SamplingConfig* device_config) {
+        const int W        = K + 1;
+        auto stream        = device.stream;
+        auto anchors_t     = bf(layout.dspark_anchors, 1);
+        auto lengths_t     = bf(layout.dspark_lengths, 1);
+        auto valid_cols_t  = bf(layout.dflash2_valid_cols, 1);
+        auto d2_ids_2d     = bf(layout.dflash2_ids, W, 1);
+        auto d2_pos_2d     = bf(layout.dflash2_pos, W, 1);
+        auto lane_t        = bf(layout.lane, 1);
+        ops::prepare_masked_block(anchors_t, lengths_t, valid_cols_t, 200056, d2_ids_2d, d2_pos_2d,
+                                  stream);
+
+        Tensor ids_1d(d2_ids_2d.data, DType::I32, {W});
+        Tensor pos_1d(d2_pos_2d.data, DType::I32, {W});
+        auto res = bf(layout.dflash2_res, C, W);
+        ops::embedding(ids_1d, model.token_embedding, res, stream);
+        ops::rmsnorm(res, model.token_norm, 1e-6f, false, res, stream);
+
+        auto prep  = bf(layout.dflash2_prep, C, W);
+        auto delta = bf(layout.dflash2_delta, 144, 2, W);
+        auto q_4d  = region(layout.dflash2_q, scratch, {128, 32, W, 1});
+        auto k_4d  = region(layout.dflash2_k, scratch, {128, 8, W, 1});
+        auto v_4d  = region(layout.dflash2_v, scratch, {128, 8, W, 1});
+        auto a_4d  = region(layout.dflash2_attn, scratch, {128, 32, W, 1});
+        Tensor q_3d(q_4d.data, DType::BF16, {128, 32, W});
+        Tensor k_3d(k_4d.data, DType::BF16, {128, 8, W});
+        Tensor q_flat(q_4d.data, DType::BF16, {4096, W});
+        Tensor k_flat(k_4d.data, DType::BF16, {1024, W});
+        Tensor v_flat(v_4d.data, DType::BF16, {1024, W});
+        Tensor a_flat(a_4d.data, DType::BF16, {4096, W});
+        auto proj = bf(layout.dflash2_proj, C, W);
+        auto gu   = bf(layout.dflash2_gu, 13824, W);
+        auto act  = bf(layout.dflash2_act, 6912, W);
+        Tensor gate = gu.slice(0, 0, 6912);
+        Tensor up   = gu.slice(0, 6912, 6912);
+        const float attn_scale = 1.0f / std::sqrt(128.0f);
+
+        for (int layer = 0; layer < 5; ++layer) {
+            const auto& dl = model.dflash2.layers[layer];
+            ops::inkling2_dflash2_conv_prepare(res, dl.input_norm, 1e-6f, dl.attn_conv_base,
+                                               dl.attn_conv_proj, prep, delta, workspace, stream);
+            ops::linear(prep, dl.q, q_flat, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::linear(prep, dl.k, k_flat, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::linear(prep, dl.v, v_flat, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::inkling2_dspark_rmsnorm_rope(pos_1d, dl.q_norm, dl.k_norm, q_3d, k_3d, 10000.0f,
+                                              stream);
+            ops::sliding_window_attention(q_4d, k_4d, v_4d, d2_pos_2d, valid_cols_t, lane_t,
+                                          {128, 32, 8}, 2048U, attn_scale,
+                                          states.dflash2_swa(layer), {0U, dflash_envelope},
+                                          workspace, a_4d, stream);
+            ops::linear(a_flat, dl.output, proj, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::inkling2_dflash2_conv_finish_add(proj, dl.attn_conv_base, delta, res, stream);
+
+            ops::inkling2_dflash2_conv_prepare(res, dl.post_attention_norm, 1e-6f,
+                                               dl.mlp_conv_base, dl.mlp_conv_proj, prep, delta,
+                                               workspace, stream);
+            ops::linear(prep, dl.gate_up, gu, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::silu_mul(gate, up, act, stream);
+            ops::linear(act, dl.down, proj, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::inkling2_dflash2_conv_finish_add(proj, dl.mlp_conv_base, delta, res, stream);
+        }
+
+        Tensor res_tail(static_cast<std::byte*>(res.data) + static_cast<std::size_t>(C) * 2U,
+                        DType::BF16, {C, K});
+        auto mask_h       = bf(layout.dflash2_mask_h, C, K);
+        auto unary_logits = bf(layout.dflash2_unary_logits, P, K);
+        ops::rmsnorm(res_tail, model.dflash2.final_norm, 1e-6f, false, mask_h, stream);
+        ops::linear(mask_h, model.output_head, unary_logits, ops::LinearPolicy::A16Only, workspace,
+                    stream);
+
+        auto cand_ids   = bf(layout.dflash2_cand_ids, 16, K, 1);
+        auto drafts_2d  = bf(layout.dflash2_drafts, K, 1);
+        auto proposal_q = bf(layout.dflash2_proposal_q, 16, K, 1);
+        Tensor base_pos_t(bf(layout.sample_position, 1).data, DType::I32, {1});
+        ops::inkling2_dflash2_topk16_and_select(
+            mask_h, unary_logits, model.dflash2.selector_hidden_proj, anchors_t,
+            model.dflash2.predecessor_codebook, model.dflash2.successor_codebook, base_pos_t,
+            device_config, cand_ids, drafts_2d, proposal_q, workspace, stream);
+
+        auto extents_t   = bf(layout.dspark_extents, 1);
+        auto verify_pos  = bf(layout.positions, W, 1);
+        auto verify_ids  = bf(layout.ids, W, 1);
+        Tensor base_pos_verify(bf(layout.dspark_pos, 1).data, DType::I32, {1});
+        ops::speculative_prepare_verify_inputs(anchors_t, drafts_2d, base_pos_verify, extents_t,
+                                               verify_ids, verify_pos, stream);
+    }
 };
 
 Executor::Executor(const RuntimeModelView& model, DeviceContext& device,
@@ -661,24 +855,27 @@ Tensor Executor::forward(std::span<const TokenId> ids, std::uint32_t start, std:
                                cudaMemcpyHostToDevice, p.device.stream));
     CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.lane, 1).data, &step->lane, sizeof(int),
                                cudaMemcpyHostToDevice, p.device.stream));
-    const bool capture_dspark = p.model.has_mtp &&
-                                p.options.speculative.backend != SpeculativeBackend::None && !all &&
+    const bool capture_dspark = p.model.has_mtp && p.states.has_dspark() && !all &&
                                 p.options.purpose != EnginePurpose::CausalScoring;
+    const bool capture_dflash2 = p.model.has_dflash2 && p.states.has_dflash2() && !all &&
+                                 p.options.purpose != EnginePurpose::CausalScoring;
     if (p.options.use_cuda_graph && t == 1 && !all) {
         std::uint32_t envelope = std::min(256U, p.options.max_context);
         while (envelope < start + 1) envelope = std::min(envelope * 2, p.options.max_context);
         auto& graph = p.graphs[{slot, envelope}];
         if (!graph.executable.ready()) {
             sync();
-            graph.definition.capture(p.device.stream,
-                                     [&] { p.schedule(1, slot, envelope, false, capture_dspark, false); });
+            graph.definition.capture(p.device.stream, [&] {
+                p.schedule(1, slot, envelope, false, capture_dspark, false, capture_dflash2);
+            });
             graph.executable.instantiate(graph.definition);
         }
         graph.executable.launch(p.device.stream);
     } else
-        p.schedule(t, slot, start + t, all, capture_dspark, false);
+        p.schedule(t, slot, start + t, all, capture_dspark, false, capture_dflash2);
     p.states.commit_append(slot, start + t);
     if (capture_dspark) p.mix_and_append_dspark(t, t, start, slot);
+    if (capture_dflash2) p.append_dflash2_context(t, start, slot);
     return p.bf(p.layout.logits, P, all ? t : 1);
 }
 
@@ -1104,7 +1301,202 @@ std::vector<TokenId> Executor::verify_dspark(std::uint32_t state_slot,
                                                stream);
     }
     p.mix_and_append_dspark(W, accepted_total, start, state_slot);
+    p.last_spec_active   = true;
+    p.last_spec_slot     = state_slot;
+    p.last_spec_start    = start;
+    p.last_spec_w        = W;
+    p.last_spec_accepted = accepted_total;
     return std::vector<TokenId>(step->dspark_licensed, step->dspark_licensed + accepted_total);
+}
+
+std::vector<TokenId> Executor::speculative_step_dflash2(std::uint32_t state_slot, TokenId anchor,
+                                                        std::uint32_t draft_tokens,
+                                                        std::uint32_t start,
+                                                        const ResolvedSamplingParameters& sampling,
+                                                        std::uint32_t logical_position,
+                                                        std::span<const TokenId> generated_history) {
+    auto& p = *impl_;
+    if (!p.model.has_dflash2 || !p.states.has_dflash2())
+        throw std::logic_error("DFlash2 step requested without loaded DFlash2 weights");
+    if (draft_tokens == 0 || draft_tokens > 15)
+        throw std::invalid_argument("DFlash2 draft_tokens must be in [1, 15]");
+    if (anchor < 0 || anchor >= V)
+        throw std::invalid_argument("DFlash2 anchor token ID outside vocabulary");
+
+    const int K           = static_cast<int>(draft_tokens);
+    const int W           = K + 1;
+    const std::uint32_t F = p.states.dflash2_depth(state_slot);
+    if (W > head_columns(p.options))
+        throw std::invalid_argument("DFlash2 verify window out of planned range");
+
+    sync();
+    auto stream = p.device.stream;
+    auto* step  = static_cast<Impl::HostStepStaging*>(p.pinned_step.data());
+
+    const bool use_penalties =
+        sampling.presence_penalty != 0.0f || sampling.frequency_penalty != 0.0f;
+    int* counts_ptr = nullptr;
+    if (use_penalties) {
+        std::fill(p.host_counts.begin(), p.host_counts.end(), 0);
+        for (auto id : generated_history)
+            if (id >= 0 && id < V) ++p.host_counts[id];
+        auto counts = p.bf(p.layout.counts, V);
+        CUDA_CHECK(cudaMemcpyAsync(counts.data, p.host_counts.data(), V * sizeof(int),
+                                   cudaMemcpyHostToDevice, stream));
+        counts_ptr = static_cast<int*>(counts.data);
+    }
+    step->config = ops::SamplingConfig{sampling.temperature,
+                                       sampling.top_k,
+                                       sampling.top_p,
+                                       sampling.min_p,
+                                       sampling.presence_penalty,
+                                       sampling.frequency_penalty,
+                                       sampling.seed,
+                                       counts_ptr};
+    auto* device_config = static_cast<ops::SamplingConfig*>(
+        p.layout.config.bind({p.scratch.p, p.scratch.bytes}).data);
+    CUDA_CHECK(cudaMemcpyAsync(device_config, &step->config, sizeof(step->config),
+                               cudaMemcpyHostToDevice, stream));
+
+    step->count              = W;
+    step->lane               = static_cast<int>(state_slot);
+    step->dflash2_frontier   = static_cast<std::int32_t>(F);
+    step->dflash2_valid_cols = W;
+    step->dflash2_base_pos   = static_cast<std::int32_t>(logical_position) + 1;
+    step->dspark_pos[0]      = static_cast<std::int32_t>(start);
+    step->dspark_pos[1]      = K;
+    step->dspark_pos[2]      = static_cast<std::int32_t>(logical_position);
+    step->dspark_pos[3]      = anchor;
+
+    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.count, 1).data, &step->count, sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.lane, 1).data, &step->lane, sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.dflash2_valid_cols, 1).data,
+                               &step->dflash2_valid_cols, sizeof(int), cudaMemcpyHostToDevice,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.sample_position, 1).data, &step->dflash2_base_pos,
+                               sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.dspark_pos, 1).data, &step->dspark_pos[0], sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.dspark_extents, 1).data, &step->dspark_pos[1],
+                               sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.dspark_lengths, 1).data, &step->dflash2_frontier,
+                               sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.dspark_anchors, 1).data, &step->dspark_pos[3],
+                               sizeof(TokenId), cudaMemcpyHostToDevice, stream));
+
+    auto slot_conv = p.states.slot_convolution(state_slot);
+    auto pre_conv  = p.bf(p.layout.dspark_pre_conv, 6656 * 3, 48);
+    CUDA_CHECK(cudaMemcpyAsync(pre_conv.data, slot_conv.data, slot_conv.bytes(),
+                               cudaMemcpyDeviceToDevice, stream));
+
+    p.states.prepare_append(state_slot, start, static_cast<std::uint32_t>(W), stream);
+
+    if (p.options.use_cuda_graph) {
+        std::uint32_t dflash_env = std::min(256U, p.options.max_context);
+        while (dflash_env < F + static_cast<std::uint32_t>(W))
+            dflash_env = std::min(dflash_env * 2U, p.options.max_context);
+        auto& dgraph = p.dflash2_draft_graphs[{state_slot, dflash_env, K}];
+        if (!dgraph.executable.ready()) {
+            sync();
+            dgraph.definition.capture(stream, [&] {
+                p.draft_dflash2_body(state_slot, K, dflash_env, device_config);
+            });
+            dgraph.executable.instantiate(dgraph.definition);
+        }
+        dgraph.executable.launch(stream);
+    } else {
+        p.draft_dflash2_body(state_slot, K, F + static_cast<std::uint32_t>(W), device_config);
+    }
+
+    // Restore round_lengths to logical_position for speculative_accept_sparse_drafts.
+    CUDA_CHECK(cudaMemcpyAsync(p.bf(p.layout.dspark_lengths, 1).data, &step->dspark_pos[2],
+                               sizeof(int), cudaMemcpyHostToDevice, stream));
+
+    if (p.options.use_cuda_graph) {
+        std::uint32_t envelope = std::min(256U, p.options.max_context);
+        while (envelope < start + static_cast<std::uint32_t>(W))
+            envelope = std::min(envelope * 2U, p.options.max_context);
+        auto& vgraph = p.verify_graphs[{state_slot, envelope, W}];
+        if (!vgraph.executable.ready()) {
+            sync();
+            vgraph.definition.capture(stream, [&] {
+                p.schedule(W, state_slot, envelope, true, false, true, true);
+            });
+            vgraph.executable.instantiate(vgraph.definition);
+        }
+        vgraph.executable.launch(stream);
+    } else {
+        p.schedule(W, state_slot, start + static_cast<std::uint32_t>(W), true, false, true, true);
+    }
+
+    auto logits_3d    = Tensor(p.bf(p.layout.logits, P, W).data, DType::BF16, {P, W, 1});
+    auto target_2d    = p.bf(p.layout.dspark_target_toks, W, 1);
+    auto drafts_2d    = p.bf(p.layout.dflash2_drafts, K, 1);
+    auto cand_ids     = p.bf(p.layout.dflash2_cand_ids, 16, K, 1);
+    auto proposal_q   = p.bf(p.layout.dflash2_proposal_q, 16, K, 1);
+    auto extents_t    = p.bf(p.layout.dspark_extents, 1);
+    auto lengths_t    = p.bf(p.layout.dspark_lengths, 1);
+    auto anchors_t    = p.bf(p.layout.dspark_anchors, 1);
+    auto licensed_2d  = p.bf(p.layout.dspark_licensed, W, 1);
+    auto licensed_cnt = p.bf(p.layout.dspark_licensed_cnt, 1);
+    auto accepted_t   = p.bf(p.layout.dspark_accepted, 1);
+
+    const bool raw_greedy = sampling.temperature <= 0.0f && !use_penalties;
+    if (raw_greedy) {
+        Tensor target_1d(target_2d.data, DType::I32, {W});
+        Tensor logits_2d(logits_3d.data, DType::BF16, {P, W});
+        ops::argmax(logits_2d, target_1d, V, stream);
+    }
+    ops::speculative_accept_sparse_drafts(
+        target_2d, logits_3d, drafts_2d, cand_ids, proposal_q, extents_t, lengths_t, anchors_t,
+        licensed_2d, licensed_cnt, accepted_t, V, device_config, {raw_greedy}, p.workspace, stream);
+
+    CUDA_CHECK(cudaMemcpyAsync(&step->dspark_licensed_count, licensed_cnt.data, sizeof(int),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(step->dspark_licensed, licensed_2d.data, W * sizeof(TokenId),
+                               cudaMemcpyDeviceToHost, stream));
+    sync();
+    const int accepted_total = step->dspark_licensed_count;
+
+    p.states.commit_append(state_slot, start + static_cast<std::uint32_t>(accepted_total));
+    if (accepted_total < W) {
+        auto conv_trace = p.bf(p.layout.dspark_conv_trace, 6656 * W, 48);
+        ops::inkling2_dspark_commit_conv_state(pre_conv, conv_trace, slot_conv, W, accepted_total,
+                                               stream);
+    }
+    p.append_dflash2_context(accepted_total, start, state_slot);
+    p.last_spec_active   = true;
+    p.last_spec_slot     = state_slot;
+    p.last_spec_start    = start;
+    p.last_spec_w        = W;
+    p.last_spec_accepted = accepted_total;
+    return std::vector<TokenId>(step->dspark_licensed, step->dspark_licensed + accepted_total);
+}
+
+void Executor::truncate_speculative_commit(std::uint32_t state_slot, std::uint32_t accepted_tokens) {
+    auto& p = *impl_;
+    if (!p.last_spec_active || p.last_spec_slot != state_slot ||
+        accepted_tokens >= static_cast<std::uint32_t>(p.last_spec_accepted) ||
+        accepted_tokens == 0) {
+        p.last_spec_active = false;
+        return;
+    }
+    auto stream = p.device.stream;
+    p.states.commit_append(state_slot, p.last_spec_start + accepted_tokens);
+    auto slot_conv  = p.states.slot_convolution(state_slot);
+    auto pre_conv   = p.bf(p.layout.dspark_pre_conv, 6656 * 3, 48);
+    auto conv_trace = p.bf(p.layout.dspark_conv_trace, 6656 * p.last_spec_w, 48);
+    ops::inkling2_dspark_commit_conv_state(pre_conv, conv_trace, slot_conv, p.last_spec_w,
+                                           static_cast<int>(accepted_tokens), stream);
+    if (p.model.has_dflash2 && p.states.has_dflash2()) {
+        p.append_dflash2_context(static_cast<int>(accepted_tokens), p.last_spec_start, state_slot);
+    } else if (p.model.has_mtp && p.states.has_dspark()) {
+        p.mix_and_append_dspark(p.last_spec_w, static_cast<int>(accepted_tokens),
+                                p.last_spec_start, state_slot, true);
+    }
+    p.last_spec_active = false;
 }
 
 std::vector<float> Executor::causal_score(std::span<const TokenId> ids, std::uint32_t first) {
@@ -1152,9 +1544,15 @@ MemorySummary Executor::memory_summary() const {
     out.workspace.used_bytes         = p.workspace.used();
     out.workspace.peak_used_bytes    = p.workspace.peak_used();
     out.workspace_logical_peak_bytes = p.workspace.peak_used();
-    out.kv_payload_bytes             = p.states.kv_bytes();
-    out.dflash_kv_bytes              = p.states.dflash_kv_bytes();
-    out.text_kv_bytes                = out.kv_payload_bytes - out.dflash_kv_bytes;
+    if (p.states.has_dflash2()) {
+        out.text_kv_bytes    = p.states.kv_bytes();
+        out.dflash_kv_bytes  = p.states.dflash_kv_bytes();
+        out.kv_payload_bytes = out.text_kv_bytes + out.dflash_kv_bytes;
+    } else {
+        out.kv_payload_bytes = p.states.kv_bytes();
+        out.dflash_kv_bytes  = p.states.dflash_kv_bytes();
+        out.text_kv_bytes    = out.kv_payload_bytes - out.dflash_kv_bytes;
+    }
     out.gdn_state_bytes              = std::size_t(6656) * 3 * 48 * 2 * p.states.slots();
     out.host_state_capacity_slots =
         p.options.context_cache.enabled ? p.options.context_cache.host_state_slots : 0;

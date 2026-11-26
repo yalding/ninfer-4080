@@ -114,17 +114,18 @@ def _dequantize_rows(
     return torch.stack(out_rows, dim=0)
 
 
-def validate_structure(artifact: Artifact) -> tuple[bool, bool]:
+def validate_structure(artifact: Artifact) -> tuple[bool, bool, bool]:
     expected_identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
     if artifact.identity != expected_identity:
         raise VerificationError(f"identity {artifact.identity!r} != {expected_identity!r}")
     has_mtp = any(obj.name.startswith("mtp/") for obj in artifact.objects)
     has_draft_head = any(obj.name == "mtp/draft_head" for obj in artifact.objects)
+    has_dflash2 = any(obj.name.startswith("dflash2/") for obj in artifact.objects)
     expected_objects = inventory.object_specs(
-        include_mtp=has_mtp, include_draft_head=has_draft_head
+        include_mtp=has_mtp, include_draft_head=has_draft_head, include_dflash2=has_dflash2
     )
     expected_tensors = inventory.tensor_specs(
-        include_mtp=has_mtp, include_draft_head=has_draft_head
+        include_mtp=has_mtp, include_draft_head=has_draft_head, include_dflash2=has_dflash2
     )
     if len(artifact.objects) != len(expected_objects):
         raise VerificationError(
@@ -160,13 +161,16 @@ def validate_structure(artifact: Artifact) -> tuple[bool, bool]:
                 raise VerificationError(f"{actual.name}: encoding mismatch")
         cursor = actual.offset + actual.bytes
 
-    if dict(formats) != inventory.format_counts(expected_tensors):
+    expected_format_counts = {
+        k: v for k, v in inventory.format_counts(expected_tensors).items() if v > 0
+    }
+    if dict(formats) != expected_format_counts:
         raise VerificationError(f"format counts mismatch: {dict(formats)}")
     if dict(layouts) != inventory.layout_counts(expected_tensors):
         raise VerificationError(f"layout counts mismatch: {dict(layouts)}")
     if cursor != artifact.file_bytes - artifact.payload_offset:
         raise VerificationError("artifact trailing padding / size mismatch")
-    return has_mtp, has_draft_head
+    return has_mtp, has_draft_head, has_dflash2
 
 
 def verify_artifact(
@@ -175,6 +179,7 @@ def verify_artifact(
     *,
     device: str | torch.device = "cuda",
     mtp_path: str | Path | None = None,
+    dflash2_dir: str | Path | None = None,
 ) -> VerifySummary:
     sources = source.validate_hf_checkpoint(model_dir)
     expected_resources = source.load_frontend_resources(sources.model_dir)
@@ -188,14 +193,19 @@ def verify_artifact(
     min_q6 = 1.0
 
     with Artifact.open(artifact_path) as artifact:
-        has_mtp, has_draft_head = validate_structure(artifact)
+        has_mtp, has_draft_head, has_dflash2 = validate_structure(artifact)
         t_specs = inventory.tensor_specs(
-            include_mtp=has_mtp, include_draft_head=has_draft_head
+            include_mtp=has_mtp, include_draft_head=has_draft_head, include_dflash2=has_dflash2
         )
         draft_head_ids = source.compute_dspark_draft_head_ids() if has_draft_head else None
         mtp_reader = (
             source.MtpSourceReader(source.resolve_mtp_path(sources.model_dir, mtp_path))
             if has_mtp
+            else None
+        )
+        dflash2_reader = (
+            source.DFlash2SourceReader(source.resolve_dflash2_dir(dflash2_dir))
+            if has_dflash2
             else None
         )
 
@@ -217,6 +227,9 @@ def verify_artifact(
                     elif spec.name.startswith("mtp/"):
                         assert mtp_reader is not None
                         expected = source.load_mtp_tensor(spec, mtp_reader)
+                    elif spec.name.startswith("dflash2/"):
+                        assert dflash2_reader is not None
+                        expected = source.load_dflash2_tensor(spec, dflash2_reader)
                     else:
                         expected = source.load_non_expert_tensor(spec, reader)
                     if not torch.isfinite(stored).all():
@@ -237,6 +250,24 @@ def verify_artifact(
                             artifact.payload(obj), obj.format, obj.shape, rows, target
                         ).cpu()
                         src_t = source.load_mtp_tensor(spec, mtp_reader)
+                        ref = src_t.index_select(0, torch.tensor(rows, dtype=torch.long)).float()
+                        cos = _cosine_similarity(deq, ref)
+                        if cos < 0.985:
+                            raise VerificationError(f"{spec.name}: cosine {cos:.5f} < 0.985")
+                        min_q4 = min(min_q4, cos)
+                        quantized_checked += 1
+
+                if dflash2_reader is not None:
+                    for spec in inventory.DFLASH2_TENSOR_SPECS:
+                        if spec.format in inventory.DIRECT_FORMATS:
+                            continue
+                        obj = artifact.find(spec.name)
+                        assert isinstance(obj, TensorObject)
+                        rows = (0, obj.shape[0] // 2, obj.shape[0] - 1)
+                        deq = _dequantize_rows(
+                            artifact.payload(obj), obj.format, obj.shape, rows, target
+                        ).cpu()
+                        src_t = source.load_dflash2_tensor(spec, dflash2_reader)
                         ref = src_t.index_select(0, torch.tensor(rows, dtype=torch.long)).float()
                         cos = _cosine_similarity(deq, ref)
                         if cos < 0.985:
@@ -370,6 +401,8 @@ def verify_artifact(
                     min_q4 = min(min_q4, cos)
                     quantized_checked += 1
         finally:
+            if dflash2_reader is not None:
+                dflash2_reader.close()
             if mtp_reader is not None:
                 mtp_reader.close()
 
@@ -394,8 +427,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--mtp", type=Path, default=None)
+    parser.add_argument("--dflash2", type=Path, default=None)
     args = parser.parse_args(argv)
-    summary = verify_artifact(args.artifact, args.model, device=args.device, mtp_path=args.mtp)
+    summary = verify_artifact(
+        args.artifact,
+        args.model,
+        device=args.device,
+        mtp_path=args.mtp,
+        dflash2_dir=args.dflash2,
+    )
     print(json.dumps(asdict(summary), indent=2, sort_keys=True))
     return 0
 

@@ -30,11 +30,12 @@ plus a global pool of two Device-resident checkpoints. Eight pinned Host State s
 pinned Host KV retain inactive continuations under Device pressure. Active request capacity is two.
 
 Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
-selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
-artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
-`--lm-head-draft` optional. DFlash2 accepts draft counts 1..15 and supports the same sampling,
-concurrency, prefix reuse, and image/video request surfaces. It may remain combined with
-`--vision`.
+selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B and Inkling-2-Mini
+artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7` (with
+`--lm-head-draft` optional on Qwen3.8-27B; Inkling-2-Mini is text-only and uses the full proposal
+head). DFlash2 accepts draft counts 1..15 and supports the same sampling, concurrency, prefix
+reuse, and (on Qwen3.8-27B) image/video request surfaces. It may remain combined with `--vision` on
+Qwen3.8-27B.
 
 When `--model-id` is omitted, the server advertises and accepts the loaded container's exact
 `identity.model_id`. An explicit `--model-id` remains a public HTTP alias override and does not

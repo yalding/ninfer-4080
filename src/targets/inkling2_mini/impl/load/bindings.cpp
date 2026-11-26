@@ -5,10 +5,12 @@
 namespace ninfer::targets::inkling2_mini::detail {
 using artifact::NumericFormat;
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp, bool load_draft_head) {
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp, bool load_draft_head,
+                               bool load_dflash2) {
     ArtifactLoadPlan out;
     auto& plan           = out.bindings;
     plan.has_mtp         = load_mtp;
+    plan.has_dflash2     = load_dflash2;
     plan.frontend        = bind_frontend_resources(binder);
     plan.token_embedding = artifact::bind_device_tensor(binder, "text/token_embedding",
                                                         NumericFormat::Q4G64_F16S, {201024, 2304});
@@ -167,6 +169,62 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp, bool loa
                 binder, "mtp/draft_head_token_ids", NumericFormat::I32, {32768}, draft_placement);
         }
     }
+    if (load_dflash2 || binder.has_object("dflash2/fc")) {
+        const auto d2_placement = load_dflash2 ? artifact::TensorPlacement::Device
+                                               : artifact::TensorPlacement::ValidateOnly;
+        auto& d2                = plan.dflash2;
+        d2.fc = artifact::bind_tensor(binder, "dflash2/fc", NumericFormat::Q4G64_F16S,
+                                      {2304, 9216}, d2_placement);
+        d2.hidden_norm = artifact::bind_tensor(binder, "dflash2/hidden_norm", NumericFormat::BF16,
+                                               {2304}, d2_placement);
+        for (std::size_t i = 0; i < kDFlash2Layers; ++i) {
+            auto& l        = d2.layers[i];
+            const auto pfx = "dflash2/layers/" + std::to_string(i) + "/";
+            l.input_norm   = artifact::bind_tensor(binder, pfx + "input_norm", NumericFormat::BF16,
+                                                   {2304}, d2_placement);
+            l.post_attention_norm = artifact::bind_tensor(
+                binder, pfx + "post_attention_norm", NumericFormat::BF16, {2304}, d2_placement);
+            l.attn_conv_base = artifact::bind_tensor(
+                binder, pfx + "attention_conv/base_kernel", NumericFormat::BF16, {2, 2, 2304},
+                d2_placement);
+            l.attn_conv_proj = artifact::bind_tensor(
+                binder, pfx + "attention_conv/kernel_projection", NumericFormat::BF16, {576, 2304},
+                d2_placement);
+            l.q_norm = artifact::bind_tensor(binder, pfx + "attention/q_norm", NumericFormat::BF16,
+                                             {128}, d2_placement);
+            l.k_norm = artifact::bind_tensor(binder, pfx + "attention/k_norm", NumericFormat::BF16,
+                                             {128}, d2_placement);
+            l.q      = artifact::bind_tensor(binder, pfx + "attention/q", NumericFormat::Q4G64_F16S,
+                                             {4096, 2304}, d2_placement);
+            l.k      = artifact::bind_tensor(binder, pfx + "attention/k", NumericFormat::Q4G64_F16S,
+                                             {1024, 2304}, d2_placement);
+            l.v      = artifact::bind_tensor(binder, pfx + "attention/v", NumericFormat::Q4G64_F16S,
+                                             {1024, 2304}, d2_placement);
+            l.output = artifact::bind_tensor(binder, pfx + "attention/output",
+                                             NumericFormat::Q4G64_F16S, {2304, 4096}, d2_placement);
+            l.mlp_conv_base = artifact::bind_tensor(
+                binder, pfx + "mlp_conv/base_kernel", NumericFormat::BF16, {2, 2, 2304},
+                d2_placement);
+            l.mlp_conv_proj = artifact::bind_tensor(
+                binder, pfx + "mlp_conv/kernel_projection", NumericFormat::BF16, {576, 2304},
+                d2_placement);
+            l.gate_up = artifact::bind_tensor(binder, pfx + "mlp/gate_up",
+                                              NumericFormat::Q4G64_F16S, {13824, 2304}, d2_placement);
+            l.down    = artifact::bind_tensor(binder, pfx + "mlp/down", NumericFormat::Q4G64_F16S,
+                                              {2304, 6912}, d2_placement);
+        }
+        d2.final_norm = artifact::bind_tensor(binder, "dflash2/final_norm", NumericFormat::BF16,
+                                              {2304}, d2_placement);
+        d2.selector_hidden_proj = artifact::bind_tensor(
+            binder, "dflash2/selector/hidden_projection", NumericFormat::BF16, {256, 2304},
+            d2_placement);
+        d2.predecessor_codebook = artifact::bind_tensor(
+            binder, "dflash2/selector/predecessor_codebook", NumericFormat::BF16, {201024, 256},
+            d2_placement);
+        d2.successor_codebook = artifact::bind_tensor(
+            binder, "dflash2/selector/successor_codebook", NumericFormat::BF16, {201024, 256},
+            d2_placement);
+    }
     out.materialization = binder.finish();
     return out;
 }
@@ -307,6 +365,40 @@ RuntimeModelView materialize_model(artifact::MaterializedArtifact& materialized,
             dst.draft_head_token_ids = artifact::materialized_tensor(
                 materialized, src.draft_head_token_ids, NumericFormat::I32, {32768});
         }
+    }
+    out.has_dflash2 = plan.has_dflash2;
+    if (plan.has_dflash2) {
+        const auto& src = plan.dflash2;
+        auto& dst       = out.dflash2;
+        dst.fc          = artifact::materialized_weight(materialized, src.fc,
+                                                        NumericFormat::Q4G64_F16S, 2304, 9216);
+        dst.hidden_norm = artifact::materialized_tensor(materialized, src.hidden_norm,
+                                                        NumericFormat::BF16, {2304});
+        for (std::size_t i = 0; i < kDFlash2Layers; ++i) {
+            const auto& sl       = src.layers[i];
+            auto& dl             = dst.layers[i];
+            dl.input_norm        = artifact::materialized_tensor(materialized, sl.input_norm, NumericFormat::BF16, {2304});
+            dl.post_attention_norm = artifact::materialized_tensor(materialized, sl.post_attention_norm, NumericFormat::BF16, {2304});
+            dl.attn_conv_base    = artifact::materialized_tensor(materialized, sl.attn_conv_base, NumericFormat::BF16, {2304, 2, 2});
+            dl.attn_conv_proj    = artifact::materialized_tensor(materialized, sl.attn_conv_proj, NumericFormat::BF16, {2304, 576});
+            dl.q_norm            = artifact::materialized_tensor(materialized, sl.q_norm, NumericFormat::BF16, {128});
+            dl.k_norm            = artifact::materialized_tensor(materialized, sl.k_norm, NumericFormat::BF16, {128});
+            dl.q                 = artifact::materialized_weight(materialized, sl.q, NumericFormat::Q4G64_F16S, 4096, 2304);
+            dl.k                 = artifact::materialized_weight(materialized, sl.k, NumericFormat::Q4G64_F16S, 1024, 2304);
+            dl.v                 = artifact::materialized_weight(materialized, sl.v, NumericFormat::Q4G64_F16S, 1024, 2304);
+            dl.output            = artifact::materialized_weight(materialized, sl.output, NumericFormat::Q4G64_F16S, 2304, 4096);
+            dl.mlp_conv_base     = artifact::materialized_tensor(materialized, sl.mlp_conv_base, NumericFormat::BF16, {2304, 2, 2});
+            dl.mlp_conv_proj     = artifact::materialized_tensor(materialized, sl.mlp_conv_proj, NumericFormat::BF16, {2304, 576});
+            dl.gate_up           = artifact::materialized_weight(materialized, sl.gate_up, NumericFormat::Q4G64_F16S, 13824, 2304);
+            dl.down              = artifact::materialized_weight(materialized, sl.down, NumericFormat::Q4G64_F16S, 2304, 6912);
+        }
+        dst.final_norm = artifact::materialized_tensor(materialized, src.final_norm, NumericFormat::BF16, {2304});
+        dst.selector_hidden_proj = artifact::materialized_tensor(
+            materialized, src.selector_hidden_proj, NumericFormat::BF16, {2304, 256});
+        dst.predecessor_codebook = artifact::materialized_tensor(
+            materialized, src.predecessor_codebook, NumericFormat::BF16, {256, 201024});
+        dst.successor_codebook = artifact::materialized_tensor(
+            materialized, src.successor_codebook, NumericFormat::BF16, {256, 201024});
     }
     return out;
 }

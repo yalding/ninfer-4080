@@ -840,7 +840,14 @@ PendingBatch Program::decode(std::span<const SequenceHandle> handles,
             std::vector<TokenId> licensed;
             std::uint32_t mtp_drafts   = k;
             std::uint32_t ngram_drafts = 0;
-            if (!impl_->ngram_pool) {
+            if (impl_->options.speculative.backend == SpeculativeBackend::DFlash2) {
+                timing.begin_wait();
+                licensed = impl_->executor.speculative_step_dflash2(
+                    seq.slot, input[0], k, depth, seq.options.sampling,
+                    static_cast<std::uint32_t>(seq.generated.size()), seq.generated);
+                timing.end_wait();
+                timing.resume_submit();
+            } else if (!impl_->ngram_pool) {
                 timing.begin_wait();
                 licensed = impl_->executor.speculative_step_dspark(
                     seq.slot, input[0], k, depth, seq.options.sampling,
@@ -960,6 +967,10 @@ CommitResult Program::commit(PendingBatch&& pending,
                 s.generated.push_back(tok);
             }
             if (impl_->ngram_pool) { impl_->ngram_pool->observe(s.ledger, prev_ledger_size); }
+            if (d.accepted_tokens < pending.counts[i] &&
+                impl_->options.speculative.backend != SpeculativeBackend::None) {
+                impl_->executor.truncate_speculative_commit(s.slot, d.accepted_tokens);
+            }
         }
         value_offset += pending.counts[i];
         out.rows[i].disposition = d.terminal ? runtime::CommitDisposition::Finishable

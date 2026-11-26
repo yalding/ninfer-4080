@@ -94,19 +94,25 @@ struct AcceptExpected {
     std::int32_t token;
 };
 
-constexpr int kSparsePhysicalRows = 248320;
-constexpr int kSparseTokenDomain  = 248077;
-constexpr int kSparseCandidates   = 16;
-constexpr int kTargetCandidateCap = 20;
+constexpr int kSparsePhysicalRowsQwen = 248320;
+constexpr int kSparseTokenDomainQwen  = 248077;
+constexpr int kSparsePhysicalRowsInk  = 201024;
+constexpr int kSparseTokenDomainInk   = 200058;
+constexpr int kSparseCandidates       = 16;
+constexpr int kTargetCandidateCap     = 20;
 
 struct SparseAcceptSuite {
     const int kSparseDrafts;
     const int kSparseColumns;
     const int kSparseBatch;
+    const int kSparsePhysicalRows;
+    const int kSparseTokenDomain;
     std::size_t observed_workspace = 0;
 
-    SparseAcceptSuite(int drafts, int batch)
-        : kSparseDrafts(drafts), kSparseColumns(drafts + 1), kSparseBatch(batch) {}
+    SparseAcceptSuite(int drafts, int batch, int physical_rows = kSparsePhysicalRowsQwen,
+                      int token_domain = kSparseTokenDomainQwen)
+        : kSparseDrafts(drafts), kSparseColumns(drafts + 1), kSparseBatch(batch),
+          kSparsePhysicalRows(physical_rows), kSparseTokenDomain(token_domain) {}
 
     std::size_t sparse_logit_index(int row, int column, int token) {
         return (static_cast<std::size_t>(row) * kSparseColumns + column) * kSparsePhysicalRows +
@@ -1246,8 +1252,10 @@ int main(int argc, char** argv) {
         }
     }
     if (ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
-            kSparseTokenDomain, {false}, 1, 15, 1, 8) != sparse_peak ||
-        ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(kSparseTokenDomain, {true},
+            kSparseTokenDomainQwen, {false}, 1, 15, 1, 8) != sparse_peak ||
+        ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(kSparseTokenDomainQwen, {true},
+                                                                       1, 15, 1, 8) != 0 ||
+        ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(kSparseTokenDomainInk, {true},
                                                                        1, 15, 1, 8) != 0) {
         std::cerr << "sparse interval workspace does not cover the observed domain\n";
         ++failures;
@@ -1255,7 +1263,7 @@ int main(int argc, char** argv) {
     for (bool raw : {false, true}) {
         try {
             (void)ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
-                kSparseTokenDomain, {raw}, 1, 16, 1, 8);
+                kSparseTokenDomainQwen, {raw}, 1, 16, 1, 8);
             std::cerr << "sparse query admitted K=16\n";
             ++failures;
         } catch (const std::invalid_argument&) {}
@@ -1266,6 +1274,13 @@ int main(int argc, char** argv) {
         failures += suite.sparse_greedy_direct_case(0, true);
         failures += SparseAcceptSuite(k, 1).repeated_history_case(false);
         failures += SparseAcceptSuite(k, 1).repeated_history_case(true);
+    }
+    {
+        SparseAcceptSuite ink_suite(7, 1, kSparsePhysicalRowsInk, kSparseTokenDomainInk);
+        failures += ink_suite.sparse_greedy_direct_case();
+        failures += ink_suite.generated_general_case();
+        failures += ink_suite.repeated_history_case(false);
+        failures += ink_suite.repeated_history_case(true);
     }
 
     if (failures != 0) {

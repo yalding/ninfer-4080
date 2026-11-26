@@ -9,11 +9,19 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kSparseMaxDrafts    = 15;
-constexpr std::int32_t kSparseCandidates   = 16;
-constexpr std::int32_t kSparsePhysicalRows = 248320;
-constexpr std::int32_t kSparseTokenDomain  = 248077;
-constexpr std::int32_t kSparseMaxBatch     = 8;
+constexpr std::int32_t kSparseMaxDrafts        = 15;
+constexpr std::int32_t kSparseCandidates       = 16;
+constexpr std::int32_t kSparsePhysicalRowsQwen = 248320;
+constexpr std::int32_t kSparseTokenDomainQwen  = 248077;
+constexpr std::int32_t kSparsePhysicalRowsInk  = 201024;
+constexpr std::int32_t kSparseTokenDomainInk   = 200058;
+constexpr std::int32_t kSparseMaxBatch         = 8;
+
+std::int32_t sparse_physical_rows_for_domain(std::int32_t token_domain) {
+    if (token_domain == kSparseTokenDomainQwen) { return kSparsePhysicalRowsQwen; }
+    if (token_domain == kSparseTokenDomainInk) { return kSparsePhysicalRowsInk; }
+    return 0;
+}
 
 void require_contiguous_nonnull(const Tensor& t, const char* op, const char* name) {
     if (!t.is_contiguous()) {
@@ -87,9 +95,9 @@ std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(std::int32
 std::size_t speculative_accept_sparse_drafts_workspace_capacity_bytes(
     std::int32_t token_domain, SpeculativeAcceptExecutionEnvelope envelope, std::int32_t min_drafts,
     std::int32_t max_drafts, std::int32_t min_batch, std::int32_t max_batch) {
-    if (token_domain != kSparseTokenDomain || min_drafts < 1 || max_drafts < min_drafts ||
-        max_drafts > kSparseMaxDrafts || min_batch < 1 || max_batch < min_batch ||
-        max_batch > kSparseMaxBatch) {
+    if (sparse_physical_rows_for_domain(token_domain) == 0 || min_drafts < 1 ||
+        max_drafts < min_drafts || max_drafts > kSparseMaxDrafts || min_batch < 1 ||
+        max_batch < min_batch || max_batch > kSparseMaxBatch) {
         throw std::invalid_argument("sparse speculative accept workspace: unsupported profile");
     }
     if (envelope.all_rows_greedy_without_penalties) { return 0; }
@@ -184,9 +192,10 @@ void speculative_accept_sparse_drafts(
     Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
     SpeculativeAcceptExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream) {
     constexpr const char* op = "speculative_accept_sparse_drafts";
-    if (token_domain != kSparseTokenDomain) {
+    const std::int32_t physical_rows = sparse_physical_rows_for_domain(token_domain);
+    if (physical_rows == 0) {
         throw std::invalid_argument(
-            "speculative_accept_sparse_drafts: token_domain must be 248077");
+            "speculative_accept_sparse_drafts: unsupported token_domain");
     }
     const std::int32_t k = drafts.ne[0];
     if (k < 1 || k > kSparseMaxDrafts)
@@ -197,7 +206,7 @@ void speculative_accept_sparse_drafts(
         throw std::invalid_argument("speculative_accept_sparse_drafts: B must be 1..8");
     }
     require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
-    require_tensor3(logits, DType::BF16, kSparsePhysicalRows, columns, batch, op, "logits");
+    require_tensor3(logits, DType::BF16, physical_rows, columns, batch, op, "logits");
     require_matrix(drafts, DType::I32, k, batch, op, "drafts");
     require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
     require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");

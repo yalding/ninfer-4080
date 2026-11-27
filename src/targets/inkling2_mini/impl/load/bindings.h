@@ -3,12 +3,16 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
+#include "ninfer/types.h"
 #include <array>
+#include <span>
+#include <vector>
 
 namespace ninfer::targets::inkling2_mini::detail {
 inline constexpr std::size_t kPhysicalLayers = 24;
 inline constexpr std::size_t kMtpLayers      = 3;
 inline constexpr std::size_t kDFlash2Layers  = 5;
+inline constexpr std::size_t kVisionLayers   = 23;
 
 inline constexpr bool is_full_attention_layer(std::size_t i) noexcept { return i % 6 == 5; }
 
@@ -105,6 +109,35 @@ struct DFlash2Plan {
     artifact::ObjectHandle successor_codebook;
 };
 
+struct VisionLayerPlan {
+    artifact::ObjectHandle ln_1_weight;
+    artifact::ObjectHandle ln_1_bias;
+    artifact::ObjectHandle qkv;
+    artifact::ObjectHandle qkv_bias;
+    artifact::ObjectHandle output;
+    artifact::ObjectHandle output_bias;
+    artifact::ObjectHandle ls_1_gamma;
+    artifact::ObjectHandle ln_2_weight;
+    artifact::ObjectHandle ln_2_bias;
+    artifact::ObjectHandle fc1;
+    artifact::ObjectHandle fc1_bias;
+    artifact::ObjectHandle fc2;
+    artifact::ObjectHandle fc2_bias;
+    artifact::ObjectHandle ls_2_gamma;
+};
+
+struct VisionPlan {
+    artifact::ObjectHandle patch_embedding;
+    artifact::ObjectHandle class_embedding;
+    artifact::ObjectHandle cls_position_embedding;
+    artifact::ObjectHandle position_embedding;
+    artifact::ObjectHandle ln_pre_weight;
+    artifact::ObjectHandle ln_pre_bias;
+    std::array<VisionLayerPlan, kVisionLayers> layers;
+    artifact::ObjectHandle proj_in;
+    artifact::ObjectHandle proj_out;
+};
+
 struct BindingPlan {
     FrontendResourcePlan frontend;
     artifact::ObjectHandle token_embedding;
@@ -117,6 +150,9 @@ struct BindingPlan {
     MtpPlan mtp;
     bool has_dflash2 = false;
     DFlash2Plan dflash2;
+    bool has_vision     = false;
+    bool vision_overlay = false;
+    VisionPlan vision;
 };
 
 struct ArtifactLoadPlan {
@@ -216,6 +252,55 @@ struct DFlash2Weights {
     Tensor successor_codebook;
 };
 
+struct VisionLayerWeights {
+    Tensor ln_1_weight;
+    Tensor ln_1_bias;
+    Weight qkv;
+    Tensor qkv_bias;
+    Weight output;
+    Tensor output_bias;
+    Tensor ls_1_gamma;
+    Tensor ln_2_weight;
+    Tensor ln_2_bias;
+    Weight fc1;
+    Tensor fc1_bias;
+    Weight fc2;
+    Tensor fc2_bias;
+    Tensor ls_2_gamma;
+};
+
+struct VisionWeights {
+    Tensor patch_embedding;
+    Tensor class_embedding;
+    Tensor cls_position_embedding;
+    Tensor position_embedding;
+    Tensor ln_pre_weight;
+    Tensor ln_pre_bias;
+    std::array<VisionLayerWeights, kVisionLayers> layers;
+    Weight proj_in;
+    Weight proj_out;
+};
+
+struct PinnedRange {
+    std::size_t offset = 0;
+    std::size_t bytes  = 0;
+};
+
+struct VisionOverlayLayout {
+    PinnedRange prelude;
+    std::vector<PinnedRange> layers;
+    PinnedRange merger;
+    std::size_t slot_bytes    = 0;
+    std::size_t staging_bytes = 0;
+};
+
+inline constexpr std::size_t kVisionStagingAlignment = 256;
+
+[[nodiscard]] inline constexpr std::size_t vision_staging_align(std::size_t bytes) noexcept {
+    return (bytes + kVisionStagingAlignment - 1) / kVisionStagingAlignment *
+           kVisionStagingAlignment;
+}
+
 struct RuntimeModelView {
     const DeviceArena* weights_arena = nullptr;
     Weight token_embedding;
@@ -229,11 +314,18 @@ struct RuntimeModelView {
     MtpWeights mtp;
     bool has_dflash2    = false;
     DFlash2Weights dflash2;
+    bool has_vision     = false;
+    bool vision_overlay_enabled = false;
+    VisionWeights vision;
+    std::span<const std::byte> pinned_weights;
+    VisionOverlayLayout vision_overlay;
 };
 
 [[nodiscard]] ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp = false,
                                              bool load_draft_head = false,
-                                             bool load_dflash2 = false);
+                                             bool load_dflash2 = false,
+                                             bool enable_vision = false,
+                                             VisionResidency vision_residency = VisionResidency::Resident);
 [[nodiscard]] RuntimeModelView materialize_model(artifact::MaterializedArtifact& materialized,
                                                  const BindingPlan& plan);
 } // namespace ninfer::targets::inkling2_mini::detail

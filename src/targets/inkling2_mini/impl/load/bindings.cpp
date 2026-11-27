@@ -1,16 +1,106 @@
 #include "targets/inkling2_mini/impl/load/bindings.h"
 #include "artifact/typed_binding.h"
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
 #include <string>
 
 namespace ninfer::targets::inkling2_mini::detail {
 using artifact::NumericFormat;
 
+namespace {
+void update_range(const void* ptr, std::size_t bytes, const std::byte* base, std::size_t block_size,
+                  std::size_t& min_offset, std::size_t& max_end) {
+    if (ptr == nullptr || bytes == 0) { return; }
+    const auto* byte_ptr = static_cast<const std::byte*>(ptr);
+    if (byte_ptr < base || byte_ptr + bytes > base + block_size) {
+        throw std::logic_error("Inkling2 vision overlay weight is outside the pinned block");
+    }
+    const auto offset = static_cast<std::size_t>(byte_ptr - base);
+    min_offset        = std::min(min_offset, offset);
+    max_end           = std::max(max_end, offset + bytes);
+}
+
+void update_weight_range(const Weight& w, const std::byte* base, std::size_t block_size,
+                         std::size_t& min_offset, std::size_t& max_end) {
+    update_range(w.payload, static_cast<std::size_t>(w.payload_bytes), base, block_size, min_offset,
+                 max_end);
+}
+
+void update_tensor_range(const Tensor& t, const std::byte* base, std::size_t block_size,
+                         std::size_t& min_offset, std::size_t& max_end) {
+    update_range(t.data, t.bytes(), base, block_size, min_offset, max_end);
+}
+
+PinnedRange make_range(std::size_t min_offset, std::size_t max_end) {
+    if (max_end <= min_offset) {
+        throw std::logic_error("Inkling2 vision overlay group has no valid weights");
+    }
+    return PinnedRange{min_offset, max_end - min_offset};
+}
+
+VisionOverlayLayout compute_vision_overlay_layout(const VisionWeights& weights,
+                                                  std::span<const std::byte> pinned_block) {
+    const auto* base = pinned_block.data();
+    const auto size  = pinned_block.size();
+    if (base == nullptr || size == 0) {
+        throw std::invalid_argument("vision_overlay_layout requires a non-empty pinned block");
+    }
+    VisionOverlayLayout out;
+    std::size_t min_off = std::numeric_limits<std::size_t>::max();
+    std::size_t max_end = 0;
+    update_tensor_range(weights.patch_embedding, base, size, min_off, max_end);
+    update_tensor_range(weights.class_embedding, base, size, min_off, max_end);
+    update_tensor_range(weights.cls_position_embedding, base, size, min_off, max_end);
+    update_tensor_range(weights.position_embedding, base, size, min_off, max_end);
+    update_tensor_range(weights.ln_pre_weight, base, size, min_off, max_end);
+    update_tensor_range(weights.ln_pre_bias, base, size, min_off, max_end);
+    out.prelude = make_range(min_off, max_end);
+
+    out.layers.reserve(weights.layers.size());
+    for (const auto& layer : weights.layers) {
+        min_off = std::numeric_limits<std::size_t>::max();
+        max_end = 0;
+        update_tensor_range(layer.ln_1_weight, base, size, min_off, max_end);
+        update_tensor_range(layer.ln_1_bias, base, size, min_off, max_end);
+        update_weight_range(layer.qkv, base, size, min_off, max_end);
+        update_tensor_range(layer.qkv_bias, base, size, min_off, max_end);
+        update_weight_range(layer.output, base, size, min_off, max_end);
+        update_tensor_range(layer.output_bias, base, size, min_off, max_end);
+        update_tensor_range(layer.ls_1_gamma, base, size, min_off, max_end);
+        update_tensor_range(layer.ln_2_weight, base, size, min_off, max_end);
+        update_tensor_range(layer.ln_2_bias, base, size, min_off, max_end);
+        update_weight_range(layer.fc1, base, size, min_off, max_end);
+        update_tensor_range(layer.fc1_bias, base, size, min_off, max_end);
+        update_weight_range(layer.fc2, base, size, min_off, max_end);
+        update_tensor_range(layer.fc2_bias, base, size, min_off, max_end);
+        update_tensor_range(layer.ls_2_gamma, base, size, min_off, max_end);
+        out.layers.push_back(make_range(min_off, max_end));
+        out.slot_bytes = std::max(out.slot_bytes, out.layers.back().bytes);
+    }
+
+    min_off = std::numeric_limits<std::size_t>::max();
+    max_end = 0;
+    update_weight_range(weights.proj_in, base, size, min_off, max_end);
+    update_weight_range(weights.proj_out, base, size, min_off, max_end);
+    out.merger = make_range(min_off, max_end);
+
+    out.staging_bytes = vision_staging_align(out.prelude.bytes) +
+                        vision_staging_align(out.merger.bytes) +
+                        2 * vision_staging_align(out.slot_bytes);
+    return out;
+}
+} // namespace
+
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp, bool load_draft_head,
-                               bool load_dflash2) {
+                               bool load_dflash2, bool enable_vision,
+                               VisionResidency vision_residency) {
     ArtifactLoadPlan out;
     auto& plan           = out.bindings;
     plan.has_mtp         = load_mtp;
     plan.has_dflash2     = load_dflash2;
+    plan.has_vision      = enable_vision;
+    plan.vision_overlay  = enable_vision && vision_residency == VisionResidency::Overlay;
     plan.frontend        = bind_frontend_resources(binder);
     plan.token_embedding = artifact::bind_device_tensor(binder, "text/token_embedding",
                                                         NumericFormat::Q4G64_F16S, {201024, 2304});
@@ -225,6 +315,62 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, bool load_mtp, bool loa
             binder, "dflash2/selector/successor_codebook", NumericFormat::BF16, {201024, 256},
             d2_placement);
     }
+    if (enable_vision || binder.has_object("vision/patch_embedding")) {
+        const auto vis_placement =
+            !enable_vision ? artifact::TensorPlacement::ValidateOnly
+                           : (vision_residency == VisionResidency::Overlay
+                                  ? artifact::TensorPlacement::PinnedHost
+                                  : artifact::TensorPlacement::Device);
+        auto& v                  = plan.vision;
+        v.patch_embedding        = artifact::bind_tensor(binder, "vision/patch_embedding",
+                                                         NumericFormat::BF16, {1024, 1200}, vis_placement);
+        v.class_embedding        = artifact::bind_tensor(binder, "vision/class_embedding",
+                                                         NumericFormat::BF16, {1024}, vis_placement);
+        v.cls_position_embedding = artifact::bind_tensor(binder, "vision/cls_position_embedding",
+                                                         NumericFormat::BF16, {1024}, vis_placement);
+        v.position_embedding     = artifact::bind_tensor(binder, "vision/position_embedding",
+                                                         NumericFormat::BF16, {1024, 1024}, vis_placement);
+        v.ln_pre_weight          = artifact::bind_tensor(binder, "vision/ln_pre/weight",
+                                                         NumericFormat::BF16, {1024}, vis_placement);
+        v.ln_pre_bias            = artifact::bind_tensor(binder, "vision/ln_pre/bias",
+                                                         NumericFormat::BF16, {1024}, vis_placement);
+        for (std::size_t i = 0; i < kVisionLayers; ++i) {
+            auto& l        = v.layers[i];
+            const auto pfx = "vision/layers/" + std::to_string(i) + "/";
+            l.ln_1_weight  = artifact::bind_tensor(binder, pfx + "ln_1/weight", NumericFormat::BF16,
+                                                   {1024}, vis_placement);
+            l.ln_1_bias    = artifact::bind_tensor(binder, pfx + "ln_1/bias", NumericFormat::BF16,
+                                                   {1024}, vis_placement);
+            l.qkv          = artifact::bind_tensor(binder, pfx + "attention/qkv",
+                                                   NumericFormat::Q4G64_F16S, {3072, 1024}, vis_placement);
+            l.qkv_bias     = artifact::bind_tensor(binder, pfx + "attention/qkv_bias",
+                                                   NumericFormat::BF16, {3072}, vis_placement);
+            l.output       = artifact::bind_tensor(binder, pfx + "attention/output",
+                                                   NumericFormat::Q5G64_F16S, {1024, 1024}, vis_placement);
+            l.output_bias  = artifact::bind_tensor(binder, pfx + "attention/output_bias",
+                                                   NumericFormat::BF16, {1024}, vis_placement);
+            l.ls_1_gamma   = artifact::bind_tensor(binder, pfx + "ls_1/gamma", NumericFormat::BF16,
+                                                   {1024}, vis_placement);
+            l.ln_2_weight  = artifact::bind_tensor(binder, pfx + "ln_2/weight", NumericFormat::BF16,
+                                                   {1024}, vis_placement);
+            l.ln_2_bias    = artifact::bind_tensor(binder, pfx + "ln_2/bias", NumericFormat::BF16,
+                                                   {1024}, vis_placement);
+            l.fc1          = artifact::bind_tensor(binder, pfx + "mlp/fc1",
+                                                   NumericFormat::Q4G64_F16S, {4096, 1024}, vis_placement);
+            l.fc1_bias     = artifact::bind_tensor(binder, pfx + "mlp/fc1_bias",
+                                                   NumericFormat::BF16, {4096}, vis_placement);
+            l.fc2          = artifact::bind_tensor(binder, pfx + "mlp/fc2",
+                                                   NumericFormat::Q5G64_F16S, {1024, 4096}, vis_placement);
+            l.fc2_bias     = artifact::bind_tensor(binder, pfx + "mlp/fc2_bias",
+                                                   NumericFormat::BF16, {1024}, vis_placement);
+            l.ls_2_gamma   = artifact::bind_tensor(binder, pfx + "ls_2/gamma", NumericFormat::BF16,
+                                                   {1024}, vis_placement);
+        }
+        v.proj_in  = artifact::bind_tensor(binder, "vision/merger/proj_in",
+                                           NumericFormat::W8G32_F16S, {4096, 4096}, vis_placement);
+        v.proj_out = artifact::bind_tensor(binder, "vision/merger/proj_out",
+                                           NumericFormat::W8G32_F16S, {2304, 4096}, vis_placement);
+    }
     out.materialization = binder.finish();
     return out;
 }
@@ -399,6 +545,64 @@ RuntimeModelView materialize_model(artifact::MaterializedArtifact& materialized,
             materialized, src.predecessor_codebook, NumericFormat::BF16, {256, 201024});
         dst.successor_codebook = artifact::materialized_tensor(
             materialized, src.successor_codebook, NumericFormat::BF16, {256, 201024});
+    }
+    out.has_vision             = plan.has_vision;
+    out.vision_overlay_enabled = plan.vision_overlay;
+    if (plan.has_vision) {
+        const auto& src             = plan.vision;
+        auto& dst                   = out.vision;
+        dst.patch_embedding         = artifact::materialized_tensor(materialized, src.patch_embedding,
+                                                                    NumericFormat::BF16, {1200, 1024});
+        dst.class_embedding         = artifact::materialized_tensor(materialized, src.class_embedding,
+                                                                    NumericFormat::BF16, {1024});
+        dst.cls_position_embedding  = artifact::materialized_tensor(
+            materialized, src.cls_position_embedding, NumericFormat::BF16, {1024});
+        dst.position_embedding      = artifact::materialized_tensor(materialized, src.position_embedding,
+                                                                    NumericFormat::BF16, {1024, 1024});
+        dst.ln_pre_weight           = artifact::materialized_tensor(materialized, src.ln_pre_weight,
+                                                                    NumericFormat::BF16, {1024});
+        dst.ln_pre_bias             = artifact::materialized_tensor(materialized, src.ln_pre_bias,
+                                                                    NumericFormat::BF16, {1024});
+        for (std::size_t i = 0; i < kVisionLayers; ++i) {
+            const auto& sl = src.layers[i];
+            auto& dl       = dst.layers[i];
+            dl.ln_1_weight = artifact::materialized_tensor(materialized, sl.ln_1_weight,
+                                                           NumericFormat::BF16, {1024});
+            dl.ln_1_bias   = artifact::materialized_tensor(materialized, sl.ln_1_bias,
+                                                           NumericFormat::BF16, {1024});
+            dl.qkv         = artifact::materialized_weight(materialized, sl.qkv,
+                                                           NumericFormat::Q4G64_F16S, 3072, 1024);
+            dl.qkv_bias    = artifact::materialized_tensor(materialized, sl.qkv_bias,
+                                                           NumericFormat::BF16, {3072});
+            dl.output      = artifact::materialized_weight(materialized, sl.output,
+                                                           NumericFormat::Q5G64_F16S, 1024, 1024);
+            dl.output_bias = artifact::materialized_tensor(materialized, sl.output_bias,
+                                                           NumericFormat::BF16, {1024});
+            dl.ls_1_gamma  = artifact::materialized_tensor(materialized, sl.ls_1_gamma,
+                                                           NumericFormat::BF16, {1024});
+            dl.ln_2_weight = artifact::materialized_tensor(materialized, sl.ln_2_weight,
+                                                           NumericFormat::BF16, {1024});
+            dl.ln_2_bias   = artifact::materialized_tensor(materialized, sl.ln_2_bias,
+                                                           NumericFormat::BF16, {1024});
+            dl.fc1         = artifact::materialized_weight(materialized, sl.fc1,
+                                                           NumericFormat::Q4G64_F16S, 4096, 1024);
+            dl.fc1_bias    = artifact::materialized_tensor(materialized, sl.fc1_bias,
+                                                           NumericFormat::BF16, {4096});
+            dl.fc2         = artifact::materialized_weight(materialized, sl.fc2,
+                                                           NumericFormat::Q5G64_F16S, 1024, 4096);
+            dl.fc2_bias    = artifact::materialized_tensor(materialized, sl.fc2_bias,
+                                                           NumericFormat::BF16, {1024});
+            dl.ls_2_gamma  = artifact::materialized_tensor(materialized, sl.ls_2_gamma,
+                                                           NumericFormat::BF16, {1024});
+        }
+        dst.proj_in  = artifact::materialized_weight(materialized, src.proj_in,
+                                                   NumericFormat::W8G32_F16S, 4096, 4096);
+        dst.proj_out = artifact::materialized_weight(materialized, src.proj_out,
+                                                   NumericFormat::W8G32_F16S, 2304, 4096);
+        if (plan.vision_overlay) {
+            out.pinned_weights = materialized.pinned_block();
+            out.vision_overlay = compute_vision_overlay_layout(dst, out.pinned_weights);
+        }
     }
     return out;
 }

@@ -20,10 +20,12 @@ FP32 = "FP32"
 I32 = "I32"
 Q3 = "Q3G128_F16S"
 Q4 = "Q4G64_F16S"
+Q5 = "Q5G64_F16S"
 Q6 = "Q6G64_F16S"
+W8 = "W8G32_F16S"
 
 DIRECT_FORMATS = frozenset((BF16, FP32, I32))
-FORMAT_NAMES = (BF16, FP32, I32, Q3, Q4, Q6)
+FORMAT_NAMES = (BF16, FP32, I32, Q3, Q4, Q5, Q6, W8)
 LAYOUT_NAMES = (CONTIGUOUS_LAYOUT, ROW_SPLIT_LAYOUT)
 
 HIDDEN_SIZE = 2304
@@ -59,6 +61,17 @@ DFLASH2_CONV_GROUPS = 144
 DFLASH2_CONV_PROJ_ROWS = 576
 DFLASH2_SELECTOR_RANK = 256
 DFLASH2_FEATURE_WIDTH = 9216
+VISION_LAYERS = 23
+VISION_HIDDEN = 1024
+VISION_INTERMEDIATE = 4096
+VISION_HEADS = 16
+VISION_HEAD_DIM = 64
+VISION_PATCH_SIZE = 20
+VISION_PATCH_DIM = 1200
+VISION_POSEMB_GRID = 32
+VISION_POSEMB_LEN = 1024
+VISION_MERGE_SIZE = 2
+VISION_MERGER_DIM = 4096
 
 FULL_ATTENTION_LAYERS = frozenset((5, 11, 17, 23))
 SWA_LAYERS = frozenset(i for i in range(PHYS_LAYERS) if i not in FULL_ATTENTION_LAYERS)
@@ -103,6 +116,15 @@ RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
     ResourceSpec("frontend/chat_template.jinja"),
     ResourceSpec("frontend/generation_config.json"),
 )
+VISION_RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
+    ResourceSpec("frontend/processor_config.json"),
+)
+
+
+def resource_specs(*, include_vision: bool = False) -> tuple[ResourceSpec, ...]:
+    if include_vision:
+        return RESOURCE_SPECS + VISION_RESOURCE_SPECS
+    return RESOURCE_SPECS
 
 
 def is_full_attention_layer(layer: int) -> bool:
@@ -308,6 +330,44 @@ def _build_dflash2_tensor_specs() -> tuple[TensorSpec, ...]:
     return tuple(specs)
 
 
+def _build_vision_tensor_specs() -> tuple[TensorSpec, ...]:
+    specs: list[TensorSpec] = [
+        tensor_spec("vision/patch_embedding", (VISION_HIDDEN, VISION_PATCH_DIM), BF16),
+        tensor_spec("vision/class_embedding", (VISION_HIDDEN,), BF16),
+        tensor_spec("vision/cls_position_embedding", (VISION_HIDDEN,), BF16),
+        tensor_spec("vision/position_embedding", (VISION_POSEMB_LEN, VISION_HIDDEN), BF16),
+        tensor_spec("vision/ln_pre/weight", (VISION_HIDDEN,), BF16),
+        tensor_spec("vision/ln_pre/bias", (VISION_HIDDEN,), BF16),
+    ]
+    for layer in range(VISION_LAYERS):
+        prefix = f"vision/layers/{layer}/"
+        specs.extend(
+            (
+                tensor_spec(prefix + "ln_1/weight", (VISION_HIDDEN,), BF16),
+                tensor_spec(prefix + "ln_1/bias", (VISION_HIDDEN,), BF16),
+                tensor_spec(prefix + "attention/qkv", (3 * VISION_HIDDEN, VISION_HIDDEN), Q4),
+                tensor_spec(prefix + "attention/qkv_bias", (3 * VISION_HIDDEN,), BF16),
+                tensor_spec(prefix + "attention/output", (VISION_HIDDEN, VISION_HIDDEN), Q5),
+                tensor_spec(prefix + "attention/output_bias", (VISION_HIDDEN,), BF16),
+                tensor_spec(prefix + "ls_1/gamma", (VISION_HIDDEN,), BF16),
+                tensor_spec(prefix + "ln_2/weight", (VISION_HIDDEN,), BF16),
+                tensor_spec(prefix + "ln_2/bias", (VISION_HIDDEN,), BF16),
+                tensor_spec(prefix + "mlp/fc1", (VISION_INTERMEDIATE, VISION_HIDDEN), Q4),
+                tensor_spec(prefix + "mlp/fc1_bias", (VISION_INTERMEDIATE,), BF16),
+                tensor_spec(prefix + "mlp/fc2", (VISION_HIDDEN, VISION_INTERMEDIATE), Q5),
+                tensor_spec(prefix + "mlp/fc2_bias", (VISION_HIDDEN,), BF16),
+                tensor_spec(prefix + "ls_2/gamma", (VISION_HIDDEN,), BF16),
+            )
+        )
+    specs.extend(
+        (
+            tensor_spec("vision/merger/proj_in", (VISION_MERGER_DIM, VISION_MERGER_DIM), W8),
+            tensor_spec("vision/merger/proj_out", (HIDDEN_SIZE, VISION_MERGER_DIM), W8),
+        )
+    )
+    return tuple(specs)
+
+
 TENSOR_SPECS: tuple[TensorSpec, ...] = _build_tensor_specs()
 MTP_TENSOR_SPECS: tuple[TensorSpec, ...] = _build_mtp_tensor_specs()
 MTP_DRAFT_HEAD_SPECS: tuple[TensorSpec, ...] = (
@@ -315,6 +375,7 @@ MTP_DRAFT_HEAD_SPECS: tuple[TensorSpec, ...] = (
     tensor_spec("mtp/draft_head_token_ids", (MTP_DRAFT_HEAD_ROWS,), I32),
 )
 DFLASH2_TENSOR_SPECS: tuple[TensorSpec, ...] = _build_dflash2_tensor_specs()
+VISION_TENSOR_SPECS: tuple[TensorSpec, ...] = _build_vision_tensor_specs()
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
 
@@ -323,12 +384,15 @@ def tensor_specs(
     include_mtp: bool = False,
     include_draft_head: bool = False,
     include_dflash2: bool = False,
+    include_vision: bool = False,
 ) -> tuple[TensorSpec, ...]:
     extra: tuple[TensorSpec, ...] = ()
     if include_mtp:
         extra += MTP_TENSOR_SPECS + (MTP_DRAFT_HEAD_SPECS if include_draft_head else ())
     if include_dflash2:
         extra += DFLASH2_TENSOR_SPECS
+    if include_vision:
+        extra += VISION_TENSOR_SPECS
     return TENSOR_SPECS + extra
 
 
@@ -337,11 +401,13 @@ def object_specs(
     include_mtp: bool = False,
     include_draft_head: bool = False,
     include_dflash2: bool = False,
+    include_vision: bool = False,
 ) -> tuple[StoredObjectSpec, ...]:
-    return RESOURCE_SPECS + tensor_specs(
+    return resource_specs(include_vision=include_vision) + tensor_specs(
         include_mtp=include_mtp,
         include_draft_head=include_draft_head,
         include_dflash2=include_dflash2,
+        include_vision=include_vision,
     )
 
 

@@ -11,10 +11,19 @@
 namespace ninfer {
 struct StartupObserver;
 }
+namespace ninfer::targets::inkling2_mini {
+struct PreparedMediaPayload;
+}
 namespace ninfer::targets::inkling2_mini::detail {
 struct RuntimeModelView;
 struct HostStateImage;
 std::size_t executor_device_bytes(const EngineOptions& options, std::uint32_t kv_tokens);
+
+struct VisionChunkSlice {
+    std::uint32_t handoff_col_offset = 0;
+    std::uint32_t token_count        = 0;
+    std::uint32_t chunk_col_begin    = 0;
+};
 
 struct DecodeRow {
     TokenId id;
@@ -31,7 +40,11 @@ public:
              const StartupObserver* observer = nullptr);
     ~Executor();
     Tensor forward(std::span<const TokenId> ids, std::uint32_t start, std::uint32_t state_slot,
-                   bool all_logits = false);
+                   bool all_logits = false,
+                   std::span<const VisionChunkSlice> vision_slices = {});
+    double encode_vision_item(const PreparedMediaPayload& payload,
+                              std::uint32_t handoff_col_offset);
+    std::uint32_t vision_handoff_capacity_tokens() const noexcept;
     std::vector<TokenId> decode_batch(std::span<const DecodeRow> rows);
     std::vector<TokenId> draft_dspark(std::uint32_t state_slot, TokenId anchor,
                                       std::uint32_t draft_tokens);

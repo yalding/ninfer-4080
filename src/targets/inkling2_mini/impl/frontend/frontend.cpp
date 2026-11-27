@@ -4,6 +4,9 @@
 #include "targets/inkling2_mini/impl/frontend/tokenizer.h"
 #include "targets/inkling2_mini/impl/frontend/chat_template.h"
 #include "targets/inkling2_mini/impl/frontend/output_session.h"
+#include "targets/inkling2_mini/impl/frontend/processor.h"
+#include "targets/inkling2_mini/impl/vision_limits.h"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -14,6 +17,9 @@ namespace ninfer::targets::inkling2_mini {
 namespace fi = frontend_internal;
 
 namespace {
+constexpr TokenId kContentImageToken = 200005;
+constexpr TokenId kImagePatchToken   = 200054;
+
 void check_control(const PreparationControl& control) {
     if (control.cancellation.requested()) {
         throw RequestError(RequestErrorKind::Cancelled, "prompt preparation cancelled");
@@ -28,7 +34,9 @@ void check_control(const PreparationControl& control) {
 class Frontend::Impl {
 public:
     std::shared_ptr<const fi::Tokenizer> tokenizer;
-    std::uint32_t max_context = 131072;
+    std::shared_ptr<fi::MediaPreprocessCache> media_cache;
+    std::uint32_t max_context     = 131072;
+    bool vision_enabled           = false;
     StopPolicy stop;
 };
 
@@ -53,10 +61,25 @@ Frontend make_frontend(const FrontendResources& resources, FrontendOptions optio
         fi::TokenizerResources{resources.tokenizer_json, resources.tokenizer_config_json,
                                resources.generation_config_json});
     if (!impl->tokenizer->has_exact_token_domain(kTokenDomain) ||
-        impl->tokenizer->encode("<|content_model_end_sampling|>") != std::vector<int>{200006}) {
+        impl->tokenizer->encode("<|content_model_end_sampling|>") != std::vector<int>{200006} ||
+        impl->tokenizer->encode("<|content_image|>") != std::vector<int>{kContentImageToken} ||
+        impl->tokenizer->encode("<|unused_200054|>") != std::vector<int>{kImagePatchToken}) {
         throw std::invalid_argument("unsupported Inkling tokenizer token domain");
     }
+    if (!resources.processor_config_json.empty()) {
+        const auto cfg = nlohmann::json::parse(resources.processor_config_json);
+        if (cfg.value("image_token", std::string{}) != "<|unused_200054|>") {
+            throw std::invalid_argument("unsupported Inkling processor_config image_token");
+        }
+    }
     impl->max_context    = options.max_context;
+    impl->vision_enabled = options.vision_enabled;
+    const auto max_patches = detail::vision_native_capacity(options.vision_max_tokens);
+    const auto max_merged = detail::vision_merged_capacity(options.vision_max_tokens,
+                                                           options.vision_max_merged_tokens);
+    impl->media_cache = std::make_shared<fi::MediaPreprocessCache>(
+        options.media_cache_bytes, options.media_live_bytes, options.media_preprocess_threads,
+        max_patches, std::min(max_merged, options.max_context));
     impl->stop.token_ids = {200006};
     return Frontend(std::move(impl));
 }
@@ -146,11 +169,134 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     bytes.push_back(input.options.continuation == PromptContinuationMode::ContinueFinalAssistant
                         ? rendered.message_begins.back()
                         : rendered.text.size());
+
+    if (!rendered.image_placeholders.empty() && !impl_->vision_enabled) {
+        throw std::invalid_argument(
+            "vision is disabled on this Engine instance; launch with --vision");
+    }
+    std::size_t total_media_bytes = 0;
+    for (const auto& ph : rendered.image_placeholders) {
+        const auto sz = input.messages[ph.message_index].parts[ph.part_index].media.bytes.size();
+        if (sz > kMaximumPromptMediaBytes - total_media_bytes) {
+            throw RequestError(RequestErrorKind::MediaBudgetExceeded,
+                               "aggregate prompt media bytes exceed limit");
+        }
+        total_media_bytes += sz;
+    }
+
+    const std::size_t ph_byte_base = bytes.size();
+    for (const auto& ph : rendered.image_placeholders) {
+        bytes.push_back(ph.placeholder_begin);
+        bytes.push_back(ph.placeholder_end);
+    }
+
     const auto encoded = impl_->tokenizer->encode_with_boundaries(
         rendered.text, bytes, {.max_tokens = static_cast<std::size_t>(impl_->max_context) + 1},
         rendered.literal_spans);
-    auto result = prepare_tokens(encoded.input_ids, true);
+    if (encoded.input_ids.size() > impl_->max_context) {
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           "prompt tokens exceed maximum context");
+    }
+
+    std::vector<fi::PreprocessedImage> pre_images;
+    fi::MediaRequestMetrics media_metrics;
+    double media_wall_seconds = 0.0;
+    if (!rendered.image_placeholders.empty()) {
+        const auto media_started = std::chrono::steady_clock::now();
+        pre_images.reserve(rendered.image_placeholders.size());
+        for (const auto& ph : rendered.image_placeholders) {
+            const auto& media = input.messages[ph.message_index].parts[ph.part_index].media;
+            pre_images.push_back(impl_->media_cache->prepare_image(media, control, media_metrics));
+        }
+        media_wall_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                          media_started).count();
+    }
+
+    std::vector<TokenId> final_ids;
+    std::vector<std::optional<std::uint32_t>> shifted_frontiers(encoded.boundaries.size(), std::nullopt);
+    std::vector<PreparedVisionItem> vision_items;
+    std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
+    if (rendered.image_placeholders.empty()) {
+        final_ids = encoded.input_ids;
+        for (std::size_t i = 0; i < encoded.boundaries.size(); ++i) {
+            if (encoded.boundaries[i].exact_frontier) {
+                shifted_frontiers[i] = static_cast<std::uint32_t>(*encoded.boundaries[i].exact_frontier);
+            }
+        }
+    } else {
+        struct PhSpan {
+            std::size_t old_pos;
+            std::uint32_t v_tokens;
+        };
+        std::vector<PhSpan> ph_spans;
+        ph_spans.reserve(rendered.image_placeholders.size());
+        std::size_t extra_tokens = 0;
+        for (std::size_t k = 0; k < rendered.image_placeholders.size(); ++k) {
+            const auto b_tok = encoded.boundaries[ph_byte_base + 2 * k].exact_frontier;
+            const auto e_tok = encoded.boundaries[ph_byte_base + 2 * k + 1].exact_frontier;
+            if (!b_tok || !e_tok || *b_tok >= encoded.input_ids.size() || *e_tok != *b_tok + 1 ||
+                encoded.input_ids[*b_tok] != kImagePatchToken) {
+                throw std::logic_error("Inkling image placeholder tokenization mismatch");
+            }
+            const std::uint32_t v_tok = pre_images[k].payload->merged_tokens;
+            ph_spans.push_back({*b_tok, v_tok});
+            extra_tokens += static_cast<std::size_t>(v_tok - 1);
+        }
+        if (encoded.input_ids.size() + extra_tokens > impl_->max_context) {
+            throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                               "prompt with vision tokens exceeds maximum context");
+        }
+        final_ids.reserve(encoded.input_ids.size() + extra_tokens);
+        std::size_t ph_cursor = 0;
+        for (std::size_t old_i = 0; old_i < encoded.input_ids.size(); ++old_i) {
+            if (ph_cursor < ph_spans.size() && old_i == ph_spans[ph_cursor].old_pos) {
+                const auto begin = static_cast<std::uint32_t>(final_ids.size());
+                const auto count = ph_spans[ph_cursor].v_tokens;
+                final_ids.insert(final_ids.end(), count, kImagePatchToken);
+                const auto end = static_cast<std::uint32_t>(final_ids.size());
+                vision_items.push_back(PreparedVisionItem{
+                    .token_begin    = begin,
+                    .token_end      = end,
+                    .grid_h         = pre_images[ph_cursor].grid_h,
+                    .grid_w         = pre_images[ph_cursor].grid_w,
+                    .content_digest = pre_images[ph_cursor].content_digest,
+                });
+                media_payloads.push_back(pre_images[ph_cursor].payload);
+                ++ph_cursor;
+            } else {
+                final_ids.push_back(encoded.input_ids[old_i]);
+            }
+        }
+        for (std::size_t i = 0; i < ph_byte_base; ++i) {
+            if (encoded.boundaries[i].exact_frontier) {
+                const std::size_t old_f = *encoded.boundaries[i].exact_frontier;
+                std::size_t new_f       = old_f;
+                for (const auto& ph : ph_spans) {
+                    if (old_f > ph.old_pos) { new_f += static_cast<std::size_t>(ph.v_tokens - 1); }
+                }
+                shifted_frontiers[i] = static_cast<std::uint32_t>(new_f);
+            }
+        }
+    }
+
+    auto result = prepare_tokens(std::move(final_ids), true);
     auto& data  = *result.data_;
+    data.vision_items   = std::move(vision_items);
+    data.media_payloads = std::move(media_payloads);
+    data.prepare.media_preprocess_seconds      = media_wall_seconds;
+    data.prepare.media_preprocess_work_seconds = media_metrics.build_seconds;
+    data.prepare.media_items                   = rendered.image_placeholders.size();
+    data.prepare.media_bytes                   = total_media_bytes;
+    data.prepare.media_cache_hits              = media_metrics.hits;
+    data.prepare.media_cache_misses            = media_metrics.misses;
+    data.prepare.media_singleflight_waits      = media_metrics.singleflight_waits;
+    data.prepare.built_patch_bytes             = media_metrics.built_patch_bytes;
+    data.prepare.reused_patch_bytes            = media_metrics.reused_patch_bytes;
+    for (const auto& img : pre_images) {
+        data.prepare.raw_patches   += img.payload->native_patches;
+        data.prepare.vision_tokens += img.payload->merged_tokens;
+        data.prepare.patch_bytes   += img.payload->payload_bytes();
+    }
     data.continuation =
         input.options.continuation == PromptContinuationMode::ContinueFinalAssistant;
     if (data.continuation) {
@@ -159,9 +305,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             !last.reasoning_content.empty() && last.parts.empty() && last.tool_calls.empty();
     }
     const auto frontier = [&](std::size_t message_count) -> std::optional<std::uint32_t> {
-        const auto value = encoded.boundaries.at(message_count).exact_frontier;
-        return value ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(*value))
-                     : std::nullopt;
+        return shifted_frontiers.at(message_count);
     };
     // Inkling emits its own assistant opener. The complete request prefix is the replay boundary;
     // continuation instead retains the history before the final assistant serialization.
@@ -315,7 +459,7 @@ PromptCapabilities Frontend::prompt_capabilities() const noexcept {
     return fi::prompt_capabilities();
 }
 
-MediaCacheSummary Frontend::media_cache_summary() const { return {}; }
+MediaCacheSummary Frontend::media_cache_summary() const { return impl_->media_cache->summary(); }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->stop; }
 
@@ -352,7 +496,7 @@ PreparedPrompt::operator bool() const noexcept { return bool(data_); }
 
 PromptSummary PreparedPrompt::summary() const {
     if (!data_) { throw std::logic_error("empty prepared prompt"); }
-    return {static_cast<std::uint32_t>(data_->token_ids.size()), false};
+    return {static_cast<std::uint32_t>(data_->token_ids.size()), data_->has_media()};
 }
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {

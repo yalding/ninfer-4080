@@ -55,5 +55,24 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(by_name["dflash2/selector/predecessor_codebook"].shape, (201024, 256))
 
 
+    def test_vision_inventory_contract(self):
+        self.assertEqual(len(inventory.VISION_TENSOR_SPECS), 330)
+        self.assertEqual(
+            len(inventory.object_specs(include_vision=True)),
+            len(inventory.OBJECT_SPECS) + 1 + 330,
+        )
+        counts = inventory.format_counts(inventory.VISION_TENSOR_SPECS)
+        self.assertEqual(counts[inventory.BF16], 236)
+        self.assertEqual(counts[inventory.Q4], 46)
+        self.assertEqual(counts[inventory.Q5], 46)
+        self.assertEqual(counts[inventory.W8], 2)
+        by_name = {s.name: s for s in inventory.VISION_TENSOR_SPECS}
+        self.assertEqual(by_name["vision/patch_embedding"].shape, (1024, 1200))
+        self.assertEqual(by_name["vision/layers/0/attention/qkv"].shape, (3072, 1024))
+        self.assertEqual(by_name["vision/layers/22/mlp/fc2"].shape, (1024, 4096))
+        self.assertEqual(by_name["vision/merger/proj_in"].shape, (4096, 4096))
+        self.assertEqual(by_name["vision/merger/proj_out"].shape, (2304, 4096))
+
+
 if __name__ == "__main__":
     unittest.main()

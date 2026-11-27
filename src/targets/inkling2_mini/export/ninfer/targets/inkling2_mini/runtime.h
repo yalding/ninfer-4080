@@ -89,6 +89,7 @@ struct RequestBasePlan {
     runtime::ResolvedExecutionOptions options;
     PreparedContextCache cache;
     std::vector<TokenId> ids;
+    std::vector<PreparedVisionItem> vision_items;
 
     const runtime::RequestPlanSummary& summary() const noexcept { return value; }
 

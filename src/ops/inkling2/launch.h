@@ -59,4 +59,16 @@ void inkling2_dflash2_topk16_and_select_launch(
     const Tensor& base_positions, const SamplingConfig* configs, Tensor& candidate_ids,
     Tensor& drafts, Tensor& proposal_q, void* projected_hidden_buf, std::int32_t* partial_ids,
     float* partial_vals, float* unary_scores, cudaStream_t stream);
+void inkling2_vision_patch_embed_launch(
+    const Tensor& patches, const Tensor& patch_weight, const Tensor& class_embedding,
+    const Tensor& cls_position_embedding, const Tensor& position_table, const Tensor& pos_indices,
+    const Tensor& pos_weights, const Tensor& ln_pre_weight, const Tensor& ln_pre_bias, float eps,
+    Tensor& out, cudaStream_t stream);
+void inkling2_vision_rope_2d_launch(const Tensor& coords, float rope_theta, Tensor& qkv,
+                                    cudaStream_t stream);
+void inkling2_vision_layerscale_add_launch(const Tensor& proj, const Tensor& bias,
+                                           const Tensor& gamma, Tensor& hidden,
+                                           cudaStream_t stream);
+void inkling2_vision_merge_2x2_launch(const Tensor& src, const Tensor& merge_indices, Tensor& out,
+                                      cudaStream_t stream);
 } // namespace ninfer::ops::detail

@@ -236,7 +236,9 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--ngram-n N` | n-gram lookup key length, `1..64` | `8` |
 | `--ngram-min N` | drop pool extensions shorter than N | `1` |
 | `--ngram-pool-mib M` | host n-gram pool size, `1..4096` | `16` |
-| `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--vision` | enable image/video input (Inkling-2-Mini supports images) and load Vision GPU allocations | off |
+| `--vision-residency resident\|overlay\|cpu` | Vision weight placement. `overlay` stages weights from pinned RAM in a reusable GPU workspace. Inkling-2-Mini supports `resident` and `overlay`. | `resident` |
+| `--vision-offload on\|off` | alias for `--vision-residency overlay\|resident` | `off` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |

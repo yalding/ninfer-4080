@@ -11,11 +11,15 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kPackedAttentionHeadDim = 72;
-inline constexpr int kPackedAttentionHeads   = 16;
-inline constexpr int kPackedAttentionBr      = 64;
-inline constexpr int kPackedAttentionBc      = 64;
-inline constexpr int kPackedAttentionPaddedD = 128;
+inline constexpr int kPackedAttentionHeads = 16;
+inline constexpr int kPackedAttentionBr    = 64;
+inline constexpr int kPackedAttentionBc    = 64;
+
+template <int HeadDim>
+__host__ __device__ inline constexpr int packed_attention_padded_d() {
+    static_assert(HeadDim == 64 || HeadDim == 72);
+    return HeadDim == 64 ? 64 : 128;
+}
 
 struct alignas(16) PackedAttentionTile {
     std::int32_t q0;
@@ -64,34 +68,36 @@ __global__ void packed_attention_prepare_tiles_kernel(const std::int32_t* cu_seq
     }
 }
 
-template <int Br, int Threads>
+template <int HeadDim, int Br, int Threads>
 __device__ __forceinline__ void
 packed_attention_stage_q(__nv_bfloat16* dst, const __nv_bfloat16* q, int q0, int end, int head,
                          int tid, std::int64_t stride_d, std::int64_t stride_h,
                          std::int64_t stride_t) {
-    constexpr int VecsPerRow = kPackedAttentionPaddedD / 8;
+    constexpr int Dp         = packed_attention_padded_d<HeadDim>();
+    constexpr int VecsPerRow = Dp / 8;
     for (int chunk = tid; chunk < Br * VecsPerRow; chunk += Threads) {
         const int row       = chunk / VecsPerRow;
         const int d         = (chunk % VecsPerRow) * 8;
-        const bool in_range = q0 + row < end && d < kPackedAttentionHeadDim;
-        __nv_bfloat16* smem = &dst[row * kPackedAttentionPaddedD + packed_attention_swz(row, d)];
+        const bool in_range = q0 + row < end && d < HeadDim;
+        __nv_bfloat16* smem = &dst[row * Dp + packed_attention_swz(row, d)];
         const __nv_bfloat16* global = packed_attention_ptr(
             q, stride_d, stride_h, stride_t, in_range ? d : 0, head, in_range ? q0 + row : q0);
         cp_async_zfill<16, Cache::cg>(smem, global, in_range ? 16 : 0);
     }
 }
 
-template <int Bc, int Threads>
+template <int HeadDim, int Bc, int Threads>
 __device__ __forceinline__ void
 packed_attention_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* src, int key0, int end, int head,
                           int tid, std::int64_t stride_d, std::int64_t stride_h,
                           std::int64_t stride_t) {
-    constexpr int VecsPerRow = kPackedAttentionPaddedD / 8;
+    constexpr int Dp         = packed_attention_padded_d<HeadDim>();
+    constexpr int VecsPerRow = Dp / 8;
     for (int chunk = tid; chunk < Bc * VecsPerRow; chunk += Threads) {
         const int row       = chunk / VecsPerRow;
         const int d         = (chunk % VecsPerRow) * 8;
-        const bool in_range = key0 + row < end && d < kPackedAttentionHeadDim;
-        __nv_bfloat16* smem = &dst[row * kPackedAttentionPaddedD + packed_attention_swz(row, d)];
+        const bool in_range = key0 + row < end && d < HeadDim;
+        __nv_bfloat16* smem = &dst[row * Dp + packed_attention_swz(row, d)];
         const __nv_bfloat16* global =
             packed_attention_ptr(src, stride_d, stride_h, stride_t, in_range ? d : 0, head,
                                  in_range ? key0 + row : key0);
@@ -99,7 +105,7 @@ packed_attention_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* src, int key0
     }
 }
 
-template <int Br, int Bc>
+template <int HeadDim, int Br, int Bc>
 __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, const PackedAttentionTile* __restrict__ tiles,
@@ -107,17 +113,19 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
     std::int64_t q_stride_d, std::int64_t q_stride_h, std::int64_t q_stride_t,
     std::int64_t k_stride_d, std::int64_t k_stride_h, std::int64_t k_stride_t,
     std::int64_t v_stride_d, std::int64_t v_stride_h, std::int64_t v_stride_t) {
+    static_assert(HeadDim == 64 || HeadDim == 72);
     static_assert(Br == 16 || Br == 32 || Br == 64);
     static_assert(Bc == 16 || Bc == 32 || Bc == 64);
-    constexpr int D             = kPackedAttentionHeadDim;
-    constexpr int Dp            = kPackedAttentionPaddedD;
+    constexpr int D             = HeadDim;
+    constexpr int Dp            = packed_attention_padded_d<HeadDim>();
     constexpr int Threads       = Br * 2;
     constexpr int QKNt          = Bc / 8;
-    constexpr int QKKs          = 5; // ceil(72 / 16)
+    constexpr int QKKs          = (D + 15) / 16;
     constexpr int PVNt          = D / 8;
     constexpr int PVKs          = Bc / 16;
     constexpr int RowBytes      = Dp * static_cast<int>(sizeof(__nv_bfloat16));
-    constexpr float ScaleLog2E  = 0.11785113019775792073f * 1.4426950408889634074f;
+    constexpr float Scale       = HeadDim == 64 ? 0.125f : 0.11785113019775792073f;
+    constexpr float ScaleLog2E  = Scale * 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
     PackedAttentionTile tile;
@@ -167,8 +175,8 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
 
-    packed_attention_stage_q<Br, Threads>(q_s, q, tile.q0, tile.end, head, tid, q_stride_d,
-                                          q_stride_h, q_stride_t);
+    packed_attention_stage_q<HeadDim, Br, Threads>(q_s, q, tile.q0, tile.end, head, tid,
+                                                   q_stride_d, q_stride_h, q_stride_t);
 
     float acc[PVNt][4];
 #pragma unroll
@@ -182,8 +190,8 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
     float l1 = 0.0f;
 
     cp_commit();
-    packed_attention_stage_kv<Bc, Threads>(k_s, k, tile.begin, tile.end, head, tid, k_stride_d,
-                                           k_stride_h, k_stride_t);
+    packed_attention_stage_kv<HeadDim, Bc, Threads>(k_s, k, tile.begin, tile.end, head, tid,
+                                                    k_stride_d, k_stride_h, k_stride_t);
     cp_commit();
 
     const int key_blocks = (tile.end - tile.begin + Bc - 1) / Bc;
@@ -192,8 +200,8 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
         cp_wait<0>();
         __syncthreads();
 
-        packed_attention_stage_kv<Bc, Threads>(v_s, v, key0, tile.end, head, tid, v_stride_d,
-                                               v_stride_h, v_stride_t);
+        packed_attention_stage_kv<HeadDim, Bc, Threads>(v_s, v, key0, tile.end, head, tid,
+                                                        v_stride_d, v_stride_h, v_stride_t);
         cp_commit();
 
         float score[QKNt][4];
@@ -316,8 +324,8 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
         cp_wait<0>();
         __syncthreads();
         if (kb + 1 < key_blocks) {
-            packed_attention_stage_kv<Bc, Threads>(k_s, k, key0 + Bc, tile.end, head, tid,
-                                                   k_stride_d, k_stride_h, k_stride_t);
+            packed_attention_stage_kv<HeadDim, Bc, Threads>(k_s, k, key0 + Bc, tile.end, head, tid,
+                                                            k_stride_d, k_stride_h, k_stride_t);
             cp_commit();
         }
 

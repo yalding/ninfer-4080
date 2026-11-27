@@ -345,6 +345,19 @@ void qualify_dflash2() {
                       static_cast<std::size_t>(view.v.nb[3]), static_cast<unsigned char>(0x50 + l),
                       "DFlash2 host restore preserves V ring");
     }
+
+    state.reset(1, device.stream);
+    state.prepare_append(0, 16, 44, device.stream);
+    state.commit_append(0, 60);
+    const auto committed_page = table(state, 0, 1);
+    state.prepare_append(0, 60, 8, device.stream);
+    device.synchronize();
+    state.commit_append(0, 61);
+    state.prepare_append(0, 61, 1, device.stream);
+    state.commit_append(0, 62);
+    require(state.depth(0) == 62 && state.used_pages() == 1 &&
+                table(state, 0, 1) == committed_page,
+            "shorter append after partial DFlash2 acceptance retains only the committed page");
 }
 } // namespace
 

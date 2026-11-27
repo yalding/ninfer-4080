@@ -18,7 +18,7 @@ std::string take_string(artifact::MaterializedArtifact& materialized,
 } // namespace
 
 FrontendResourcePlan bind_frontend_resources(artifact::Binder& binder) {
-    return FrontendResourcePlan{
+    FrontendResourcePlan plan{
         .tokenizer_json = artifact::bind_raw_resource(binder, "frontend/tokenizer.json"),
         .tokenizer_config_json =
             artifact::bind_raw_resource(binder, "frontend/tokenizer_config.json"),
@@ -26,6 +26,11 @@ FrontendResourcePlan bind_frontend_resources(artifact::Binder& binder) {
         .generation_config_json =
             artifact::bind_raw_resource(binder, "frontend/generation_config.json"),
     };
+    if (binder.has_object("frontend/processor_config.json")) {
+        plan.processor_config_json =
+            artifact::bind_raw_resource(binder, "frontend/processor_config.json");
+    }
+    return plan;
 }
 
 FrontendResources take_frontend_resources(artifact::MaterializedArtifact& materialized,
@@ -35,6 +40,9 @@ FrontendResources take_frontend_resources(artifact::MaterializedArtifact& materi
         .tokenizer_config_json  = take_string(materialized, plan.tokenizer_config_json),
         .chat_template_jinja    = take_string(materialized, plan.chat_template_jinja),
         .generation_config_json = take_string(materialized, plan.generation_config_json),
+        .processor_config_json  = plan.processor_config_json
+                                      ? take_string(materialized, *plan.processor_config_json)
+                                      : std::string{},
     };
 }
 

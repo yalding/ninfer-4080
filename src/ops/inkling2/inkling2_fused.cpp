@@ -565,4 +565,71 @@ void inkling2_dflash2_topk16_and_select(const Tensor& mask_hidden, const Tensor&
         projected_hidden, partial_ids, partial_vals, unary_scores, s);
 }
 
+void inkling2_vision_patch_embed(const Tensor& patches, const Tensor& patch_weight,
+                                 const Tensor& class_embedding,
+                                 const Tensor& cls_position_embedding, const Tensor& position_table,
+                                 const Tensor& pos_indices, const Tensor& pos_weights,
+                                 const Tensor& ln_pre_weight, const Tensor& ln_pre_bias, float eps,
+                                 Tensor& out, cudaStream_t s) {
+    const int p = patches.ne[1];
+    require(p >= 1 && std::isfinite(eps) && eps > 0.0f, "inkling2_vision_patch_embed geometry/eps");
+    shape(patches, DType::BF16, {1200, p});
+    shape(patch_weight, DType::BF16, {1200, 1024});
+    shape(class_embedding, DType::BF16, {1024});
+    shape(cls_position_embedding, DType::BF16, {1024});
+    shape(position_table, DType::BF16, {1024, 1024});
+    shape(pos_indices, DType::I32, {4, p});
+    shape(pos_weights, DType::FP32, {4, p});
+    shape(ln_pre_weight, DType::BF16, {1024});
+    shape(ln_pre_bias, DType::BF16, {1024});
+    shape(out, DType::BF16, {1024, p + 1});
+    disjoint(out, patches);
+    disjoint(out, patch_weight);
+    disjoint(out, class_embedding);
+    disjoint(out, cls_position_embedding);
+    disjoint(out, position_table);
+    disjoint(out, ln_pre_weight);
+    disjoint(out, ln_pre_bias);
+    detail::inkling2_vision_patch_embed_launch(
+        patches, patch_weight, class_embedding, cls_position_embedding, position_table, pos_indices,
+        pos_weights, ln_pre_weight, ln_pre_bias, eps, out, s);
+}
+
+void inkling2_vision_rope_2d(const Tensor& coords, float rope_theta, Tensor& qkv, cudaStream_t s) {
+    const int t = qkv.ne[1];
+    require(t >= 1 && std::isfinite(rope_theta) && rope_theta > 0.0f,
+            "inkling2_vision_rope_2d geometry/theta");
+    shape(coords, DType::I32, {4, t});
+    shape(qkv, DType::BF16, {3072, t});
+    disjoint(qkv, coords);
+    detail::inkling2_vision_rope_2d_launch(coords, rope_theta, qkv, s);
+}
+
+void inkling2_vision_layerscale_add(const Tensor& proj, const Tensor& bias, const Tensor& gamma,
+                                    Tensor& hidden, cudaStream_t s) {
+    const int t = hidden.ne[1];
+    require(t >= 1, "inkling2_vision_layerscale_add T must be positive");
+    shape(proj, DType::BF16, {1024, t});
+    shape(bias, DType::BF16, {1024});
+    shape(gamma, DType::BF16, {1024});
+    shape(hidden, DType::BF16, {1024, t});
+    disjoint(hidden, proj);
+    disjoint(hidden, bias);
+    disjoint(hidden, gamma);
+    detail::inkling2_vision_layerscale_add_launch(proj, bias, gamma, hidden, s);
+}
+
+void inkling2_vision_merge_2x2(const Tensor& src, const Tensor& merge_indices, Tensor& out,
+                               cudaStream_t s) {
+    const int t_vis = src.ne[1];
+    const int v     = out.ne[1];
+    require(t_vis >= 1 && v >= 1, "inkling2_vision_merge_2x2 extents must be positive");
+    shape(src, DType::BF16, {1024, t_vis});
+    shape(merge_indices, DType::I32, {4, v});
+    shape(out, DType::BF16, {4096, v});
+    disjoint(out, src);
+    disjoint(out, merge_indices);
+    detail::inkling2_vision_merge_2x2_launch(src, merge_indices, out, s);
+}
+
 } // namespace ninfer::ops

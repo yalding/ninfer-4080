@@ -119,9 +119,10 @@ the port is active; the same numbers are repeated in the model card.
   accuracy and fit below 100K. The pinned host pools hold one deep checkpoint so rewrites reuse
   the prefix instead of re-prefilling.
 - **Inkling-2-Mini** (`inkling2-mini/q3g128`) supports reasoning effort, prefix reuse, batched
-  non-speculative decode, `--spec mtp` (DSpark), and `--spec dflash2`. With `rk4v4-e8` KV and a
-  131,072-token context limit on the RTX 4060 Ti 16 GB, DFlash2 K=7 decoded at 85.25 tok/s after a
-  65,536-token prefill. [Inkling-2-Mini implementation and benchmarks](docs/maintainer/inkling2-mini.md)
+  non-speculative decode, `--spec mtp` (DSpark), `--spec dflash2`, and image input via
+  `--vision --vision-offload on`, which stages ViT weights from pinned host RAM into reusable GPU
+  workspace. With `rk4v4-e8` KV and a 131,072-token context limit on the RTX 4060 Ti 16 GB,
+  DFlash2 K=7 decoded at 85.25 tok/s after a 65,536-token prefill. [Inkling-2-Mini implementation and benchmarks](docs/maintainer/inkling2-mini.md)
 - The official 16.96 GiB `groupwise-int` artifact does not load on this card; the 3-bit GSQ3
   artifact is the registered 4080 fit.
 

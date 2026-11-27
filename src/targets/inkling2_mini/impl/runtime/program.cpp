@@ -13,23 +13,58 @@ namespace ninfer::targets::inkling2_mini {
 namespace {
 std::uint32_t pages(std::uint32_t n) { return (n + 63) / 64; }
 
-PrefixShortlistKey shortlist(std::span<const TokenId> ids, std::uint32_t frontier) noexcept {
+bool frontier_splits_vision_item(std::span<const PreparedVisionItem> items,
+                                 std::uint32_t frontier) noexcept {
+    for (const auto& item : items)
+        if (item.token_begin < frontier && frontier < item.token_end) return true;
+    return false;
+}
+
+bool vision_prefix_matches(std::span<const PreparedVisionItem> a,
+                           std::span<const PreparedVisionItem> b,
+                           std::uint32_t frontier) noexcept {
+    if (frontier_splits_vision_item(a, frontier) || frontier_splits_vision_item(b, frontier))
+        return false;
+    std::size_t ia = 0, ib = 0;
+    while (ia < a.size() && a[ia].token_end <= frontier) ++ia;
+    while (ib < b.size() && b[ib].token_end <= frontier) ++ib;
+    if (ia != ib) return false;
+    for (std::size_t i = 0; i < ia; ++i)
+        if (!(a[i] == b[i])) return false;
+    return true;
+}
+
+PrefixShortlistKey shortlist(std::span<const TokenId> ids,
+                             std::span<const PreparedVisionItem> vision_items,
+                             std::uint32_t frontier) noexcept {
     PrefixShortlistKey out;
     out.frontier = frontier;
     out.digests  = {1469598103934665603ull, 1099511628211ull};
-    for (std::uint32_t i = 0; i < frontier; ++i)
-        for (int b = 0; b < 4; ++b) {
-            auto v         = (static_cast<std::uint32_t>(ids[i]) >> (8 * b)) & 255;
-            out.digests[0] = (out.digests[0] ^ v) * 1099511628211ull;
-            out.digests[1] = (out.digests[1] + v) * 0x9e3779b185ebca87ull;
-        }
+    auto mix_byte = [&](std::uint32_t v) {
+        out.digests[0] = (out.digests[0] ^ v) * 1099511628211ull;
+        out.digests[1] = (out.digests[1] + v) * 0x9e3779b185ebca87ull;
+    };
+    auto mix_u32 = [&](std::uint32_t w) {
+        for (int b = 0; b < 4; ++b) mix_byte((w >> (8 * b)) & 255u);
+    };
+    for (std::uint32_t i = 0; i < frontier; ++i) mix_u32(static_cast<std::uint32_t>(ids[i]));
+    for (const auto& item : vision_items) {
+        if (item.token_end > frontier) continue;
+        mix_u32(item.token_begin);
+        mix_u32(item.token_end);
+        mix_u32(static_cast<std::uint32_t>(item.grid_h));
+        mix_u32(static_cast<std::uint32_t>(item.grid_w));
+        for (std::uint8_t byte : item.content_digest) mix_byte(byte);
+    }
     return out;
 }
 
-std::string digest(std::span<const TokenId> ids) {
+std::string digest(std::span<const TokenId> ids,
+                   std::span<const PreparedVisionItem> vision_items = {}) {
     char text[17];
-    std::snprintf(text, sizeof(text), "%016llx",
-                  static_cast<unsigned long long>(shortlist(ids, ids.size()).digests[0]));
+    std::snprintf(
+        text, sizeof(text), "%016llx",
+        static_cast<unsigned long long>(shortlist(ids, vision_items, ids.size()).digests[0]));
     return text;
 }
 
@@ -77,13 +112,17 @@ SequencePlan SequencePlanner::finalize(std::uint32_t groups) && {
 
 std::optional<PrefixShortlistKey>
 RequestBasePlan::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
-    if (!options.allow_prefix_reuse || frontier == 0 || frontier >= ids.size()) return std::nullopt;
-    return shortlist(ids, frontier);
+    if (!options.allow_prefix_reuse || frontier == 0 || frontier >= ids.size() ||
+        frontier_splits_vision_item(vision_items, frontier))
+        return std::nullopt;
+    return shortlist(ids, vision_items, frontier);
 }
 
 std::optional<runtime::PrefillWork>
 RequestBasePlan::shared_candidate_rebuild_work(std::uint32_t frontier) const noexcept {
-    if (frontier == 0 || frontier > ids.size()) return std::nullopt;
+    if (frontier == 0 || frontier > ids.size() ||
+        frontier_splits_vision_item(vision_items, frontier))
+        return std::nullopt;
     return runtime::make_prefill_work(0, frontier, 0, 0, 1024);
 }
 
@@ -109,6 +148,8 @@ public:
         std::vector<std::uint32_t> captures, shared_captures;
         PreparedContextCache cache;
         PromptIdentity identity;
+        std::vector<PreparedVisionItem> vision_items;
+        std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
         std::vector<Checkpoint> checkpoints;
         std::shared_ptr<detail::HostStateImage> host;
         float spec_accept_ema              = 0.5f;
@@ -134,6 +175,8 @@ public:
     std::vector<std::uint64_t> slots;
     std::map<std::uint64_t, Sequence> sequences;
     std::uint64_t next = 1, revision = 1, pending = 0;
+    std::uint64_t handoff_seq_id = 0;
+    std::vector<std::pair<std::size_t, std::uint32_t>> handoff_items;
     std::optional<ResourcePlan> transaction;
     std::optional<PreparedPrompt> transaction_prompt;
     struct CaptureTransaction {
@@ -189,6 +232,10 @@ public:
     void erase(std::uint64_t id) {
         auto it = sequences.find(id);
         if (it == sequences.end()) return;
+        if (handoff_seq_id == id) {
+            handoff_seq_id = 0;
+            handoff_items.clear();
+        }
         if (!it->second.host) {
             executor.reset(it->second.slot);
             slots[it->second.slot] = 0;
@@ -220,7 +267,7 @@ public:
                 cp.ref.kind = runtime::CheckpointKind::SharedStablePrefix;
                 cp.scope    = runtime::CheckpointScope::Shared;
             }
-            cp.shortlist_key             = shortlist(s.ledger, depth);
+            cp.shortlist_key             = shortlist(s.ledger, s.vision_items, depth);
             cp.state_residency           = s.host ? runtime::ReplicaResidency::HostOnly
                                                   : runtime::ReplicaResidency::DeviceOnly;
             cp.required_kv.main_frontier = depth;
@@ -239,7 +286,8 @@ public:
 
     void capture_private(Sequence& s) {
         const auto frontier = executor.slot_depth(s.slot);
-        if (!s.publish || !frontier) return;
+        if (!s.publish || !frontier || frontier_splits_vision_item(s.vision_items, frontier))
+            return;
         bool rewrite =
             s.identity.rewrite_checkpoint && s.identity.rewrite_checkpoint->frontier == frontier;
         auto marker = std::find_if(
@@ -348,6 +396,10 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
     plan.options.allow_prefix_reuse = options.allow_prefix_reuse && data.identity.reusable;
     plan.cache                      = data.context_cache;
     plan.ids                        = data.token_ids;
+    plan.vision_items               = data.vision_items;
+    if (!data.vision_items.empty() && !impl_->options.enable_vision)
+        throw RequestError(RequestErrorKind::InvalidMedia,
+                           "Inkling-2 prompt contains image items but vision is disabled");
     auto& s                         = plan.value;
     s.prompt_tokens                 = data.token_ids.size();
     s.requested_output_tokens       = options.requested_output_tokens;
@@ -432,6 +484,7 @@ Program::inspect_admission(const PreparedPrompt& prompt, const RequestBasePlan& 
         if (depth == 0 || depth >= base.ids.size() || it->second.ledger.size() < depth ||
             !std::equal(it->second.ledger.begin(), it->second.ledger.begin() + depth,
                         base.ids.begin()) ||
+            !vision_prefix_matches(it->second.vision_items, base.vision_items, depth) ||
             (checkpoint && checkpoint->frontier != depth))
             return std::nullopt;
         out.source = id;
@@ -511,12 +564,14 @@ Program::inspect_admission(const PreparedPrompt& prompt, const RequestBasePlan& 
 }
 
 std::optional<ResourcePlan> Program::seal_identity(const AdmissionCandidate& candidate,
-                                                   const PreparedPrompt&,
+                                                   const PreparedPrompt& prompt,
                                                    runtime::FinalScheduleIntent intent) {
     if (!physically_feasible(candidate, {})) return std::nullopt;
+    const auto& data = PreparedPromptAccess::view(prompt);
     ResourcePlan plan{candidate, resource_revision(), {}, {}};
-    plan.capture_frontiers.assign(intent.shared_capture_frontiers.begin(),
-                                  intent.shared_capture_frontiers.end());
+    for (auto frontier : intent.shared_capture_frontiers)
+        if (!frontier_splits_vision_item(data.vision_items, frontier))
+            plan.capture_frontiers.push_back(frontier);
     return plan;
 }
 
@@ -610,10 +665,12 @@ Program::progress_context_transaction(runtime::CancellationFlagView cancel) {
         snapshot.active = false;
         snapshot.shared = true;
         snapshot.ledger.assign(source.ledger.begin(), source.ledger.begin() + source.progress);
+        for (const auto& item : source.vision_items)
+            if (item.token_end <= source.progress) snapshot.vision_items.push_back(item);
         snapshot.progress = source.progress;
         impl_->executor.copy_state(source.slot, snapshot.slot);
         impl_->slots.at(snapshot.slot) = snapshot.id;
-        auto key                       = shortlist(snapshot.ledger, snapshot.ledger.size());
+        auto key = shortlist(snapshot.ledger, snapshot.vision_items, snapshot.ledger.size());
         SharedPrefixSummary summary;
         summary.checkpoint.ref           = {runtime::CheckpointKind::SharedStablePrefix,
                                             static_cast<std::uint32_t>(snapshot.ledger.size()), 0};
@@ -674,6 +731,10 @@ Program::progress_context_transaction(runtime::CancellationFlagView cancel) {
     seq.prompt          = std::move(prepared.token_ids);
     seq.cache           = std::move(prepared.context_cache);
     seq.identity        = std::move(prepared.identity);
+    seq.vision_items    = std::move(prepared.vision_items);
+    seq.media_payloads  = std::move(prepared.media_payloads);
+    if (seq.media_payloads.size() < seq.vision_items.size())
+        seq.media_payloads.resize(seq.vision_items.size());
     seq.captures        = plan.capture_frontiers;
     seq.shared_captures = plan.capture_frontiers;
     for (const auto& marker : seq.cache.opportunities)
@@ -682,10 +743,20 @@ Program::progress_context_transaction(runtime::CancellationFlagView cancel) {
     for (auto frontier : seq.identity.rewrite_execution_frontiers) seq.captures.push_back(frontier);
     if (seq.identity.rewrite_checkpoint)
         seq.captures.push_back(seq.identity.rewrite_checkpoint->frontier);
+    auto prune_split = [&](std::vector<std::uint32_t>& vec) {
+        std::erase_if(vec, [&](std::uint32_t f) {
+            return frontier_splits_vision_item(seq.vision_items, f);
+        });
+    };
+    prune_split(seq.captures);
+    prune_split(seq.shared_captures);
     seq.entitlement = pages(c.value.prompt_tokens + c.value.effective_output_tokens);
     seq.publish     = c.value.publish_continuation;
     seq.begin       = {c.value.prompt_tokens, c.reused, c.value.prefix_reuse_path};
     seq.progress    = c.reused;
+    for (std::size_t i = 0; i < seq.vision_items.size() && i < seq.media_payloads.size(); ++i) {
+        if (seq.vision_items[i].token_end <= seq.progress) seq.media_payloads[i].reset();
+    }
     if (c.source) {
         auto& source = impl_->sequences.at(c.source);
         seq.ledger.assign(source.ledger.begin(), source.ledger.begin() + c.reused);
@@ -780,12 +851,82 @@ PrefillProgress Program::advance_prefill(SequenceHandle handle, runtime::Executi
         if (frontier > seq.progress && frontier < seq.progress + count)
             count = frontier - seq.progress;
     if (!count) throw std::logic_error("Inkling-2 prefill called past prompt");
-    auto ids      = std::span(seq.prompt).subspan(seq.progress, count);
-    Tensor logits = impl_->executor.forward(ids, seq.progress, seq.slot);
+    std::vector<detail::VisionChunkSlice> vision_slices;
+    double vision_sec = 0.0;
+    if (!seq.vision_items.empty()) {
+        std::vector<std::size_t> overlapping;
+        const std::uint32_t cap = impl_->executor.vision_handoff_capacity_tokens();
+        std::uint32_t needed_tokens = 0;
+        for (std::size_t i = 0; i < seq.vision_items.size(); ++i) {
+            const auto& item = seq.vision_items[i];
+            if (item.token_end <= seq.progress || item.token_begin >= seq.progress + count)
+                continue;
+            const std::uint32_t item_tokens = item.token_end - item.token_begin;
+            if (!overlapping.empty() && needed_tokens + item_tokens > cap) {
+                count = item.token_begin - seq.progress;
+                break;
+            }
+            overlapping.push_back(i);
+            needed_tokens += item_tokens;
+        }
+        if (!overlapping.empty()) {
+            bool all_resident = (impl_->handoff_seq_id == seq.id);
+            std::vector<std::uint32_t> item_offsets(overlapping.size(), 0);
+            if (all_resident) {
+                for (std::size_t k = 0; k < overlapping.size(); ++k) {
+                    auto hit = std::find_if(
+                        impl_->handoff_items.begin(), impl_->handoff_items.end(),
+                        [&](const auto& entry) { return entry.first == overlapping[k]; });
+                    if (hit == impl_->handoff_items.end()) {
+                        all_resident = false;
+                        break;
+                    }
+                    item_offsets[k] = hit->second;
+                }
+            }
+            if (!all_resident) {
+                impl_->handoff_seq_id = 0;
+                impl_->handoff_items.clear();
+                std::uint32_t col = 0;
+                for (std::size_t k = 0; k < overlapping.size(); ++k) {
+                    const std::size_t idx = overlapping[k];
+                    const auto& payload   = seq.media_payloads.at(idx);
+                    if (!payload)
+                        throw std::logic_error(
+                            "Inkling-2 vision media payload was already released");
+                    vision_sec += impl_->executor.encode_vision_item(*payload, col);
+                    item_offsets[k] = col;
+                    impl_->handoff_items.emplace_back(idx, col);
+                    col += payload->merged_tokens;
+                }
+                impl_->handoff_seq_id = seq.id;
+            }
+            const std::uint32_t chunk_end = seq.progress + static_cast<std::uint32_t>(count);
+            for (std::size_t k = 0; k < overlapping.size(); ++k) {
+                const auto& item      = seq.vision_items[overlapping[k]];
+                const std::uint32_t ob = std::max(seq.progress, item.token_begin);
+                const std::uint32_t oe = std::min(chunk_end, item.token_end);
+                vision_slices.push_back(
+                    {item_offsets[k] + (ob - item.token_begin), oe - ob, ob - seq.progress});
+            }
+        }
+    }
+    auto ids = std::span(seq.prompt).subspan(seq.progress, count);
+    Tensor logits =
+        impl_->executor.forward(ids, seq.progress, seq.slot, false, vision_slices);
     const std::size_t prev_ledger_size = seq.ledger.size();
     seq.ledger.insert(seq.ledger.end(), ids.begin(), ids.end());
     if (impl_->ngram_pool) { impl_->ngram_pool->observe(seq.ledger, prev_ledger_size); }
     seq.progress += count;
+    for (std::size_t i = 0; i < seq.vision_items.size() && i < seq.media_payloads.size(); ++i) {
+        if (seq.vision_items[i].token_end <= seq.progress) seq.media_payloads[i].reset();
+    }
+    if (impl_->handoff_seq_id == seq.id) {
+        std::erase_if(impl_->handoff_items, [&](const auto& entry) {
+            return seq.vision_items[entry.first].token_end <= seq.progress;
+        });
+        if (impl_->handoff_items.empty()) impl_->handoff_seq_id = 0;
+    }
     ++impl_->revision;
     out.processed_prompt_tokens = count;
     out.complete                = seq.progress == seq.prompt.size();
@@ -804,7 +945,9 @@ PrefillProgress Program::advance_prefill(SequenceHandle handle, runtime::Executi
         out.pending.emplace(std::move(pending));
     }
     out.timing = timing.finish();
-    seq.timings.prefill_seconds += out.timing.elapsed_ns() * 1e-9;
+    const double step_sec = out.timing.elapsed_ns() * 1e-9;
+    seq.timings.vision_seconds += vision_sec;
+    seq.timings.prefill_seconds += std::max(0.0, step_sec - vision_sec);
     if (out.pending) out.pending->timing = out.timing;
     if (!out.complete && std::find(seq.shared_captures.begin(), seq.shared_captures.end(),
                                    seq.progress) != seq.shared_captures.end())
@@ -1068,11 +1211,17 @@ FinishResult Program::finish(SequenceHandle handle) noexcept {
         out.status      = runtime::ConsumeStatus::Consumed;
         out.timings     = seq.timings;
         out.speculative = seq.speculative;
-        if (seq.publish) {
+        if (seq.publish && !frontier_splits_vision_item(
+                               seq.vision_items, impl_->executor.slot_depth(seq.slot))) {
             seq.active = false;
             seq.ledger.resize(impl_->executor.slot_depth(seq.slot));
             seq.prompt.clear();
             seq.generated.clear();
+            seq.media_payloads.clear();
+            if (impl_->handoff_seq_id == handle.id) {
+                impl_->handoff_seq_id = 0;
+                impl_->handoff_items.clear();
+            }
             if (std::count(impl_->slots.begin(), impl_->slots.end(), 0) == 0 &&
                 impl_->executor.can_snapshot_to_host(seq.slot))
                 impl_->spill(seq);
@@ -1142,7 +1291,8 @@ std::uint32_t Program::continuation_depth(const ContinuationHandle& h) const noe
 
 std::string Program::continuation_digest(const ContinuationHandle& h) const {
     auto it = impl_->sequences.find(h.id);
-    return it == impl_->sequences.end() ? std::string() : digest(it->second.ledger);
+    return it == impl_->sequences.end() ? std::string()
+                                        : digest(it->second.ledger, it->second.vision_items);
 }
 
 std::vector<SlotCheckpoint> Program::continuation_checkpoints(const ContinuationHandle& h) const {
@@ -1151,7 +1301,8 @@ std::vector<SlotCheckpoint> Program::continuation_checkpoints(const Continuation
     if (it == impl_->sequences.end()) return out;
     for (const auto& cp : it->second.checkpoints)
         out.push_back({cp.summary.ref.frontier,
-                       digest(std::span(it->second.ledger).first(cp.summary.ref.frontier))});
+                       digest(std::span(it->second.ledger).first(cp.summary.ref.frontier),
+                              it->second.vision_items)});
     auto d = continuation_depth(h);
     if (d) out.push_back({d, continuation_digest(h)});
     std::sort(out.begin(), out.end(),
@@ -1229,9 +1380,10 @@ CaptureAssessment Program::inspect_capture(const CaptureOffer& offer,
     auto it = impl_->sequences.find(offer.id);
     if (it == impl_->sequences.end() || !it->second.active) return out;
     const auto& seq   = it->second;
+    if (frontier_splits_vision_item(seq.vision_items, seq.progress)) return out;
     out.source        = seq.id;
     out.replacement   = replacement ? replacement->id : 0;
-    out.shortlist_key = shortlist(seq.ledger, seq.progress);
+    out.shortlist_key = shortlist(seq.ledger, seq.vision_items, seq.progress);
     out.protected_rebuild_work =
         runtime::make_prefill_work(0, seq.progress, 0, 0, impl_->options.prefill_chunk);
     auto opportunity = std::find_if(seq.cache.opportunities.begin(), seq.cache.opportunities.end(),
@@ -1323,7 +1475,9 @@ bool Program::shared_capture_matches(const CaptureOffer& offer,
     auto a = impl_->sequences.find(offer.id), b = impl_->sequences.find(shared.id);
     return a != impl_->sequences.end() && b != impl_->sequences.end() &&
            a->second.progress == b->second.ledger.size() &&
-           std::equal(b->second.ledger.begin(), b->second.ledger.end(), a->second.ledger.begin());
+           std::equal(b->second.ledger.begin(), b->second.ledger.end(), a->second.ledger.begin()) &&
+           vision_prefix_matches(a->second.vision_items, b->second.vision_items,
+                                 a->second.progress);
 }
 
 void Program::skip_capture(CaptureOffer&&) {}

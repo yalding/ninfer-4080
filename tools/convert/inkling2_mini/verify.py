@@ -46,7 +46,9 @@ class VerifySummary:
     quantized_checked: int
     min_q3_cosine: float
     min_q4_cosine: float
+    min_q5_cosine: float
     min_q6_cosine: float
+    min_w8_cosine: float
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -114,18 +116,25 @@ def _dequantize_rows(
     return torch.stack(out_rows, dim=0)
 
 
-def validate_structure(artifact: Artifact) -> tuple[bool, bool, bool]:
+def validate_structure(artifact: Artifact) -> tuple[bool, bool, bool, bool]:
     expected_identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
     if artifact.identity != expected_identity:
         raise VerificationError(f"identity {artifact.identity!r} != {expected_identity!r}")
     has_mtp = any(obj.name.startswith("mtp/") for obj in artifact.objects)
     has_draft_head = any(obj.name == "mtp/draft_head" for obj in artifact.objects)
     has_dflash2 = any(obj.name.startswith("dflash2/") for obj in artifact.objects)
+    has_vision = any(obj.name.startswith("vision/") for obj in artifact.objects)
     expected_objects = inventory.object_specs(
-        include_mtp=has_mtp, include_draft_head=has_draft_head, include_dflash2=has_dflash2
+        include_mtp=has_mtp,
+        include_draft_head=has_draft_head,
+        include_dflash2=has_dflash2,
+        include_vision=has_vision,
     )
     expected_tensors = inventory.tensor_specs(
-        include_mtp=has_mtp, include_draft_head=has_draft_head, include_dflash2=has_dflash2
+        include_mtp=has_mtp,
+        include_draft_head=has_draft_head,
+        include_dflash2=has_dflash2,
+        include_vision=has_vision,
     )
     if len(artifact.objects) != len(expected_objects):
         raise VerificationError(
@@ -170,7 +179,7 @@ def validate_structure(artifact: Artifact) -> tuple[bool, bool, bool]:
         raise VerificationError(f"layout counts mismatch: {dict(layouts)}")
     if cursor != artifact.file_bytes - artifact.payload_offset:
         raise VerificationError("artifact trailing padding / size mismatch")
-    return has_mtp, has_draft_head, has_dflash2
+    return has_mtp, has_draft_head, has_dflash2, has_vision
 
 
 def verify_artifact(
@@ -182,7 +191,6 @@ def verify_artifact(
     dflash2_dir: str | Path | None = None,
 ) -> VerifySummary:
     sources = source.validate_hf_checkpoint(model_dir)
-    expected_resources = source.load_frontend_resources(sources.model_dir)
     target = torch.device(device if (str(device) != "cuda" or torch.cuda.is_available()) else "cpu")
 
     probe_layers = (0, 5, 6, 11, 17, 18, 20, 23)
@@ -190,12 +198,20 @@ def verify_artifact(
     quantized_checked = 0
     min_q3 = 1.0
     min_q4 = 1.0
+    min_q5 = 1.0
     min_q6 = 1.0
+    min_w8 = 1.0
 
     with Artifact.open(artifact_path) as artifact:
-        has_mtp, has_draft_head, has_dflash2 = validate_structure(artifact)
+        has_mtp, has_draft_head, has_dflash2, has_vision = validate_structure(artifact)
+        expected_resources = source.load_frontend_resources(
+            sources.model_dir, include_vision=has_vision
+        )
         t_specs = inventory.tensor_specs(
-            include_mtp=has_mtp, include_draft_head=has_draft_head, include_dflash2=has_dflash2
+            include_mtp=has_mtp,
+            include_draft_head=has_draft_head,
+            include_dflash2=has_dflash2,
+            include_vision=has_vision,
         )
         draft_head_ids = source.compute_dspark_draft_head_ids() if has_draft_head else None
         mtp_reader = (
@@ -230,6 +246,8 @@ def verify_artifact(
                     elif spec.name.startswith("dflash2/"):
                         assert dflash2_reader is not None
                         expected = source.load_dflash2_tensor(spec, dflash2_reader)
+                    elif spec.name.startswith("vision/"):
+                        expected = source.load_vision_tensor(spec, reader)
                     else:
                         expected = source.load_non_expert_tensor(spec, reader)
                     if not torch.isfinite(stored).all():
@@ -400,6 +418,32 @@ def verify_artifact(
                         raise VerificationError(f"mtp/draft_head: cosine {cos:.5f} < 0.985")
                     min_q4 = min(min_q4, cos)
                     quantized_checked += 1
+                if has_vision:
+                    for spec in inventory.VISION_TENSOR_SPECS:
+                        if spec.format in inventory.DIRECT_FORMATS:
+                            continue
+                        obj = artifact.find(spec.name)
+                        assert isinstance(obj, TensorObject)
+                        rows = (0, obj.shape[0] // 2, obj.shape[0] - 1)
+                        deq = _dequantize_rows(
+                            artifact.payload(obj), obj.format, obj.shape, rows, target
+                        ).cpu()
+                        src_t = source.load_vision_tensor(spec, reader)
+                        ref = src_t.index_select(0, torch.tensor(rows, dtype=torch.long)).float()
+                        cos = _cosine_similarity(deq, ref)
+                        if obj.format == inventory.Q4:
+                            if cos < 0.985:
+                                raise VerificationError(f"{spec.name}: cosine {cos:.5f} < 0.985")
+                            min_q4 = min(min_q4, cos)
+                        elif obj.format == inventory.Q5:
+                            if cos < 0.993:
+                                raise VerificationError(f"{spec.name}: cosine {cos:.5f} < 0.993")
+                            min_q5 = min(min_q5, cos)
+                        elif obj.format == inventory.W8:
+                            if cos < 0.999:
+                                raise VerificationError(f"{spec.name}: cosine {cos:.5f} < 0.999")
+                            min_w8 = min(min_w8, cos)
+                        quantized_checked += 1
         finally:
             if dflash2_reader is not None:
                 dflash2_reader.close()
@@ -412,12 +456,14 @@ def verify_artifact(
             file_bytes=artifact.file_bytes,
             objects=len(artifact.objects),
             tensors=len(t_specs),
-            resources=len(inventory.RESOURCE_SPECS),
+            resources=len(inventory.resource_specs(include_vision=has_vision)),
             direct_exact_checked=direct_checked,
             quantized_checked=quantized_checked,
             min_q3_cosine=min_q3,
             min_q4_cosine=min_q4,
+            min_q5_cosine=min_q5,
             min_q6_cosine=min_q6,
+            min_w8_cosine=min_w8,
         )
 
 

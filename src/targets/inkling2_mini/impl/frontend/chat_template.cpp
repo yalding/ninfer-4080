@@ -162,12 +162,35 @@ RenderedChat render_chat(const PromptInput& input) {
         }
         for (std::size_t part_index = 0; part_index < message.parts.size(); ++part_index) {
             const auto& part = message.parts[part_index];
-            if (part.kind != MessagePartKind::Text) {
-                throw std::invalid_argument("Inkling-2-Mini Phase 1 accepts text only");
+            if (part.kind == MessagePartKind::Text) {
+                out.message_part_spans[index].push_back(emit(
+                    "<|content_text|>", part.text,
+                    continued && part_index + 1 == message.parts.size() &&
+                        message.tool_calls.empty()));
+            } else if (part.kind == MessagePartKind::Media) {
+                if (part.media.kind != MediaKind::Image) {
+                    throw std::invalid_argument("Inkling-2-Mini supports image media only");
+                }
+                if (message.role != ChatRole::User && message.role != ChatRole::Tool) {
+                    throw std::invalid_argument(
+                        "Inkling-2-Mini image content is only supported for user and tool messages");
+                }
+                if (continued && part_index + 1 == message.parts.size() &&
+                    message.tool_calls.empty()) {
+                    throw std::invalid_argument(
+                        "Inkling-2-Mini continuation cannot end on an open image part");
+                }
+                out.text += header;
+                out.text += "<|content_image|>";
+                const auto ph_begin = out.text.size();
+                out.text += "<|unused_200054|>";
+                const auto ph_end = out.text.size();
+                out.text += "<|end_message|>";
+                out.image_placeholders.push_back({index, part_index, ph_begin, ph_end});
+                out.message_part_spans[index].push_back(ByteSpan{ph_begin, out.text.size()});
+            } else {
+                throw std::invalid_argument("unsupported Inkling message part kind");
             }
-            out.message_part_spans[index].push_back(emit(
-                "<|content_text|>", part.text,
-                continued && part_index + 1 == message.parts.size() && message.tool_calls.empty()));
         }
         for (const auto& call : message.tool_calls) {
             if (!assistant) { throw std::invalid_argument("tool calls require assistant role"); }

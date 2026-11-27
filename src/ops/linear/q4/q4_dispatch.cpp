@@ -147,6 +147,14 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q4_mma_r64_c128;
         }
         break;
+    case 1024:
+        if (n == 3072 || n == 4096) {
+            if (t <= 7) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            if (t <= 320) { return launch_q4_mma_r64_c64; }
+            return launch_q4_mma_r64_c128;
+        }
+        break;
     default:
         break;
     }

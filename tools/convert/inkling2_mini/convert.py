@@ -47,12 +47,14 @@ def _build_writer_specs(
     include_mtp: bool = False,
     include_draft_head: bool = False,
     include_dflash2: bool = False,
+    include_vision: bool = False,
 ) -> list[ArtifactResourceSpec | ArtifactTensorSpec]:
     specs: list[ArtifactResourceSpec | ArtifactTensorSpec] = []
     for item in inventory.object_specs(
         include_mtp=include_mtp,
         include_draft_head=include_draft_head,
         include_dflash2=include_dflash2,
+        include_vision=include_vision,
     ):
         if isinstance(item, inventory.ResourceSpec):
             specs.append(ArtifactResourceSpec(item.name, item.encoding, len(resources[item.name])))
@@ -131,6 +133,7 @@ def convert(
     use_mtp: bool = True,
     dflash2_dir: str | Path | None = None,
     use_dflash2: bool = False,
+    use_vision: bool | None = None,
     base_artifact_path: str | Path | None = None,
 ) -> Path:
     started = time.perf_counter()
@@ -149,22 +152,30 @@ def convert(
     include_mtp = resolved_mtp is not None
     include_draft_head = include_mtp
     include_dflash2 = resolved_dflash2 is not None
-    resources = source.load_frontend_resources(sources.model_dir)
+    has_vision = source.has_vision_weights(sources)
+    if use_vision is True and not has_vision:
+        raise FileNotFoundError(f"vision weights not found in {sources.model_dir}")
+    include_vision = has_vision if use_vision is None else use_vision
+    resources = source.load_frontend_resources(sources.model_dir, include_vision=include_vision)
+    r_specs = inventory.resource_specs(include_vision=include_vision)
     writer_specs = _build_writer_specs(
         resources,
         include_mtp=include_mtp,
         include_draft_head=include_draft_head,
         include_dflash2=include_dflash2,
+        include_vision=include_vision,
     )
     t_specs = inventory.tensor_specs(
         include_mtp=include_mtp,
         include_draft_head=include_draft_head,
         include_dflash2=include_dflash2,
+        include_vision=include_vision,
     )
     obj_specs = inventory.object_specs(
         include_mtp=include_mtp,
         include_draft_head=include_draft_head,
         include_dflash2=include_dflash2,
+        include_vision=include_vision,
     )
     draft_head_ids = source.compute_dspark_draft_head_ids() if include_draft_head else None
 
@@ -173,7 +184,8 @@ def convert(
     tmp_output = output.with_suffix(output.suffix + ".tmp")
 
     print(
-        f"preflight complete: {len(writer_specs)} objects (mtp={include_mtp}, dflash2={include_dflash2}), "
+        f"preflight complete: {len(writer_specs)} objects (mtp={include_mtp}, "
+        f"dflash2={include_dflash2}, vision={include_vision}), "
         f"tensor_bytes={inventory.total_tensor_payload_bytes(t_specs)}, device={resolved_device}",
         flush=True,
     )
@@ -195,13 +207,30 @@ def convert(
                 total = len(obj_specs)
                 done = 0
 
-                for res_spec in inventory.RESOURCE_SPECS:
+                for res_spec in r_specs:
                     writer.write(res_spec.name, resources[res_spec.name])
                     done += 1
                     print(f"[{done}/{total}] {res_spec.name}", flush=True)
 
                 for t_spec in t_specs:
-                    if t_spec.name == "mtp/draft_head_token_ids":
+                    base_obj = None
+                    if base_artifact is not None:
+                        try:
+                            base_obj = base_artifact.find(t_spec.name)
+                        except KeyError:
+                            base_obj = None
+                    if (
+                        base_obj is not None
+                        and base_obj.shape == t_spec.shape
+                        and base_obj.format == t_spec.format
+                        and base_obj.layout == t_spec.layout
+                    ):
+                        payload_mv = base_artifact.payload(base_obj)
+                        try:
+                            writer.write(t_spec.name, payload_mv)
+                        finally:
+                            payload_mv.release()
+                    elif t_spec.name == "mtp/draft_head_token_ids":
                         assert draft_head_ids is not None
                         payload = encode_direct(draft_head_ids, t_spec.format)
                         writer.write(t_spec.name, payload)
@@ -227,12 +256,12 @@ def convert(
                         del tensor
                         writer.write(t_spec.name, payload)
                         del payload
-                    elif base_artifact is not None:
-                        payload_mv = base_artifact.payload(t_spec.name)
-                        try:
-                            writer.write(t_spec.name, payload_mv)
-                        finally:
-                            payload_mv.release()
+                    elif t_spec.name.startswith("vision/"):
+                        tensor = source.load_vision_tensor(t_spec, reader)
+                        payload = _encode_non_expert_tensor(t_spec, tensor, resolved_device)
+                        del tensor
+                        writer.write(t_spec.name, payload)
+                        del payload
                     elif t_spec.name.endswith(("ffn/routed_gate_up", "ffn/routed_down")):
                         layer = int(t_spec.name.split("/")[2])
                         is_w13 = t_spec.name.endswith("ffn/routed_gate_up")
@@ -287,7 +316,7 @@ def convert(
         "objects": {
             "count": len(written_objects),
             "tensors": len(t_specs),
-            "resources": len(inventory.RESOURCE_SPECS),
+            "resources": len(r_specs),
             "formats": dict(sorted(Counter(s.format for s in t_specs).items())),
             "layouts": dict(sorted(Counter(s.layout for s in t_specs).items())),
             "tensor_bytes": inventory.total_tensor_payload_bytes(t_specs),
@@ -311,6 +340,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--no-mtp", action="store_true")
     parser.add_argument("--dflash2", type=Path, default=None)
     parser.add_argument("--no-dflash2", action="store_true")
+    parser.add_argument("--vision", action="store_true", default=None)
+    parser.add_argument("--no-vision", dest="vision", action="store_false")
     parser.add_argument("--base-artifact", type=Path, default=None)
     args = parser.parse_args(argv)
     convert(
@@ -321,6 +352,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         use_mtp=not args.no_mtp,
         dflash2_dir=args.dflash2,
         use_dflash2=(not args.no_dflash2) and (args.dflash2 is not None),
+        use_vision=args.vision,
         base_artifact_path=args.base_artifact,
     )
 

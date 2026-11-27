@@ -59,6 +59,20 @@ _EXPECTED_LOOP_CONFIG = {
     "is_varloop": False,
 }
 
+_EXPECTED_VISION_CONFIG = {
+    "model_type": "inkling2_vision",
+    "text_hidden_size": inventory.HIDDEN_SIZE,
+    "native_patch_size": inventory.VISION_PATCH_SIZE,
+    "adapter_merge_size": inventory.VISION_MERGE_SIZE,
+    "projection_hidden_dim": inventory.VISION_MERGER_DIM,
+    "projector_bias": False,
+    "hidden_size": inventory.VISION_HIDDEN,
+    "num_hidden_layers": inventory.VISION_LAYERS,
+    "num_attention_heads": inventory.VISION_HEADS,
+    "posemb_grid_size": inventory.VISION_POSEMB_GRID,
+    "layer_norm_eps": 1e-5,
+}
+
 
 def _build_e4m3_lut() -> np.ndarray:
     codes = np.arange(256, dtype=np.uint8)
@@ -298,19 +312,35 @@ def validate_hf_checkpoint(model_dir: str | Path) -> CheckpointSources:
                     f"got {expert_schemes.get(tname)!r}"
                 )
 
+    vision = config.get("vision_config")
+    if isinstance(vision, dict):
+        for key, expected in _EXPECTED_VISION_CONFIG.items():
+            actual = vision.get(key)
+            if isinstance(expected, float):
+                if actual is None or abs(float(actual) - expected) > 1e-7:
+                    raise ValueError(f"vision_config.{key}: expected {expected!r}, got {actual!r}")
+            elif actual != expected:
+                raise ValueError(f"vision_config.{key}: expected {expected!r}, got {actual!r}")
+
     weight_map = _resolve_weight_map(root)
     return CheckpointSources(
         model_dir=root,
-        config_summary={"model_type": config["model_type"], "text_config": text},
+        config_summary={"model_type": config["model_type"], "text_config": text, "vision_config": vision},
         expert_quant_schemes=expert_schemes,
         weight_map=weight_map,
     )
 
 
-def load_frontend_resources(model_dir: str | Path) -> dict[str, bytes]:
+def has_vision_weights(sources: CheckpointSources) -> bool:
+    return "model.visual.backbone.embeddings.patch_embedding.weight" in sources.weight_map
+
+
+def load_frontend_resources(
+    model_dir: str | Path, *, include_vision: bool = False
+) -> dict[str, bytes]:
     root = Path(model_dir)
     resources: dict[str, bytes] = {}
-    for spec in inventory.RESOURCE_SPECS:
+    for spec in inventory.resource_specs(include_vision=include_vision):
         filename = spec.name.removeprefix("frontend/")
         path = root / filename
         if path.is_file():
@@ -779,6 +809,64 @@ def load_dflash2_tensor(spec: inventory.TensorSpec, reader: DFlash2SourceReader)
         t = reader.get(hp + mapping[suffix]).to(torch.bfloat16).contiguous()
     else:
         raise ValueError(f"unhandled DFlash2 tensor {name}")
+
+    if tuple(t.shape) != spec.shape:
+        raise ValueError(f"{name}: shape {tuple(t.shape)} != {spec.shape}")
+    return t
+
+
+def load_vision_tensor(spec: inventory.TensorSpec, reader: Inkling2SourceReader) -> torch.Tensor:
+    name = spec.name
+    direct_top = {
+        "vision/patch_embedding": "model.visual.backbone.embeddings.patch_embedding.weight",
+        "vision/class_embedding": "model.visual.backbone.embeddings.class_embedding",
+        "vision/cls_position_embedding": "model.visual.backbone.embeddings.cls_position_embedding",
+        "vision/position_embedding": "model.visual.backbone.embeddings.position_embedding",
+        "vision/ln_pre/weight": "model.visual.backbone.ln_pre.weight",
+        "vision/ln_pre/bias": "model.visual.backbone.ln_pre.bias",
+        "vision/merger/proj_in": "model.visual.proj_in.weight",
+        "vision/merger/proj_out": "model.visual.proj_out.weight",
+    }
+    if name in direct_top:
+        t = reader.get(direct_top[name]).to(torch.bfloat16).contiguous()
+        if tuple(t.shape) != spec.shape:
+            raise ValueError(f"{name}: shape {tuple(t.shape)} != {spec.shape}")
+        return t
+
+    parts = name.split("/")
+    if len(parts) < 4 or parts[0] != "vision" or parts[1] != "layers":
+        raise ValueError(f"unexpected vision tensor name: {name}")
+    layer = int(parts[2])
+    suffix = "/".join(parts[3:])
+    vp = f"model.visual.backbone.layers.{layer}."
+    if suffix == "attention/qkv":
+        q = reader.get(vp + "self_attn.q_proj.weight")
+        k = reader.get(vp + "self_attn.k_proj.weight")
+        v = reader.get(vp + "self_attn.v_proj.weight")
+        t = torch.cat((q, k, v), dim=0).to(torch.bfloat16).contiguous()
+    elif suffix == "attention/qkv_bias":
+        q = reader.get(vp + "self_attn.q_proj.bias")
+        k = reader.get(vp + "self_attn.k_proj.bias")
+        v = reader.get(vp + "self_attn.v_proj.bias")
+        t = torch.cat((q, k, v), dim=0).to(torch.bfloat16).contiguous()
+    else:
+        mapping = {
+            "ln_1/weight": "ln_1.weight",
+            "ln_1/bias": "ln_1.bias",
+            "attention/output": "self_attn.out_proj.weight",
+            "attention/output_bias": "self_attn.out_proj.bias",
+            "ls_1/gamma": "ls_1.gamma",
+            "ln_2/weight": "ln_2.weight",
+            "ln_2/bias": "ln_2.bias",
+            "mlp/fc1": "mlp.c_fc.weight",
+            "mlp/fc1_bias": "mlp.c_fc.bias",
+            "mlp/fc2": "mlp.c_proj.weight",
+            "mlp/fc2_bias": "mlp.c_proj.bias",
+            "ls_2/gamma": "ls_2.gamma",
+        }
+        if suffix not in mapping:
+            raise ValueError(f"unhandled vision tensor {name}")
+        t = reader.get(vp + mapping[suffix]).to(torch.bfloat16).contiguous()
 
     if tuple(t.shape) != spec.shape:
         raise ValueError(f"{name}: shape {tuple(t.shape)} != {spec.shape}")

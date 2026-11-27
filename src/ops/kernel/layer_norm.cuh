@@ -98,12 +98,12 @@ __launch_bounds__(Block) __global__
     }
 }
 
-template <int Block>
+template <int D, int Block>
 __launch_bounds__(Block) __global__
-    void layer_norm_d1152_warp_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                      const __nv_bfloat162* bias, __nv_bfloat162* out,
-                                      std::int64_t rows, float eps) {
-    constexpr int d        = 1152;
+    void layer_norm_warp_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                const __nv_bfloat162* bias, __nv_bfloat162* out,
+                                std::int64_t rows, float eps) {
+    constexpr int d        = D;
     constexpr int pairs    = d / 2;
     constexpr int warps    = Block / 32;
     const int lane         = static_cast<int>(threadIdx.x) & 31;

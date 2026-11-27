@@ -283,15 +283,22 @@ int main(int argc, char** argv) {
     try {
         template_tests();
         tokenizer_semantic_tests();
-        const std::filesystem::path source =
+        std::error_code ec;
+        std::filesystem::path source =
             argc > 1 ? argv[1] : "C:/LLM/thinkingmachines/Inkling-2-Mini";
-        if (!std::filesystem::exists(source / "tokenizer.json")) {
+        if (!std::filesystem::exists(source / "tokenizer.json", ec)) {
+            source = std::filesystem::path(NINFER_SOURCE_DIR) / "models/Inkling-2-Mini";
+        }
+        if (!std::filesystem::exists(source / "tokenizer.json", ec)) {
             std::cout << "SKIP: pass checkpoint directory to run tokenizer/output qualification\n";
             return 77;
         }
         ik::FrontendResources resources{
             read(source / "tokenizer.json"), read(source / "tokenizer_config.json"),
-            read(source / "chat_template.jinja"), read(source / "generation_config.json")};
+            read(source / "chat_template.jinja"), read(source / "generation_config.json"),
+            std::filesystem::exists(source / "processor_config.json", ec)
+                ? read(source / "processor_config.json")
+                : std::string{}};
         const fi::Tokenizer tokenizer({resources.tokenizer_json, resources.tokenizer_config_json,
                                        resources.generation_config_json});
         require(tokenizer.has_exact_token_domain(200058), "token domain");
@@ -324,18 +331,157 @@ int main(int argc, char** argv) {
                 "literal user special markup");
         output_tests(frontend, tokenizer);
         cache_identity_tests(frontend, tokenizer);
-        const std::filesystem::path artifact =
+        {
+            auto vres = resources;
+            if (vres.processor_config_json.empty()) {
+                vres.processor_config_json =
+                    R"({"image_processor":{"size":{"height":40,"width":40},"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5]},"image_token":"<|unused_200054|>"})";
+            }
+            auto make_bmp = [](int w, int h, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+                const int row_stride = ((w * 3 + 3) / 4) * 4;
+                const int pixel_bytes = row_stride * h;
+                const int file_bytes = 54 + pixel_bytes;
+                std::vector<std::uint8_t> bmp(file_bytes, 0);
+                bmp[0] = 'B';
+                bmp[1] = 'M';
+                auto put32 = [&](int off, std::uint32_t v) {
+                    bmp[off + 0] = static_cast<std::uint8_t>(v & 0xff);
+                    bmp[off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xff);
+                    bmp[off + 2] = static_cast<std::uint8_t>((v >> 16) & 0xff);
+                    bmp[off + 3] = static_cast<std::uint8_t>((v >> 24) & 0xff);
+                };
+                put32(2, file_bytes);
+                put32(10, 54);
+                put32(14, 40);
+                put32(18, static_cast<std::uint32_t>(w));
+                put32(22, static_cast<std::uint32_t>(h));
+                bmp[26] = 1;
+                bmp[28] = 24;
+                for (int y = 0; y < h; ++y) {
+                    for (int x = 0; x < w; ++x) {
+                        const int p = 54 + y * row_stride + x * 3;
+                        bmp[p + 0]  = b;
+                        bmp[p + 1]  = g;
+                        bmp[p + 2]  = r;
+                    }
+                }
+                return bmp;
+            };
+            auto img1 = make_bmp(40, 50, 200, 100, 50);
+            auto img2 = make_bmp(40, 50, 10, 20, 30);
+
+            PromptInput img_input;
+            ChatMessage msg;
+            msg.role = ChatRole::User;
+            MessagePart mp;
+            mp.kind = MessagePartKind::Media;
+            mp.media.kind  = MediaKind::Image;
+            mp.media.bytes = img1;
+            msg.parts.push_back(std::move(mp));
+            msg.parts.push_back({MessagePartKind::Text, "describe", {}});
+            img_input.messages.push_back(std::move(msg));
+
+            bool rejected_disabled = false;
+            try {
+                (void)frontend.prepare(img_input);
+            } catch (const std::exception&) { rejected_disabled = true; }
+            require(rejected_disabled, "vision disabled rejects image input");
+
+            const auto vfront = ik::make_frontend(
+                vres, {.max_context = 4096, .vision_enabled = true, .media_cache_bytes = 256 * 1024});
+            const auto vp1     = vfront.prepare(img_input);
+            const auto& vdata1 = ik::PreparedPromptAccess::view(vp1);
+            require(vdata1.has_media() && vdata1.vision_items.size() == 1 &&
+                        vdata1.media_payloads.size() == 1 && vdata1.media_payloads[0] != nullptr,
+                    "vision prepare produces one vision item and payload");
+            const auto& item1    = vdata1.vision_items[0];
+            const auto& payload1 = *vdata1.media_payloads[0];
+            require(payload1.merged_tokens == 2 && payload1.native_patches == 6 &&
+                        payload1.padded_h20 == 4 && payload1.padded_w20 == 2,
+                    "40x50 image pads to 40x80 with 6 active 20x20 patches and 2 merged tokens");
+            require(std::find(payload1.patches.begin(), payload1.patches.end(),
+                              static_cast<std::uint16_t>(0xBF81)) != payload1.patches.end(),
+                    "partially padded patch uses BF16 0xBF81 (-1.00784f) pad fill");
+            require(item1.token_begin >= 1 &&
+                        vdata1.token_ids[item1.token_begin - 1] == 200005 &&
+                        vdata1.token_ids[item1.token_begin] == 200054 &&
+                        vdata1.token_ids[item1.token_begin + 1] == 200054 &&
+                        vdata1.token_ids[item1.token_end] == 200010,
+                    "image expands to <|content_image|>, V x <|unused_200054|>, <|end_message|>");
+            const auto vp1_cached = vfront.prepare(img_input);
+            require(vfront.media_cache_summary().hits >= 1, "identical image hits media cache");
+
+            PromptInput img2_input = img_input;
+            img2_input.messages[0].parts[0].media.bytes = img2;
+            const auto vp2     = vfront.prepare(img2_input);
+            const auto& vdata2 = ik::PreparedPromptAccess::view(vp2);
+            require(vdata2.vision_items[0].content_digest != item1.content_digest,
+                    "different same-size images produce distinct content_digest");
+
+            const auto bounded = ik::make_frontend(
+                vres, {.max_context = 4096, .vision_enabled = true,
+                       .media_live_bytes = payload1.payload_bytes(), .media_preprocess_threads = 1});
+            auto live_prompt = bounded.prepare(img_input);
+            bool exhausted = false;
+            try {
+                (void)bounded.prepare(img2_input);
+            } catch (const RequestError& error) {
+                exhausted = error.kind() == RequestErrorKind::MediaBudgetExceeded;
+            }
+            require(exhausted && bounded.media_cache_summary().live_bytes == payload1.payload_bytes(),
+                    "evicting an image does not release its budget while a prompt holds it");
+            live_prompt = {};
+            require(bounded.media_cache_summary().live_bytes == 0 &&
+                        bounded.prepare(img2_input).summary().has_media,
+                    "releasing the prompt returns the live bytes and permits a retry");
+
+            const auto limited = ik::make_frontend(
+                vres, {.max_context = 4096, .vision_enabled = true, .vision_max_tokens = 5});
+            const auto resized = limited.prepare(img_input);
+            const auto& resized_data = ik::PreparedPromptAccess::view(resized);
+            require(resized_data.media_payloads[0]->native_patches <= 5,
+                    "downsize honors native patch capacity even when merged tokens fit");
+            img_input.messages[0].parts[0].media.image_resize_policy =
+                ImageResizePolicy::RejectOversized;
+            bool rejected_oversized = false;
+            try {
+                (void)limited.prepare(img_input);
+            } catch (const RequestError& error) {
+                rejected_oversized = error.kind() == RequestErrorKind::MediaBudgetExceeded;
+            }
+            require(rejected_oversized, "reject policy honors native patch capacity");
+        }
+        std::filesystem::path artifact =
             argc > 2 ? argv[2] : "C:/LLM/inkling2_mini_q3g128.ninfer";
-        if (std::filesystem::exists(artifact)) {
+        if (!std::filesystem::exists(artifact, ec)) {
+            artifact = std::filesystem::path(NINFER_SOURCE_DIR) / "models/inkling2_mini_q3g128.ninfer";
+        }
+        if (std::filesystem::exists(artifact, ec)) {
             ninfer::artifact::Reader reader(artifact);
             ninfer::artifact::Binder binder(reader);
             const auto plan = ik::detail::bind_artifact(binder);
-            require(plan.materialization.object_count == 540 &&
+            const bool has_vis = binder.has_object("vision/patch_embedding");
+            require(plan.materialization.object_count == (has_vis ? 871 : 540) &&
                         plan.materialization.device_objects.size() == 536 &&
-                        plan.materialization.host_objects.size() == 4,
+                        plan.materialization.host_objects.size() == (has_vis ? 5 : 4),
                     "complete artifact bindings");
             require(plan.materialization.device_capacity_bytes == 11158837248ULL,
                     "resident weights exact arena budget");
+            if (has_vis) {
+                ninfer::artifact::Binder b_overlay(reader);
+                const auto overlay_plan = ik::detail::bind_artifact(
+                    b_overlay, false, false, false, true, VisionResidency::Overlay);
+                require(overlay_plan.materialization.device_objects.size() == 536 &&
+                            overlay_plan.materialization.device_capacity_bytes ==
+                                11158837248ULL &&
+                            overlay_plan.materialization.pinned_objects.size() == 330,
+                        "overlay vision bindings keep 0 B permanent VRAM and 330 pinned objects");
+                ninfer::artifact::Binder b_resident(reader);
+                const auto resident_plan = ik::detail::bind_artifact(
+                    b_resident, false, false, false, true, VisionResidency::Resident);
+                require(resident_plan.materialization.device_objects.size() == 536 + 330,
+                        "resident vision bindings place all 330 vision objects on device");
+            }
         }
         std::cout << "PASS: Inkling frontend template, " << n
                   << " tokenizer oracle cases, output transactions and artifact bindings\n";

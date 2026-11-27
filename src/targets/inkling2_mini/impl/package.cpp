@@ -65,8 +65,17 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile) {
-    if (options.enable_vision)
-        throw std::invalid_argument("Inkling-2-Mini supports text-only execution");
+    if (options.enable_vision) {
+        if (options.vision_residency == VisionResidency::Cpu) {
+            throw std::invalid_argument(
+                "Inkling-2-Mini does not support --vision-cpu; use --vision-offload on "
+                "(--vision-residency overlay)");
+        }
+        if (!binder.has_object("vision/patch_embedding")) {
+            throw std::invalid_argument(
+                "Inkling-2-Mini --vision requires an artifact with vision/ weights");
+        }
+    }
     const auto backend = options.speculative.backend;
     if (backend != SpeculativeBackend::None && backend != SpeculativeBackend::DFlash &&
         backend != SpeculativeBackend::Mtp && backend != SpeculativeBackend::DFlash2)
@@ -86,7 +95,9 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         load_mtp && options.speculative.proposal_head == ProposalHead::Optimized;
     const bool load_dflash2 = backend == SpeculativeBackend::DFlash2;
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        detail::bind_artifact(binder, load_mtp, load_draft_head, load_dflash2), options));
+        detail::bind_artifact(binder, load_mtp, load_draft_head, load_dflash2,
+                              options.enable_vision, options.vision_residency),
+        options));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -100,7 +111,17 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
 
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return inkling2_mini::make_frontend(model.impl_->resources, {options.max_context});
+    return inkling2_mini::make_frontend(
+        model.impl_->resources,
+        FrontendOptions{
+            .max_context              = options.max_context,
+            .vision_enabled           = options.enable_vision,
+            .media_cache_bytes        = options.media_cache_bytes,
+            .media_live_bytes         = options.media_live_bytes,
+            .media_preprocess_threads = options.media_preprocess_threads,
+            .vision_max_tokens        = options.vision_max_tokens,
+            .vision_max_merged_tokens = options.vision_max_merged_tokens,
+        });
 }
 
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext&, const EngineOptions& options,

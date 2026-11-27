@@ -38,7 +38,8 @@ ownership, and the verified RTX 4060 Ti 16 GB (`sm_89`) Phase 1–8 measurements
   - Norms, `sconv`, dynamic conv projections, sinks, relative biases, clips, routers, loop rank-64 tensors: `BF16` / `FP32` (`~49 MiB`)
   - Optional DSpark `mtp/` tensors (`--mtp`, `53` stored tensors -> `593` total objects, `11,476,532,736` bytes total: `10.63 GiB` device weights with full proposal head, `10.66 GiB` when `mtp/draft_head` `Q4G64_F16S [32768, 2304]` + `mtp/draft_head_token_ids` `I32 [32768]` are active under `--lm-head-draft`): `fuse_weight` (`FP32` `[4, 4]`), `mask_embed` & `final_norm` (`BF16`), `3` draft layers (`Q4G64_F16S` `q`/`k`/`v`/`k_ctx`/`v_ctx`/`output`/`gate_up`/`down` + `BF16` norms), and Markov RNN head (`markov/dflare_norm`, `w1`, `rnn_proj_*`, `hidden_out_*`). Bound with `TensorPlacement::ValidateOnly` when speculative decoding is disabled.
   - Optional DFlash 2 `dflash2/` companion tensors (`--dflash2 <dir>` + `--base-artifact <base.ninfer>`, `76` stored tensors -> `616` total objects on base `540`, `11,619,800,576` bytes total / `10.80 GiB` resident device arena): `dflash2/fc` (`Q4G64_F16S [2304, 9216]`), `5` non-causal SWA draft layers (`Q4G64_F16S` `q`/`k`/`v`/`output` + fused `gate_up`/`down`, `BF16` `input_norm`/`post_attention_norm`/`q_norm`/`k_norm`, and `BF16` dynamic grouped width-2 `attention_conv`/`mlp_conv` `base_kernel` + `kernel_projection`), `dflash2/{hidden_norm,final_norm}` (`BF16`), and rank-256 `dflash2/selector/{hidden_projection,predecessor_codebook,successor_codebook}` (`BF16`). Bound with `TensorPlacement::ValidateOnly` when `--spec dflash2` is not selected.
-  - Frontend resources: `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`
+  - Optional Vision `vision/` tensors (`--vision` default auto-detect when `model.visual.*` exists in the source checkpoint; `330` stored tensors -> `871` total objects on base `540`, `924` with DSpark, `947` with DFlash2): `patch_embedding` (`BF16 [1200, 1024]`, HWC `[20, 20, 3]`), `class_embedding`, `cls_position_embedding`, `position_embedding` (`BF16 [1024, 1024]`, `32×32` grid), `ln_pre`, `23` ViT layers (`qkv` `Q4G64_F16S [3072, 1024]`, `output` `Q5G64_F16S [1024, 1024]`, `fc1` `Q4G64_F16S [4096, 1024]`, `fc2` `Q5G64_F16S [1024, 4096]`, plus `BF16` LayerNorms, biases, and `ls_1`/`ls_2` gammas), and `2×2` merger (`proj_in` `W8G32_F16S [4096, 4096]`, `proj_out` `W8G32_F16S [2304, 4096]`). Bound with `TensorPlacement::ValidateOnly` when `--vision` is off, `TensorPlacement::PinnedHost` under `--vision --vision-offload on` (`0 B` permanent VRAM), or `TensorPlacement::Device` under `--vision --vision-offload off`.
+  - Frontend resources: `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`, and optional `processor_config.json` (`5` host objects when present).
 
 ## 3. Runtime, StateImage, Prefix Reuse, and Frontend
 
@@ -328,9 +329,28 @@ All four concurrent response texts matched their serial counterparts exactly. Fo
 Verification covered the Inkling2 attention and MoE oracles, fused operations, state and program
 suites, Q4 linear, and CLI and server options.
 
+### Phase 9 — Vision-from-RAM (`23`-Layer ViT & Double-Buffered Overlay)
+
+- **Image processor & chat template (`processor.{h,cpp}`, `chat_template.{h,cpp}`):** `Inkling2ImageProcessor` resizes with FP32 Lanczos-3 (`factor = 40`), normalizes `(p/255 - 0.5)/0.5`, right/bottom pads to a multiple of `40` with `-1` in pixel space (`-1.007843137f` -> BF16 `0xBF81`), drops completely padded `20×20` sub-patches (`20*y >= target_h || 20*x >= target_w`), computes bilinear `32×32` `position_embedding` indices/weights, and builds `2×2` `merge_indices` (`-1` -> zero-fill). Chat template expands `MediaKind::Image` in `User`/`Tool` roles to `<|content_image|>` + `V × <|unused_200054|>` + `<|end_message|>` (`200005`, `200054`, `200010`); video and `--vision-cpu` are rejected.
+- **Vision ops & overlay runtime (`vision.cu`, `vision_overlay.h`, `executor.cpp`, `program.cpp`):**
+  - Closed ops: `inkling2_vision_patch_embed`, `inkling2_vision_rope_2d` (interleaved 2D axial RoPE, `theta = 10000.0`), `inkling2_vision_layerscale_add`, `inkling2_vision_merge_2x2`, plus `D = 1024` `layer_norm`, `head_dim = 64` `packed_softmax_attention`, and `Q4`/`Q5`/`W8` ViT linear dispatches.
+  - `VisionWeightStream` double-buffers `23` ViT layers (`45.25 MiB` staging aliased with text-step scratch via `LayoutBuilder::scope`) over `device.transfer_stream` while keeping `100%` of vision weights in pinned host RAM (`0 B` permanent VRAM).
+  - `PreparedVisionItem` (`token_begin`, `token_end`, `grid_h`, `grid_w`, `content_digest`) prevents cross-image prefix collisions on equal-resolution images and blocks checkpoint splits inside image token spans; `Executor::forward` scatters encoded `[2304, V_tok]` handoff columns into `cur` via `ops::scatter`, and `Program::advance_prefill` releases host `media_payloads` once past `token_end`.
+- **Windows launcher.** `scripts/run-ninfer-4060ti-inkling2.bat` enables overlay vision and
+  expects the vision-capable conversion at `models/inkling2_mini_q3g128.ninfer` by default.
+  Set `NINFER_ARTIFACT` to use a different artifact or `NINFER_VISION=0` for text-only serving.
+- **CLI check on RTX 4060 Ti 16 GB.** The image-chart example produced identical 24 greedy token
+  IDs with resident and overlay weights at 8,192-token `rk4v4-e8` capacity and a 128-token prefill
+  chunk. The loaded device weight arena was 10.4 GiB with overlay and 10.6 GiB with resident weights.
+- **Artifact verification.** The base vision conversion passed all 626 exact checks and 128
+  quantization checks against the local Inkling-2-Mini checkpoint.
+- **Serving check on RTX 4060 Ti 16 GB.** With overlay vision and 131,072-token `rk4v4-e8`
+  capacity, OpenAI Chat Completions and Anthropic Messages returned the correct colors for
+  solid-color 120×80 image prompts. The base configuration, DSpark at `K=4` with `--lm-head-draft`,
+  and DFlash 2 at `K=7` passed.
+
 ## 5. Follow-On Roadmap
 
 - **DSpark shortlist.** Calibrate `mtp/draft_head_token_ids` using token frequencies from code and
   text to improve `--lm-head-draft` acceptance.
 - **Quantization quality.** Evaluate imatrix/AWQ calibration or `Q4G64_F16S` `ffn/routed_down`.
-- **Vision.** Port Inkling-2's 23-layer ViT (`dim=1024`, `patch=20`, `merge=2`, axial RoPE `theta=10000`).

@@ -19,6 +19,27 @@ public:
         data->identity.reusable = reusable;
         return PreparedPrompt(std::move(data));
     }
+
+    static PreparedPrompt with_image(std::size_t before, std::size_t img_tokens,
+                                     std::size_t after, std::uint8_t digest_seed) {
+        auto data               = std::make_unique<PreparedPromptData>();
+        const std::size_t total = before + img_tokens + after;
+        data->token_ids.assign(total, 1);
+        for (std::size_t i = 0; i < img_tokens; ++i)
+            data->token_ids[before + i] = 200054;
+        data->positions.resize(total);
+        std::iota(data->positions.begin(), data->positions.end(), 0);
+        data->identity.reusable = true;
+        PreparedVisionItem item;
+        item.token_begin = static_cast<std::uint32_t>(before);
+        item.token_end   = static_cast<std::uint32_t>(before + img_tokens);
+        item.grid_h      = 1;
+        item.grid_w      = 1;
+        item.content_digest.fill(digest_seed);
+        data->vision_items.push_back(item);
+        data->media_payloads.push_back(std::make_shared<PreparedMediaPayload>());
+        return PreparedPrompt(std::move(data));
+    }
 };
 } // namespace ninfer::targets::inkling2_mini
 
@@ -301,6 +322,42 @@ void control_tests() {
         pb.values = {10, 11, 20, 0};
         require(pb.row_count() == 2 && pb.row_stride() == 2 && pb.tokens().size() == 4,
                 "PendingBatch preserves explicit ragged stride across multi-row batches");
+    }
+
+    // Vision shortlist, split-frontier rejection, and vision-disabled rejection.
+    {
+        auto p1 = ik::FrontendTestAccess::with_image(10, 8, 6, 0x11);
+        auto p2 = ik::FrontendTestAccess::with_image(10, 8, 6, 0x22);
+        EngineOptions vo;
+        vo.max_context                          = 4096;
+        vo.kv_capacity                          = KvCapacityPolicy::explicit_capacity(4096);
+        vo.kv_cache                             = KvCacheStorage::Int8Group64;
+        vo.context_cache.enabled                = true;
+        vo.context_cache.device_state_slots     = 2;
+        vo.context_cache.host_state_slots       = 0;
+        vo.context_cache.host_kv_capacity_bytes = 0;
+        vo.enable_vision                        = false;
+        DeviceContext dev;
+        ik::detail::RuntimeModelView vmodel{};
+        ik::Program text_only_prog(vmodel, dev, vo);
+        rt::ResolvedExecutionOptions eo;
+        eo.requested_output_tokens = 16;
+        eo.allow_prefix_reuse      = true;
+        rejects([&] { (void)text_only_prog.plan_request(p1, eo); },
+                "vision-disabled Program::plan_request rejects prompt with vision_items");
+
+        vo.enable_vision = true;
+        ik::Program vprog(vmodel, dev, vo);
+        const auto base1 = vprog.plan_request(p1, eo);
+        const auto base2 = vprog.plan_request(p2, eo);
+        require(!base1.prefix_shortlist_key(14).has_value(),
+                "shortlist rejects frontier strictly inside vision item");
+        require(!base1.shared_candidate_rebuild_work(14).has_value(),
+                "shared_candidate_rebuild_work rejects frontier strictly inside vision item");
+        require(base1.prefix_shortlist_key(10).has_value() &&
+                    base1.prefix_shortlist_key(18).has_value() &&
+                    base1.prefix_shortlist_key(18) != base2.prefix_shortlist_key(18),
+                "same-resolution different-digest images have distinct shortlist keys");
     }
 }
 } // namespace

@@ -141,6 +141,15 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
                           {2304, 6912, 161U, Comparison::Sampled, false, kInklingK2304});
 
+    // Inkling-2-Mini vision geometries: K=1024 -> N in {3072, 4096}, including odd T_vis.
+    constexpr std::array kInklingVisionK1024{
+        a16(1), a16(5), a16(7), a16(16), a16(17), a16(65), a16(257), a16(321),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {3072, 1024, 163U, Comparison::Sampled, false, kInklingVisionK1024});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {4096, 1024, 165U, Comparison::Sampled, false, kInklingVisionK1024});
+
     return failures;
 }
 

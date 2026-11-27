@@ -4,6 +4,7 @@
 
 #include <ninfer/targets/inkling2_mini/frontend.h>
 
+#include <optional>
 #include <string>
 
 namespace ninfer::artifact {
@@ -17,6 +18,7 @@ struct FrontendResourcePlan {
     artifact::ObjectHandle tokenizer_config_json;
     artifact::ObjectHandle chat_template_jinja;
     artifact::ObjectHandle generation_config_json;
+    std::optional<artifact::ObjectHandle> processor_config_json;
 };
 
 struct FrontendResources {
@@ -24,6 +26,7 @@ struct FrontendResources {
     std::string tokenizer_config_json;
     std::string chat_template_jinja;
     std::string generation_config_json;
+    std::string processor_config_json;
 };
 
 [[nodiscard]] FrontendResourcePlan bind_frontend_resources(artifact::Binder& binder);

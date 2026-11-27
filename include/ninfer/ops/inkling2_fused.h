@@ -285,4 +285,35 @@ void inkling2_dflash2_topk16_and_select(const Tensor& mask_hidden, const Tensor&
                                         Tensor& drafts, Tensor& proposal_q,
                                         WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * Inkling-2-Mini ViT patch embedding, CLS prepend, bilinear position-embedding addition, and
+ * pre-LayerNorm (`D = 1024`, `K = 1200`, `P >= 1`).
+ */
+void inkling2_vision_patch_embed(const Tensor& patches, const Tensor& patch_weight,
+                                 const Tensor& class_embedding,
+                                 const Tensor& cls_position_embedding, const Tensor& position_table,
+                                 const Tensor& pos_indices, const Tensor& pos_weights,
+                                 const Tensor& ln_pre_weight, const Tensor& ln_pre_bias, float eps,
+                                 Tensor& out, cudaStream_t stream);
+
+/**
+ * In-place interleaved 2D axial RoPE on Q (`[0..1024)`) and K (`[1024..2048)`) of `qkv [3072, T]`,
+ * `H = 16`, `head_dim = 64`. Skips tokens with `coords[0, t] < 0 || coords[1, t] < 0` bit-exactly.
+ */
+void inkling2_vision_rope_2d(const Tensor& coords, float rope_theta, Tensor& qkv,
+                             cudaStream_t stream);
+
+/**
+ * Fused LayerScale residual add: `hidden[:, t] += gamma * (proj[:, t] + bias)` (`D = 1024`).
+ */
+void inkling2_vision_layerscale_add(const Tensor& proj, const Tensor& bias, const Tensor& gamma,
+                                    Tensor& hidden, cudaStream_t stream);
+
+/**
+ * Gathers `2x2` spatial sub-patches from `src [1024, T_vis]` via `merge_indices [4, V]`
+ * (`-1` -> zero-fill) into `out [4096, V]`.
+ */
+void inkling2_vision_merge_2x2(const Tensor& src, const Tensor& merge_indices, Tensor& out,
+                               cudaStream_t stream);
+
 } // namespace ninfer::ops

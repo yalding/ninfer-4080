@@ -218,7 +218,14 @@ void StateImage::prepare_append(std::uint32_t slot, std::uint32_t start, std::ui
 }
 
 void StateImage::commit_append(std::uint32_t slot, std::uint32_t depth) {
-    slots_.at(slot).depth = depth;
+    auto& state = slots_.at(slot);
+    const auto committed_pages = (depth + 63) / 64;
+    if (committed_pages > state.pages.size())
+        throw std::logic_error("Inkling commit exceeds prepared KV pages");
+    // Verification finishes before a partial commit. Release pages containing only rejected
+    // tokens so later appends, forks, and host snapshots see the committed frontier.
+    state.pages.resize(committed_pages);
+    state.depth = depth;
 }
 
 Tensor StateImage::convolution(std::uint32_t slot, int visit, int component) const {

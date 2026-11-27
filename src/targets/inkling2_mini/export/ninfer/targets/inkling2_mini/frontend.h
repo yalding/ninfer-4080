@@ -16,7 +16,13 @@ namespace ninfer::targets::inkling2_mini {
 inline constexpr std::size_t kTokenDomain = 200058;
 
 struct FrontendOptions {
-    std::uint32_t max_context = 131072;
+    std::uint32_t max_context              = 131072;
+    bool vision_enabled                    = false;
+    std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
+    std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
+    std::uint32_t media_preprocess_threads = 0;
+    std::uint32_t vision_max_tokens        = 8192;
+    std::uint32_t vision_max_merged_tokens = 16384;
 };
 
 namespace frontend_internal {

@@ -23,24 +23,25 @@ constexpr ReductionCriterion layer_norm_bf16_criterion() {
 }
 
 std::vector<double> layer_norm_oracle(const std::vector<float>& x, const std::vector<float>& weight,
-                                      const std::vector<float>& bias, std::int32_t rows) {
+                                      const std::vector<float>& bias, std::int32_t width,
+                                      std::int32_t rows) {
     std::vector<double> output(x.size());
     for (std::int32_t row = 0; row < rows; ++row) {
-        const std::size_t base = static_cast<std::size_t>(row) * kVisionWidth;
+        const std::size_t base = static_cast<std::size_t>(row) * width;
         double mean            = 0.0;
-        for (std::int32_t column = 0; column < kVisionWidth; ++column) {
+        for (std::int32_t column = 0; column < width; ++column) {
             mean += static_cast<double>(x[base + column]);
         }
-        mean /= static_cast<double>(kVisionWidth);
+        mean /= static_cast<double>(width);
 
         double squared_deviation = 0.0;
-        for (std::int32_t column = 0; column < kVisionWidth; ++column) {
+        for (std::int32_t column = 0; column < width; ++column) {
             const double centered = static_cast<double>(x[base + column]) - mean;
             squared_deviation += centered * centered;
         }
         const double inverse =
-            1.0 / std::sqrt(squared_deviation / static_cast<double>(kVisionWidth) + kEps);
-        for (std::int32_t column = 0; column < kVisionWidth; ++column) {
+            1.0 / std::sqrt(squared_deviation / static_cast<double>(width) + kEps);
+        for (std::int32_t column = 0; column < width; ++column) {
             output[base + column] = (static_cast<double>(x[base + column]) - mean) * inverse *
                                         static_cast<double>(weight[column]) +
                                     static_cast<double>(bias[column]);
@@ -49,17 +50,17 @@ std::vector<double> layer_norm_oracle(const std::vector<float>& x, const std::ve
     return output;
 }
 
-int run_case(const char* label, std::int32_t rows, std::uint32_t seed, bool near_constant = false,
-             bool bf16x2_unaligned = false) {
-    const std::size_t n = static_cast<std::size_t>(kVisionWidth) * rows;
-    std::vector<float> x(n), weight(kVisionWidth), bias(kVisionWidth);
+int run_case(const char* label, std::int32_t width, std::int32_t rows, std::uint32_t seed,
+             bool near_constant = false, bool bf16x2_unaligned = false) {
+    const std::size_t n = static_cast<std::size_t>(width) * rows;
+    std::vector<float> x(n), weight(width), bias(width);
     fill_uniform(x, seed, -4.0F, 4.0F);
     fill_uniform(weight, seed + 1U, -1.5F, 1.5F);
     fill_uniform(bias, seed + 2U, -1.0F, 1.0F);
     if (near_constant) {
         for (std::int32_t row = 0; row < rows; ++row) {
-            const std::size_t base = static_cast<std::size_t>(row) * kVisionWidth;
-            for (std::int32_t column = 0; column < kVisionWidth; ++column) {
+            const std::size_t base = static_cast<std::size_t>(row) * width;
+            for (std::int32_t column = 0; column < width; ++column) {
                 x[base + column] = 1.0F + static_cast<float>((column % 5) - 2) / 128.0F;
             }
         }
@@ -67,7 +68,7 @@ int run_case(const char* label, std::int32_t rows, std::uint32_t seed, bool near
     round_to_bf16(x);
     round_to_bf16(weight);
     round_to_bf16(bias);
-    const std::vector<double> reference = layer_norm_oracle(x, weight, bias, rows);
+    const std::vector<double> reference = layer_norm_oracle(x, weight, bias, width, rows);
 
     norm::DeviceInput device_x      = norm::make_input(x, bf16x2_unaligned);
     norm::DeviceInput device_weight = norm::make_input(weight, bf16x2_unaligned);
@@ -77,10 +78,10 @@ int run_case(const char* label, std::int32_t rows, std::uint32_t seed, bool near
     output.fill(0xff);
     void* output_data = static_cast<std::uint8_t*>(output.data()) + leading;
 
-    Tensor tx(device_x.data, DType::BF16, {kVisionWidth, rows});
-    Tensor tw(device_weight.data, DType::BF16, {kVisionWidth});
-    Tensor tb(device_bias.data, DType::BF16, {kVisionWidth});
-    Tensor tout(output_data, DType::BF16, {kVisionWidth, rows});
+    Tensor tx(device_x.data, DType::BF16, {width, rows});
+    Tensor tw(device_weight.data, DType::BF16, {width});
+    Tensor tb(device_bias.data, DType::BF16, {width});
+    Tensor tout(output_data, DType::BF16, {width, rows});
     ops::layer_norm(tx, tw, tb, kEps, tout, nullptr);
     cuda_synchronize();
 
@@ -103,14 +104,17 @@ int main() {
     }
 
     int failures = 0;
-    failures += run_case("layer_norm vision [1152,1]", 1, 3101U);
-    failures += run_case("layer_norm vision [1152,256]", 256, 3102U);
-    failures += run_case("layer_norm vision [1152,4096]", 4096, 3103U);
-    failures += run_case("layer_norm near-constant [1152,4]", 4, 3201U, true);
+    failures += run_case("layer_norm vision [1152,1]", kVisionWidth, 1, 3101U);
+    failures += run_case("layer_norm vision [1152,256]", kVisionWidth, 256, 3102U);
+    failures += run_case("layer_norm vision [1152,4096]", kVisionWidth, 4096, 3103U);
+    failures += run_case("layer_norm near-constant [1152,4]", kVisionWidth, 4, 3201U, true);
 
     // Alignment is not part of the public contract; this exercises the scalar fallback at the
     // registered width rather than adding a fictitious model shape.
-    failures += run_case("layer_norm unaligned [1152,7]", 7, 3202U, false, true);
+    failures += run_case("layer_norm unaligned [1152,7]", kVisionWidth, 7, 3202U, false, true);
+
+    failures += run_case("layer_norm inkling2 [1024,1]", 1024, 1, 3301U);
+    failures += run_case("layer_norm inkling2 [1024,197]", 1024, 197, 3302U);
 
     std::cout << (failures ? "FAIL" : "OK") << " layer_norm correctness\n";
     return failures ? 1 : 0;

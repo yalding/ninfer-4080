@@ -59,6 +59,14 @@ int q5_a16_conformance() {
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
                           {1152, 4304, 181U, Comparison::Sampled, false, kN1152K4304});
 
+    constexpr std::array kInklingVisionOddT{
+        a16(1), a16(5), a16(17), a16(65), a16(257), a16(513),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
+                          {1024, 1024, 183U, Comparison::Full, false, kInklingVisionOddT});
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
+                          {1024, 4096, 185U, Comparison::Sampled, false, kInklingVisionOddT});
+
     return failures;
 }
 

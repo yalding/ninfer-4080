@@ -156,6 +156,14 @@ int w8_a16_conformance() {
 
     failures += feature_conformance();
 
+    constexpr std::array kInklingVisionW8{
+        a16(1), a16(5), a16(17), a16(65), a16(257), a16(513),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {4096, 4096, 289U, Comparison::Sampled, false, kInklingVisionW8});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {2304, 4096, 293U, Comparison::Sampled, false, kInklingVisionW8});
+
     return failures;
 }
 

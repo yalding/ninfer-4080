@@ -1,28 +1,38 @@
 #include "targets/inkling2_mini/impl/runtime/executor.h"
 #include "targets/inkling2_mini/impl/load/bindings.h"
+#include "targets/inkling2_mini/impl/runtime/vision_overlay.h"
+#include "targets/inkling2_mini/impl/vision_limits.h"
 #include "targets/inkling2_mini/impl/state/state_image.h"
+#include <ninfer/targets/inkling2_mini/prepared_prompt.h>
 #include "core/arena.h"
 #include "core/decode_graph.h"
+#include "ninfer/ops/add_bias.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/embedding.h"
+#include "ninfer/ops/gelu.h"
 #include "ninfer/ops/inkling2_attention.h"
 #include "ninfer/ops/inkling2_fused.h"
 #include "ninfer/ops/inkling2_moe.h"
 #include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/layer_norm.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/prepare_masked_block.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/sliding_window_attention.h"
+#include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -31,6 +41,15 @@ namespace ninfer::targets::inkling2_mini::detail {
 namespace {
 constexpr int C = 2304, V = 200058, P = 201024;
 constexpr std::uint32_t kScoreChunk = 128;
+constexpr std::size_t kVisionOverlayStagingBytes = 47'448'064ULL;
+
+std::uint32_t v_native_max(const EngineOptions& options) {
+    return vision_native_capacity(options.vision_max_tokens);
+}
+
+std::uint32_t v_item_max(const EngineOptions& options) {
+    return vision_merged_capacity(options.vision_max_tokens, options.vision_max_merged_tokens);
+}
 
 std::uint32_t chunk_capacity(const EngineOptions& options) {
     const std::uint32_t batch =
@@ -101,6 +120,20 @@ std::size_t op_workspace(const EngineOptions& options) {
     bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(QType::Q6G64_F16S, P, C,
                                                                  ops::LinearPolicy::A16Only, 1,
                                                                  head_columns(options)));
+    if (options.enable_vision) {
+        const int tv = static_cast<int>(v_native_max(options)) + 1;
+        const int vm = static_cast<int>(v_item_max(options));
+        for (const auto [qt, n, k, cols] :
+             {std::tuple{QType::Q4G64_F16S, 3072, 1024, tv},
+              std::tuple{QType::Q5G64_F16S, 1024, 1024, tv},
+              std::tuple{QType::Q4G64_F16S, 4096, 1024, tv},
+              std::tuple{QType::Q5G64_F16S, 1024, 4096, tv},
+              std::tuple{QType::W8G32_F16S, 4096, 4096, vm},
+              std::tuple{QType::W8G32_F16S, 2304, 4096, vm}}) {
+            bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
+                                        qt, n, k, ops::LinearPolicy::A16Only, 1, cols));
+        }
+    }
     return std::max(bytes, ops::sampling_workspace_capacity_bytes(V, 1, 1));
 }
 
@@ -120,7 +153,12 @@ struct ScratchLayout {
     TensorRegion dflash2_q, dflash2_k, dflash2_v, dflash2_attn, dflash2_proj, dflash2_gu, dflash2_act;
     TensorRegion dflash2_mask_h, dflash2_unary_logits, dflash2_cand_ids, dflash2_proposal_q;
     TensorRegion dflash2_drafts;
+    TensorRegion vision_handoff, vision_scatter_idx;
+    LayoutRegion vision_overlay_staging;
+    TensorRegion vit_patches, vit_coords, vit_pos_idx, vit_pos_w, vit_merge_idx;
+    TensorRegion vit_x, vit_ln, vit_qkv, vit_attn, vit_proj, vit_fc1, vit_merged, vit_proj_in;
     LayoutRegion config;
+    std::size_t vision_general_bytes = 0;
     std::size_t bytes;
 };
 
@@ -137,32 +175,7 @@ ScratchLayout scratch_layout(const EngineOptions& options) {
     auto i32 = [&](std::initializer_list<int> shape) {
         return b.add_tensor(DType::I32, shape, 256, "Inkling indices");
     };
-    s.cur      = bf({C, t});
-    s.residual = bf({C, t});
-    for (auto& block : s.blocks) block = bf({C, t});
-    s.prelude         = bf({C, t});
-    s.bank            = bf({C, t});
-    s.previous        = bf({C, t});
-    s.mix             = bf({C, t, 3});
-    s.messages        = bf({C, t, 4});
-    s.inputs          = bf({C, t, 3});
-    s.qgr             = bf({6528, t});
-    s.kraw            = bf({1024, t});
-    s.vraw            = bf({1024, t});
-    s.kconv           = bf({1024, t});
-    s.vconv           = bf({1024, t});
-    s.q               = bf({128, 24, t});
-    s.k               = bf({128, 8, t});
-    s.v               = bf({128, 8, t});
-    s.r               = fp({16, 24, t});
-    s.sink            = fp({24, t});
-    s.dynamic_k       = fp({32, t});
-    s.dynamic_v       = fp({32, t});
-    s.rel             = bf({1025, 24, std::max(t, 32)});
-    s.attention       = bf({128, 24, t});
-    s.projection      = bf({C, t});
-    s.moe             = bf({C, t});
-    s.ffn_mix         = bf({C, t});
+    s.cur             = bf({C, t});
     const int max_b   = static_cast<int>(
         std::min<std::uint32_t>(kMaximumConcurrency, std::max(1U, options.max_concurrency)));
     s.ids             = i32({t});
@@ -238,8 +251,70 @@ ScratchLayout scratch_layout(const EngineOptions& options) {
         s.dspark_licensed_cnt = i32({1});
         s.dspark_accepted     = i32({1});
     }
-    s.config          = b.add(sizeof(ops::SamplingConfig) * max_b, 256, "Inkling sampling config");
-    s.bytes           = b.finish(256);
+    if (options.enable_vision) {
+        s.vision_handoff     = bf({C, static_cast<int>(v_item_max(options))});
+        s.vision_scatter_idx = i32({t});
+    }
+    s.config = b.add(sizeof(ops::SamplingConfig) * max_b, 256, "Inkling sampling config");
+    {
+        auto text_scope = b.scope();
+        s.residual      = bf({C, t});
+        for (auto& block : s.blocks) block = bf({C, t});
+        s.prelude   = bf({C, t});
+        s.bank      = bf({C, t});
+        s.previous  = bf({C, t});
+        s.mix       = bf({C, t, 3});
+        s.messages  = bf({C, t, 4});
+        s.inputs    = bf({C, t, 3});
+        s.qgr       = bf({6528, t});
+        s.kraw      = bf({1024, t});
+        s.vraw      = bf({1024, t});
+        s.kconv     = bf({1024, t});
+        s.vconv     = bf({1024, t});
+        s.q         = bf({128, 24, t});
+        s.k         = bf({128, 8, t});
+        s.v         = bf({128, 8, t});
+        s.r         = fp({16, 24, t});
+        s.sink      = fp({24, t});
+        s.dynamic_k = fp({32, t});
+        s.dynamic_v = fp({32, t});
+        s.rel       = bf({1025, 24, std::max(t, 32)});
+        s.attention = bf({128, 24, t});
+        s.projection = bf({C, t});
+        s.moe       = bf({C, t});
+        s.ffn_mix   = bf({C, t});
+    }
+    if (options.enable_vision) {
+        auto vision_scope = b.scope();
+        const int vn      = static_cast<int>(v_native_max(options));
+        const int tv      = vn + 1;
+        const int vm      = static_cast<int>(v_item_max(options));
+        std::size_t start_offset = 0;
+        if (options.vision_residency == VisionResidency::Overlay) {
+            s.vision_overlay_staging =
+                b.add(kVisionOverlayStagingBytes, 256, "Inkling vision overlay staging");
+            start_offset = s.vision_overlay_staging.offset;
+        }
+        s.vit_patches   = bf({1200, vn});
+        if (options.vision_residency != VisionResidency::Overlay) {
+            start_offset = s.vit_patches.region.offset;
+        }
+        s.vit_coords    = i32({4, tv});
+        s.vit_pos_idx   = i32({4, vn});
+        s.vit_pos_w     = fp({4, vn});
+        s.vit_merge_idx = i32({4, vm});
+        s.vit_x         = bf({1024, tv});
+        s.vit_ln        = bf({1024, tv});
+        s.vit_qkv       = bf({3072, tv});
+        s.vit_attn      = bf({1024, tv});
+        s.vit_proj      = bf({1024, tv});
+        s.vit_fc1       = bf({4096, tv});
+        s.vit_merged    = bf({4096, vm});
+        s.vit_proj_in   = bf({4096, vm});
+        s.vision_general_bytes =
+            (s.vit_proj_in.region.offset + s.vit_proj_in.region.bytes) - start_offset;
+    }
+    s.bytes = b.finish(256);
     return s;
 }
 
@@ -316,12 +391,18 @@ public:
     PinnedHostBuffer pinned_step;
     PinnedHostBuffer pinned_ids;
     PinnedHostBuffer pinned_positions;
+    PinnedHostBuffer pinned_vision_idx;
     std::vector<std::int32_t> host_counts;
-    bool last_spec_active          = false;
-    std::uint32_t last_spec_slot   = 0;
-    std::uint32_t last_spec_start  = 0;
-    int last_spec_w                = 0;
-    int last_spec_accepted         = 0;
+    std::optional<VisionWeightStream> vision_stream;
+    VisionWeights active_vision_weights;
+    std::size_t vision_encode_peak_bytes    = 0;
+    std::size_t vision_handoff_active_bytes = 0;
+    std::size_t vision_handoff_peak_bytes   = 0;
+    bool last_spec_active                   = false;
+    std::uint32_t last_spec_slot            = 0;
+    std::uint32_t last_spec_start           = 0;
+    int last_spec_w                         = 0;
+    int last_spec_accepted                  = 0;
 
     Impl(const RuntimeModelView& m, DeviceContext& d, const EngineOptions& o,
          const StartupObserver* observer = nullptr)
@@ -330,6 +411,8 @@ public:
           pinned_step(sizeof(HostStepStaging)),
           pinned_ids(chunk_capacity(o) * sizeof(TokenId)),
           pinned_positions(chunk_capacity(o) * sizeof(std::int32_t)),
+          pinned_vision_idx(o.enable_vision ? chunk_capacity(o) * sizeof(std::int32_t)
+                                            : sizeof(std::int32_t)),
           host_counts(static_cast<std::size_t>(V) * std::max(1U, o.max_concurrency)) {
         if (model.has_mtp && states.has_dspark() &&
             options.speculative.proposal_head != ProposalHead::Optimized) {
@@ -341,6 +424,20 @@ public:
                                            b_fold, device.stream);
             CUDA_CHECK(cudaStreamSynchronize(device.stream));
         }
+        if (model.has_vision && options.enable_vision) {
+            if (model.vision_overlay_enabled) {
+                if (model.vision_overlay.staging_bytes > layout.vision_overlay_staging.bytes) {
+                    throw std::logic_error(
+                        "Inkling vision overlay staging exceeds planned scratch capacity");
+                }
+                auto* staging = static_cast<std::byte*>(
+                    layout.vision_overlay_staging.bind({scratch.p, scratch.bytes}).data);
+                vision_stream.emplace(device, model.vision_overlay, model.pinned_weights, staging);
+                active_vision_weights = vision_stream->window_weights(model.vision);
+            } else {
+                active_vision_weights = model.vision;
+            }
+        }
     }
 
     Tensor bf(const TensorRegion& r, int a, int b = 1, int c = 1) {
@@ -349,13 +446,29 @@ public:
 
     void schedule(int t, std::uint32_t slot, std::uint32_t envelope, bool all,
                   bool capture_dspark = false, bool record_conv = false,
-                  bool capture_dflash2 = false) {
+                  bool capture_dflash2 = false,
+                  std::span<const VisionChunkSlice> vision_slices = {}) {
         auto stream = device.stream;
         Tensor cur = bf(layout.cur, C, t), residual = bf(layout.residual, C, t);
         Tensor ids = bf(layout.ids, t), positions = bf(layout.positions, t);
         Tensor count = bf(layout.count, 1), lane = bf(layout.lane, 1);
         ops::embedding(ids, model.token_embedding, cur, stream);
         ops::rmsnorm(cur, model.token_norm, 1e-6f, false, cur, stream);
+        if (!vision_slices.empty()) {
+            auto* handoff_base = static_cast<std::byte*>(
+                layout.vision_handoff.region.bind({scratch.p, scratch.bytes}).data);
+            auto* idx_base = static_cast<std::byte*>(
+                layout.vision_scatter_idx.region.bind({scratch.p, scratch.bytes}).data);
+            std::size_t idx_offset = 0;
+            for (const auto& slice : vision_slices) {
+                Tensor src(handoff_base + static_cast<std::size_t>(slice.handoff_col_offset) * C * 2,
+                           DType::BF16, {C, static_cast<int>(slice.token_count)});
+                Tensor idx(idx_base + idx_offset * sizeof(std::int32_t), DType::I32,
+                           {static_cast<int>(slice.token_count)});
+                ops::scatter(src, idx, cur, stream);
+                idx_offset += slice.token_count;
+            }
+        }
         std::array<Tensor, 4> blocks;
         for (int i = 0; i < 4; ++i) blocks[i] = bf(layout.blocks[i], C, t);
         Tensor prelude = bf(layout.prelude, C, t), bank = bf(layout.bank, C, t),
@@ -1051,7 +1164,7 @@ Executor::~Executor() {
 }
 
 Tensor Executor::forward(std::span<const TokenId> ids, std::uint32_t start, std::uint32_t slot,
-                         bool all) {
+                         bool all, std::span<const VisionChunkSlice> vision_slices) {
     auto& p     = *impl_;
     const int t = static_cast<int>(ids.size());
     if (ids.empty() || ids.size() > chunk_capacity(p.options) ||
@@ -1061,6 +1174,24 @@ Tensor Executor::forward(std::span<const TokenId> ids, std::uint32_t start, std:
         if (id < 0 || id >= V) throw std::invalid_argument("Inkling token ID outside vocabulary");
     // Finish prior use of pinned table staging and transient storage before mutating the maps.
     sync();
+    if (!vision_slices.empty()) {
+        if (!p.options.enable_vision || !p.model.has_vision)
+            throw std::invalid_argument("Inkling vision slices require enabled vision model");
+        const std::uint32_t cap = v_item_max(p.options);
+        auto* host_idx          = static_cast<std::int32_t*>(p.pinned_vision_idx.data());
+        std::size_t total_idx   = 0;
+        for (const auto& s : vision_slices) {
+            if (s.token_count == 0 || s.handoff_col_offset + s.token_count > cap ||
+                s.chunk_col_begin + s.token_count > static_cast<std::uint32_t>(t) ||
+                total_idx + s.token_count > static_cast<std::size_t>(t))
+                throw std::invalid_argument("Inkling vision slice exceeds capacity");
+            for (std::uint32_t j = 0; j < s.token_count; ++j)
+                host_idx[total_idx++] = static_cast<std::int32_t>(s.chunk_col_begin + j);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            p.layout.vision_scatter_idx.region.bind({p.scratch.p, p.scratch.bytes}).data, host_idx,
+            total_idx * sizeof(std::int32_t), cudaMemcpyHostToDevice, p.device.stream));
+    }
     p.states.prepare_append(slot, start, t, p.device.stream);
     auto* host_ids = static_cast<TokenId*>(p.pinned_ids.data());
     std::memcpy(host_ids, ids.data(), ids.size_bytes());
@@ -1082,7 +1213,7 @@ Tensor Executor::forward(std::span<const TokenId> ids, std::uint32_t start, std:
                                 p.options.purpose != EnginePurpose::CausalScoring;
     const bool capture_dflash2 = p.model.has_dflash2 && p.states.has_dflash2() && !all &&
                                  p.options.purpose != EnginePurpose::CausalScoring;
-    if (p.options.use_cuda_graph && t == 1 && !all) {
+    if (p.options.use_cuda_graph && t == 1 && !all && vision_slices.empty()) {
         std::uint32_t envelope = std::min(256U, p.options.max_context);
         while (envelope < start + 1) envelope = std::min(envelope * 2, p.options.max_context);
         auto& graph = p.graphs[{slot, envelope}];
@@ -1095,11 +1226,119 @@ Tensor Executor::forward(std::span<const TokenId> ids, std::uint32_t start, std:
         }
         graph.executable.launch(p.device.stream);
     } else
-        p.schedule(t, slot, start + t, all, capture_dspark, false, capture_dflash2);
+        p.schedule(t, slot, start + t, all, capture_dspark, false, capture_dflash2, vision_slices);
     p.states.commit_append(slot, start + t);
     if (capture_dspark) p.mix_and_append_dspark(t, t, start, slot);
     if (capture_dflash2) p.append_dflash2_context(t, start, slot);
     return p.bf(p.layout.logits, P, all ? t : 1);
+}
+
+std::uint32_t Executor::vision_handoff_capacity_tokens() const noexcept {
+    return impl_->options.enable_vision ? v_item_max(impl_->options) : 0;
+}
+
+double Executor::encode_vision_item(const PreparedMediaPayload& payload,
+                                    std::uint32_t handoff_col_offset) {
+    auto& p = *impl_;
+    if (!p.options.enable_vision || !p.model.has_vision)
+        throw std::logic_error("Inkling encode_vision_item called without enabled vision");
+    const std::uint32_t p_nat = payload.native_patches;
+    const std::uint32_t v_tok = payload.merged_tokens;
+    if (p_nat == 0 || p_nat > v_native_max(p.options) || v_tok == 0 ||
+        handoff_col_offset + v_tok > v_item_max(p.options))
+        throw std::invalid_argument("Inkling vision item exceeds configured vision capacity");
+
+    sync();
+    const auto t0      = std::chrono::steady_clock::now();
+    auto stream        = p.device.stream;
+    const int P_vis    = static_cast<int>(p_nat);
+    const int T_vis    = P_vis + 1;
+    const int V_vis    = static_cast<int>(v_tok);
+    const DeviceSpan backing{p.scratch.p, p.scratch.bytes};
+
+    Tensor tp(p.layout.vit_patches.region.bind(backing).data, DType::BF16, {1200, P_vis});
+    Tensor tcoords(p.layout.vit_coords.region.bind(backing).data, DType::I32, {4, T_vis});
+    Tensor tpi(p.layout.vit_pos_idx.region.bind(backing).data, DType::I32, {4, P_vis});
+    Tensor tpw(p.layout.vit_pos_w.region.bind(backing).data, DType::FP32, {4, P_vis});
+    Tensor tmerge_idx(p.layout.vit_merge_idx.region.bind(backing).data, DType::I32, {4, V_vis});
+
+    CUDA_CHECK(cudaMemcpyAsync(tp.data, payload.patches.data(),
+                               payload.patches.size() * sizeof(std::uint16_t),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(tcoords.data, payload.coords.data(),
+                               payload.coords.size() * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(tpi.data, payload.pos_indices.data(),
+                               payload.pos_indices.size() * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(tpw.data, payload.pos_weights.data(),
+                               payload.pos_weights.size() * sizeof(float),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(tmerge_idx.data, payload.merge_indices.data(),
+                               payload.merge_indices.size() * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    Tensor tx(p.layout.vit_x.region.bind(backing).data, DType::BF16, {1024, T_vis});
+    Tensor tln(p.layout.vit_ln.region.bind(backing).data, DType::BF16, {1024, T_vis});
+    Tensor tqkv(p.layout.vit_qkv.region.bind(backing).data, DType::BF16, {3072, T_vis});
+    Tensor tattn(p.layout.vit_attn.region.bind(backing).data, DType::BF16, {1024, T_vis});
+    Tensor tproj(p.layout.vit_proj.region.bind(backing).data, DType::BF16, {1024, T_vis});
+    Tensor tfc1(p.layout.vit_fc1.region.bind(backing).data, DType::BF16, {4096, T_vis});
+    Tensor tmerged(p.layout.vit_merged.region.bind(backing).data, DType::BF16, {4096, V_vis});
+    Tensor tproj_in(p.layout.vit_proj_in.region.bind(backing).data, DType::BF16, {4096, V_vis});
+
+    const auto& w = p.active_vision_weights;
+    if (p.vision_stream) {
+        p.vision_stream->reset(stream);
+        p.vision_stream->prelude_ready(stream);
+    }
+
+    ops::inkling2_vision_patch_embed(tp, w.patch_embedding, w.class_embedding,
+                                     w.cls_position_embedding, w.position_embedding, tpi, tpw,
+                                     w.ln_pre_weight, w.ln_pre_bias, 1e-5f, tx, stream);
+
+    for (std::uint32_t l = 0; l < kVisionLayers; ++l) {
+        if (p.vision_stream) p.vision_stream->begin_layer(l, stream);
+        const auto& wl = w.layers[l];
+        ops::layer_norm(tx, wl.ln_1_weight, wl.ln_1_bias, 1e-5f, tln, stream);
+        ops::linear(tln, wl.qkv, tqkv, ops::LinearPolicy::A16Only, p.workspace, stream);
+        ops::add_bias(wl.qkv_bias, tqkv, stream);
+        ops::inkling2_vision_rope_2d(tcoords, 10000.0f, tqkv, stream);
+        Tensor qkv3   = tqkv.reshape({64, 48, T_vis});
+        Tensor q      = qkv3.slice(1, 0, 16);
+        Tensor k      = qkv3.slice(1, 16, 16);
+        Tensor v      = qkv3.slice(1, 32, 16);
+        Tensor tattn3 = tattn.reshape({64, 16, T_vis});
+        ops::packed_softmax_attention(q, k, v, {64, 16, 16}, 0.125f, T_vis, tattn3, stream);
+        ops::linear(tattn, wl.output, tproj, ops::LinearPolicy::A16Only, p.workspace, stream);
+        ops::inkling2_vision_layerscale_add(tproj, wl.output_bias, wl.ls_1_gamma, tx, stream);
+
+        ops::layer_norm(tx, wl.ln_2_weight, wl.ln_2_bias, 1e-5f, tln, stream);
+        ops::linear(tln, wl.fc1, tfc1, ops::LinearPolicy::A16Only, p.workspace, stream);
+        ops::add_bias(wl.fc1_bias, tfc1, stream);
+        ops::gelu(tfc1, ops::GeluMode::Exact, stream);
+        ops::linear(tfc1, wl.fc2, tproj, ops::LinearPolicy::A16Only, p.workspace, stream);
+        ops::inkling2_vision_layerscale_add(tproj, wl.fc2_bias, wl.ls_2_gamma, tx, stream);
+        if (p.vision_stream) p.vision_stream->end_layer(l, stream);
+    }
+
+    ops::inkling2_vision_merge_2x2(tx, tmerge_idx, tmerged, stream);
+    if (p.vision_stream) p.vision_stream->merger_ready(stream);
+    ops::linear(tmerged, w.proj_in, tproj_in, ops::LinearPolicy::A16Only, p.workspace, stream);
+    ops::gelu(tproj_in, ops::GeluMode::Exact, stream);
+    auto* handoff_ptr = static_cast<std::byte*>(p.layout.vision_handoff.region.bind(backing).data) +
+                        static_cast<std::size_t>(handoff_col_offset) * C * 2;
+    Tensor handoff_dst(handoff_ptr, DType::BF16, {C, V_vis});
+    ops::linear(tproj_in, w.proj_out, handoff_dst, ops::LinearPolicy::A16Only, p.workspace, stream);
+
+    sync();
+    if (p.vision_stream) CUDA_CHECK(cudaStreamSynchronize(p.device.transfer_stream));
+    p.vision_encode_peak_bytes    = std::max(p.vision_encode_peak_bytes, p.layout.vision_general_bytes);
+    p.vision_handoff_active_bytes = static_cast<std::size_t>(handoff_col_offset + v_tok) * C * 2;
+    p.vision_handoff_peak_bytes =
+        std::max(p.vision_handoff_peak_bytes, p.vision_handoff_active_bytes);
+    const auto t1 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(t1 - t0).count();
 }
 
 TokenId Executor::sample(const Tensor& logits, const ResolvedSamplingParameters& sampling,
@@ -1881,10 +2120,26 @@ MemorySummary Executor::memory_summary() const {
     out.host_state_occupied_slots = p.states.host_state_count();
     out.host_kv_capacity_bytes    = p.states.host_kv_capacity();
     out.host_kv_occupied_bytes    = p.states.host_kv_bytes();
+    if (p.options.enable_vision) {
+        VisionWorkspaceMemorySummary vw;
+        vw.aggregate_prompt_tokens = v_native_max(p.options);
+        vw.max_item_tokens         = v_item_max(p.options);
+        vw.general_capacity_bytes  = p.layout.vision_general_bytes;
+        vw.encode_peak_bytes       = p.vision_encode_peak_bytes;
+        vw.handoff_offset_bytes    = p.layout.vision_handoff.region.offset;
+        vw.handoff_capacity_bytes  = p.layout.vision_handoff.region.bytes;
+        vw.handoff_active_bytes    = p.vision_handoff_active_bytes;
+        vw.handoff_peak_bytes      = p.vision_handoff_peak_bytes;
+        out.vision_workspace       = vw;
+    }
     return out;
 }
 
-void Executor::reset_memory_peaks() { impl_->workspace.reset_peak(); }
+void Executor::reset_memory_peaks() {
+    impl_->workspace.reset_peak();
+    impl_->vision_encode_peak_bytes  = 0;
+    impl_->vision_handoff_peak_bytes = 0;
+}
 
 void Executor::sync() { CUDA_CHECK(cudaStreamSynchronize(impl_->device.stream)); }
 

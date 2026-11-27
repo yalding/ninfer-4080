@@ -349,7 +349,9 @@ denominator is nonzero.
 
 ### Multimodal request
 
-Start the server with `--vision` before sending media:
+Start the server with `--vision` before sending media. On Inkling-2-Mini, add
+`--vision-offload on` to stream image encoder weights from pinned host RAM into a reusable GPU
+workspace. Inkling-2-Mini accepts images.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -375,14 +377,14 @@ has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision l
 `min(--max-context, 32768)`. There is no fixed image/video item-count limit: item count is admitted
 through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
 
-Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
-pool. Prepared payloads are keyed by SHA-256 of the acquired bytes plus modality, so repeated media
+Media cache misses run as bounded host decode → resize → BF16-pack tasks. Prepared payloads are
+keyed by SHA-256 of the acquired bytes and relevant preprocessing settings, so repeated media
 in later requests reuses the exact immutable BF16 patch input; concurrent identical misses use one
 single-flight build. `--media-cache-mib` bounds LRU-retained payloads, while
 `--media-live-mib` bounds every cache-, request-, or runtime-referenced payload. Cache eviction does
 not invalidate a request reference, and live bytes are returned only when the final reference is
-released. A request-level preparation gate derived from the live limit prevents concurrent partial
-builds from deadlocking the memory account.
+released. Qwen uses a request-level preparation gate derived from the live limit. Inkling-2-Mini
+rejects a new payload if live request references leave insufficient space after cache eviction.
 
 An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
 the prepared token count and configured context ceiling. A media preprocessing resource rejection

@@ -6,6 +6,13 @@
 #include <vector>
 
 namespace ninfer::targets::inkling2_mini::frontend_internal {
+struct ImagePlaceholder {
+    std::size_t message_index     = 0;
+    std::size_t part_index        = 0;
+    std::size_t placeholder_begin = 0;
+    std::size_t placeholder_end   = 0;
+};
+
 struct RenderedChat {
     std::string text;
     std::vector<ByteSpan> literal_spans;
@@ -13,9 +20,9 @@ struct RenderedChat {
     std::vector<std::size_t> message_begins;
     std::vector<std::vector<ByteSpan>> message_part_spans;
     std::vector<std::size_t> tool_boundaries;
+    std::vector<ImagePlaceholder> image_placeholders;
 };
 
-// Implements the registered Inkling-2 text template; media is rejected in Phase 1.
 RenderedChat render_chat(const PromptInput& input);
 PromptCapabilities prompt_capabilities() noexcept;
 } // namespace ninfer::targets::inkling2_mini::frontend_internal

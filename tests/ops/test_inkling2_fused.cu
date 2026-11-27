@@ -956,6 +956,177 @@ int sconv_batched_test(DeviceContext& dev) {
                          from_device<std::uint16_t>(dst_ref.p, std::size_t(6656 * 3) * 48 * total_slots));
     return fail;
 }
+
+int vision_patch_embed_test(DeviceContext& device, int p) {
+    const int d = 1024, k = 1200, rows_pos = 1024;
+    const float eps = 1e-5f;
+    auto patches = values(std::size_t(k) * p, 501 + p, 0.5f);
+    auto weight  = values(std::size_t(k) * d, 502 + p, 0.1f);
+    auto cls_e   = values(d, 503, 0.5f);
+    auto cls_p   = values(d, 504, 0.5f);
+    auto pos_tbl = values(std::size_t(d) * rows_pos, 505, 0.25f);
+    auto ln_w    = values(d, 506, 1.0f);
+    auto ln_b    = values(d, 507, 0.5f);
+
+    std::vector<std::int32_t> pos_idx(std::size_t(4) * p);
+    std::vector<float> pos_w(std::size_t(4) * p);
+    for (int i = 0; i < p; ++i) {
+        const int r0 = (i * 7) % 31, c0 = (i * 11) % 31;
+        pos_idx[i * 4 + 0] = r0 * 32 + c0;
+        pos_idx[i * 4 + 1] = r0 * 32 + (c0 + 1);
+        pos_idx[i * 4 + 2] = (r0 + 1) * 32 + c0;
+        pos_idx[i * 4 + 3] = (r0 + 1) * 32 + (c0 + 1);
+        const float wy = 0.25f * static_cast<float>(i % 4);
+        const float wx = 0.2f * static_cast<float>((i + 1) % 5);
+        pos_w[i * 4 + 0] = (1.f - wy) * (1.f - wx);
+        pos_w[i * 4 + 1] = (1.f - wy) * wx;
+        pos_w[i * 4 + 2] = wy * (1.f - wx);
+        pos_w[i * 4 + 3] = wy * wx;
+    }
+
+    std::vector<double> expected(std::size_t(d) * (p + 1));
+    for (int t = 0; t <= p; ++t) {
+        std::vector<double> raw(d);
+        double mean = 0.0;
+        for (int n = 0; n < d; ++n) {
+            double v = 0.0;
+            if (t == 0) {
+                v = static_cast<double>(cls_e[n]) + static_cast<double>(cls_p[n]);
+            } else {
+                const int pi = t - 1;
+                for (int kk = 0; kk < k; ++kk) {
+                    v += static_cast<double>(patches[std::size_t(pi) * k + kk]) *
+                         static_cast<double>(weight[std::size_t(n) * k + kk]);
+                }
+                for (int c = 0; c < 4; ++c) {
+                    v += static_cast<double>(pos_tbl[std::size_t(pos_idx[pi * 4 + c]) * d + n]) *
+                         static_cast<double>(pos_w[pi * 4 + c]);
+                }
+            }
+            raw[n] = static_cast<double>(__bfloat162float(__float2bfloat16_rn(static_cast<float>(v))));
+            mean += raw[n];
+        }
+        mean /= d;
+        double var = 0.0;
+        for (int n = 0; n < d; ++n) {
+            const double diff = raw[n] - mean;
+            var += diff * diff;
+        }
+        const double inv = 1.0 / std::sqrt(var / d + eps);
+        for (int n = 0; n < d; ++n) {
+            expected[std::size_t(t) * d + n] =
+                (raw[n] - mean) * inv * static_cast<double>(ln_w[n]) + static_cast<double>(ln_b[n]);
+        }
+    }
+
+    auto dp = to_device_bf16(patches), dw = to_device_bf16(weight);
+    auto dce = to_device_bf16(cls_e), dcp = to_device_bf16(cls_p), dpt = to_device_bf16(pos_tbl);
+    auto dpi = to_device(pos_idx), dpw = to_device(pos_w);
+    auto dlw = to_device_bf16(ln_w), dlb = to_device_bf16(ln_b);
+    GuardedDeviceBuffer dout(std::size_t(d) * (p + 1) * 2);
+    Tensor tp(dp.p, DType::BF16, {k, p}), tw(dw.p, DType::BF16, {k, d});
+    Tensor tce(dce.p, DType::BF16, {d}), tcp(dcp.p, DType::BF16, {d});
+    Tensor tpt(dpt.p, DType::BF16, {d, rows_pos}), tpi(dpi.p, DType::I32, {4, p});
+    Tensor tpw(dpw.p, DType::FP32, {4, p}), tlw(dlw.p, DType::BF16, {d}), tlb(dlb.p, DType::BF16, {d});
+    Tensor to(dout.data(), DType::BF16, {d, p + 1});
+    graph_run(device, [&] {
+        ops::inkling2_vision_patch_embed(tp, tw, tce, tcp, tpt, tpi, tpw, tlw, tlb, eps, to, device.stream);
+    }, false);
+    int fail = check("vision_patch_embed", dout, expected);
+    fail += dout.verify_guards("vision_patch_embed guards");
+    return fail;
+}
+
+int vision_rope_2d_test(DeviceContext& device, int t_vis) {
+    const int qkv_rows = 3072, heads = 16, hd = 64;
+    const float theta = 10000.0f;
+    auto qkv_init = values(std::size_t(qkv_rows) * t_vis, 601 + t_vis, 1.0f);
+    std::vector<std::int32_t> coords(std::size_t(4) * t_vis);
+    coords[0] = -1; coords[1] = -1; coords[2] = 6; coords[3] = 8;
+    for (int t = 1; t < t_vis; ++t) {
+        coords[t * 4 + 0] = (t - 1) / 8;
+        coords[t * 4 + 1] = (t - 1) % 8;
+        coords[t * 4 + 2] = 6;
+        coords[t * 4 + 3] = 8;
+    }
+
+    std::vector<double> expected(qkv_init.begin(), qkv_init.end());
+    for (int t = 1; t < t_vis; ++t) {
+        const int y = coords[t * 4 + 0], x = coords[t * 4 + 1];
+        for (int qk = 0; qk < 2; ++qk) {
+            for (int h = 0; h < heads; ++h) {
+                const std::size_t base = std::size_t(t) * qkv_rows + qk * 1024 + h * hd;
+                for (int lane = 0; lane < 32; ++lane) {
+                    const int pair = lane & 15;
+                    const double inv_freq = std::pow(static_cast<double>(theta), -static_cast<double>(2 * pair) / 32.0);
+                    const double angle = static_cast<double>(lane >= 16 ? x : y) * inv_freq;
+                    const double c = std::cos(angle), s = std::sin(angle);
+                    const double v0 = expected[base + lane * 2];
+                    const double v1 = expected[base + lane * 2 + 1];
+                    expected[base + lane * 2]     = v0 * c - v1 * s;
+                    expected[base + lane * 2 + 1] = v0 * s + v1 * c;
+                }
+            }
+        }
+    }
+
+    auto dqkv = to_device_bf16(qkv_init);
+    auto dcoords = to_device(coords);
+    std::vector<std::uint16_t> cls_before = from_device<std::uint16_t>(dqkv.p, qkv_rows);
+    Tensor tcoords(dcoords.p, DType::I32, {4, t_vis}), tqkv(dqkv.p, DType::BF16, {qkv_rows, t_vis});
+    graph_run(device, [&] { ops::inkling2_vision_rope_2d(tcoords, theta, tqkv, device.stream); }, true);
+    int fail = verify_exact("vision_rope_2d cls bit-exact", from_device<std::uint16_t>(dqkv.p, qkv_rows), cls_before);
+    fail += verify_reduction("vision_rope_2d", from_device_bf16(dqkv.p, expected.size()), expected, kBF);
+    return fail;
+}
+
+int vision_layerscale_merge_test(DeviceContext& device, int t_vis, int v) {
+    const int d = 1024;
+    auto proj = values(std::size_t(d) * t_vis, 701, 1.0f);
+    auto hid  = values(std::size_t(d) * t_vis, 702, 1.0f);
+    auto bias = values(d, 703, 0.5f);
+    auto gam  = values(d, 704, 0.25f);
+    std::vector<double> exp_ls(hid.size());
+    for (int t = 0; t < t_vis; ++t) {
+        for (int i = 0; i < d; ++i) {
+            const std::size_t idx = std::size_t(t) * d + i;
+            exp_ls[idx] = static_cast<double>(hid[idx]) +
+                          static_cast<double>(gam[i]) * (static_cast<double>(proj[idx]) + static_cast<double>(bias[i]));
+        }
+    }
+    auto dp = to_device_bf16(proj), db = to_device_bf16(bias), dg = to_device_bf16(gam);
+    GuardedDeviceBuffer dh(hid.size() * 2);
+    auto hid_bits = to_device_bf16(hid);
+    CUDA_CHECK(cudaMemcpy(dh.data(), hid_bits.p, hid.size() * 2, cudaMemcpyDeviceToDevice));
+    Tensor tp(dp.p, DType::BF16, {d, t_vis}), tb(db.p, DType::BF16, {d}), tg(dg.p, DType::BF16, {d});
+    Tensor th(dh.data(), DType::BF16, {d, t_vis});
+    graph_run(device, [&] { ops::inkling2_vision_layerscale_add(tp, tb, tg, th, device.stream); }, true);
+    int fail = check("vision_layerscale_add", dh, exp_ls);
+    fail += dh.verify_guards("vision_layerscale_add guards");
+
+    std::vector<std::int32_t> merge_idx(std::size_t(4) * v);
+    for (int i = 0; i < 4 * v; ++i) merge_idx[i] = (i % 5 == 4) ? -1 : (1 + (i % (t_vis - 1)));
+    std::vector<std::uint16_t> src_bits(hid.size());
+    for (std::size_t i = 0; i < src_bits.size(); ++i) src_bits[i] = f32_to_bf16(hid[i]);
+    std::vector<std::uint16_t> exp_merge(std::size_t(4096) * v, 0);
+    for (int col = 0; col < v; ++col) {
+        for (int q = 0; q < 4; ++q) {
+            const int si = merge_idx[col * 4 + q];
+            if (si >= 0) {
+                std::copy_n(src_bits.data() + std::size_t(si) * d, d,
+                            exp_merge.data() + (std::size_t(col) * 4 + q) * d);
+            }
+        }
+    }
+    auto dmi = to_device(merge_idx);
+    GuardedDeviceBuffer dmo(exp_merge.size() * 2);
+    Tensor tsrc(hid_bits.p, DType::BF16, {d, t_vis}), tmi(dmi.p, DType::I32, {4, v}),
+        tmo(dmo.data(), DType::BF16, {4096, v});
+    graph_run(device, [&] { ops::inkling2_vision_merge_2x2(tsrc, tmi, tmo, device.stream); }, true);
+    fail += verify_exact("vision_merge_2x2", from_device<std::uint16_t>(dmo.data(), exp_merge.size()), exp_merge);
+    fail += dmo.verify_guards("vision_merge_2x2 guards");
+    return fail;
+}
 } // namespace
 
 int main() {
@@ -1038,6 +1209,10 @@ int main() {
             failures += dflash2_topk16_and_select_test(device, k, 0.0f, k != 1);
             failures += dflash2_topk16_and_select_test(device, k, 0.8f, true);
         }
+        failures += vision_patch_embed_test(device, 17);
+        failures += vision_patch_embed_test(device, 65);
+        failures += vision_rope_2d_test(device, 49);
+        failures += vision_layerscale_merge_test(device, 49, 12);
         std::cout << (failures ? "FAIL" : "PASS") << " Inkling2 fused ops (" << failures << " failures)\n";
         return failures ? 1 : 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
